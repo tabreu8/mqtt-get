@@ -357,7 +357,8 @@ Set `MQTT_PROTOCOL_VERSION=5` (or `protocol_version: 5` in the UI, API or MCP) t
 | **Request/response** | MCP `publish_and_wait` (and the core behind it) sets a **response topic** and random **correlation data** on the request. Replies carrying someone else's correlation data are ignored; the result says whether it was `correlated`. |
 | **Reason codes** | Refused connections, rejected subscriptions and publishes, and server disconnects show the MQTT 5 reason, e.g. `connect failed: reason 0x86 bad user name or password`. |
 | **Topic aliases** | The broker may replace long topic names with 2-byte aliases (up to `MQTT_TOPIC_ALIAS_MAXIMUM`, default 1024), which saves bandwidth. mqtt-get resolves them per connection. |
-| **Sessions and flow control** | `MQTT_SESSION_EXPIRY_SEC` keeps the session across reconnects; mqtt-get allows up to 65535 in-flight QoS 1/2 messages (receive maximum). |
+| **Sessions and flow control** | `MQTT_SESSION_EXPIRY_SEC` keeps the session across reconnects. mqtt-get accepts up to 65535 in-flight QoS 1/2 messages from the broker, and respects the broker's own limits when publishing: its Receive Maximum (in-flight QoS 1/2 publishes), Maximum QoS, Retain Available and Maximum Packet Size. A publish the broker can't accept fails with a clear error instead of getting the connection dropped. |
+| **Server keep alive** | If the broker overrides the keepalive in CONNACK, mqtt-get uses the broker's value. |
 
 Publishing with properties:
 
@@ -537,7 +538,7 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `MQTT_WS_HEADERS` | – | `Name: value`, comma-separated |
 | `MQTT_CONNECTIONS` | `1` | Number of broker connections (see [scaling](#performance-and-scaling)) |
 | `MQTT_SHARED_GROUP` | – | Shared-subscription group spreading ingest over the connections (broker must support `$share`) |
-| `MQTT_CLIENT` | `lean` | MQTT 3.1/3.1.1 client: `lean` (built-in, fastest) or `paho` (Eclipse paho). MQTT 5 always uses Eclipse paho.golang |
+| `MQTT_CLIENT` | `lean` | MQTT client: `lean` (built-in, fastest, all protocol versions) or `paho` (Eclipse paho for 3.1/3.1.1, Eclipse paho.golang for MQTT 5) |
 | `MQTT_SUBSCRIPTION_MODE` | `auto` | `split` divides `MQTT_TOPICS` between the connections: scale-out without broker support (filters must not overlap) |
 
 ### Server
@@ -771,7 +772,7 @@ Suggested alerts: `mqttget_mqtt_connected == 0` for 1 minute; `rate(mqttget_webh
 
 **What makes it fast**
 
-- **A purpose-built MQTT 3.1.1 client ("lean", the default).** General-purpose MQTT libraries pass every message through several goroutines and channels and allocate 4–5 objects per message; that was ~88% of the CPU per message. mqtt-get's own client parses each message straight out of a 64 KiB socket buffer and stores it on the same goroutine, with **one allocation per message** (topic and payload share one block, and the topic is a zero-copy view into it). QoS 1/2 acknowledgements are batched and flushed once per socket read instead of once per message. It supports QoS 0/1/2 in both directions (exactly-once QoS 2), keepalive with a dead-connection watchdog, reconnect with failover, and every transport and auth method. It is fuzz-tested and passes the full real-broker suite. The Eclipse paho client remains available with `MQTT_CLIENT=paho`; MQTT 5 uses Eclipse paho.golang.
+- **A purpose-built MQTT client ("lean", the default, for MQTT 3.1, 3.1.1 and 5).** General-purpose MQTT libraries pass every message through several goroutines and channels and allocate 4–5 objects per message; that was ~88% of the CPU per message. mqtt-get's own client parses each message straight out of a 64 KiB socket buffer and stores it on the same goroutine, with **one allocation per message** (topic and payload share one block, and the topic is a zero-copy view into it). QoS 1/2 acknowledgements are batched and flushed once per socket read instead of once per message. It supports QoS 0/1/2 in both directions (exactly-once QoS 2), keepalive with a dead-connection watchdog, reconnect with failover, and every transport and auth method. Over MQTT 5, properties are only parsed when a message has them (then as zero-copy views into the same block), and topic aliases are resolved on the receive goroutine without locks. It is fuzz-tested and passes the full real-broker suite. The Eclipse clients remain available with `MQTT_CLIENT=paho` (paho for 3.1.1, paho.golang for MQTT 5).
 - The value store is split into 256 locks. Each topic has one small record (32 bytes plus the payload) that is **updated in place**, so storing an update for a known topic allocates nothing, and mqtt-get's own ingest step (store, webhook and watcher routing) is allocation-free. A message is only copied to the heap when a webhook or a waiting agent needs it.
 - An **adaptive garbage collector** setting (see [Memory and GC](#memory-and-gc)) cuts GC work where memory allows.
 - Webhook matching uses a topic trie that's swapped atomically, so matching takes no locks.
@@ -783,14 +784,16 @@ Suggested alerts: `mqttget_mqtt_connected == 0` for 1 minute; `rate(mqttget_webh
 | Ingest, MQTT 3.1.1, 1 connection | **~3.3M msg/s** at ~310 ns CPU per message (paho client: ~160k msg/s, 8.4 µs) |
 | Ingest, MQTT 3.1.1, 4 split connections | **~6.1M msg/s** (not CPU-bound: the fake broker was the limit) |
 | Ingest, QoS 1, 1 connection | **~2.8M msg/s**, acknowledgements included (paho client: 43k msg/s) |
-| Ingest, MQTT 5 (paho.golang), 1 / 4 split connections | ~250k / ~540–590k msg/s |
+| Ingest, MQTT 5, 1 connection | **~3.5M msg/s** at ~310 ns CPU per message (paho.golang: ~230k msg/s, 8.5 µs) |
+| Ingest, MQTT 5, every message with properties (content type, user property, expiry) | **~1.6M msg/s** at ~720 ns (paho.golang: ~124k msg/s, 16.7 µs) |
+| Ingest, MQTT 5, 4 split connections / QoS 1 | ~6.1M / ~2.9M msg/s |
 | mqtt-get's own cost per message (store + webhook routing) | **~200 ns, 0 allocations** |
 | Through a real broker (Mosquitto, same VM), 64-byte payloads, 10k topics | ~225k msg/s, no loss: single-threaded Mosquitto is the limit there, not mqtt-get |
 | `GET` one value (in-process benchmark) | ~1.7 µs |
 | Memory with 10k topics | ~16–30 MB RSS |
 | Memory with **1M topics** (64-byte payloads) | ~550 MB RSS |
 
-**Scaling up.** One connection is handled by one CPU core: about 3M msg/s with the lean client, so a single connection is usually enough. When the broker or the network limits a single connection, or you use `MQTT_CLIENT=paho` or MQTT 5, open several connections to spread ingest over several cores. There are two ways, and you choose with `MQTT_SUBSCRIPTION_MODE`:
+**Scaling up.** One connection is handled by one CPU core: about 3M msg/s with the lean client, so a single connection is usually enough. When the broker or the network limits a single connection, or you use `MQTT_CLIENT=paho`, open several connections to spread ingest over several cores. There are two ways, and you choose with `MQTT_SUBSCRIPTION_MODE`:
 
 | | **Split filters** (`split`) | **Shared subscription group** (`MQTT_SHARED_GROUP`) |
 |---|---|---|
@@ -820,6 +823,7 @@ Measured ingest on a 4-vCPU VM, fed by `cmd/floodbroker` (a fake broker that str
 | 4 connections, `split`, with the memory/GC work below | 694k msg/s | 4.8× |
 | 1 connection, **lean client** | 3.3M msg/s | 23× |
 | 4 connections, `split`, **lean client** | **6.1M msg/s** | 42× |
+| 1 connection, **lean client, MQTT 5** | 3.5M msg/s | 24× |
 
 (The first four rows used the paho client, before the lean client existed. With the lean client a single connection is usually enough; extra connections still help when the broker or the network per connection is the limit.)
 

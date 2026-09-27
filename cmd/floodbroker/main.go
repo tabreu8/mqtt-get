@@ -25,6 +25,7 @@ var (
 	nTopics = flag.Int("topics", 1000, "distinct topics per subscribed filter")
 	size    = flag.Int("size", 64, "payload bytes")
 	qos     = flag.Int("qos", 0, "QoS of the flood (0 or 1; acknowledgements are read and ignored)")
+	props   = flag.Bool("props", false, "MQTT 5: give every message a content type, a user property and an expiry")
 	sent    atomic.Uint64
 )
 
@@ -162,7 +163,13 @@ func buildBlock(filters []string, v5 bool) []byte {
 			if *qos > 0 {
 				vh = binary.BigEndian.AppendUint16(vh, uint16(i%65535+1))
 			}
-			if v5 {
+			if v5 && *props {
+				var pb []byte
+				pb = appendStr(append(pb, 0x03), "application/json")          // content type
+				pb = appendStr(appendStr(append(pb, 0x26), "site"), "lisbon") // user property
+				pb = binary.BigEndian.AppendUint32(append(pb, 0x02), 3600)    // message expiry
+				vh = append(appendVarint(vh, len(pb)), pb...)
+			} else if v5 {
 				vh = append(vh, 0) // no properties
 			}
 			block = appendVarint(append(block, 0x30|byte(*qos)<<1), len(vh)+len(payload))
