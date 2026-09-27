@@ -115,11 +115,27 @@ func (l *v5link) start() {
 			cp.Properties.ReceiveMaximum = &receiveMax
 			cp.Properties.TopicAliasMaximum = &aliasMax
 			cp.Properties.RequestProblemInfo = true
+			if w := cfg.Will; w != nil && l.idx == 0 {
+				cp.WillMessage = &paho.WillMessage{Topic: w.Topic, Payload: []byte(w.Payload), QoS: w.QoS, Retain: w.Retain}
+				if w.DelaySec > 0 {
+					d := w.DelaySec
+					cp.WillProperties = &paho.WillProperties{WillDelayInterval: &d}
+				}
+			}
 			return cp, nil
 		},
 		OnConnectionUp: func(cm *autopaho.ConnectionManager, _ *paho.Connack) {
 			l.up.Store(true)
 			l.m.linkUp(l.clientID)
+			if w := cfg.Will; w != nil && w.OnlinePayload != "" && l.idx == 0 {
+				go func() { // cm, not l.cm: this may run before NewConnection returns
+					pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+					if _, err := cm.Publish(pctx, &paho.Publish{Topic: w.Topic, QoS: w.QoS, Retain: w.Retain, Payload: []byte(w.OnlinePayload)}); err != nil {
+						l.m.setErr("publishing the online status to " + w.Topic + " failed: " + err.Error())
+					}
+				}()
+			}
 			if len(subs) == 0 {
 				return
 			}

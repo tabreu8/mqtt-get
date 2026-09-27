@@ -77,6 +77,22 @@ type Broker struct {
 	// client built for ingest speed) or "paho" (eclipse paho.mqtt.golang for
 	// MQTT 3.1/3.1.1, eclipse paho.golang for MQTT 5).
 	Client string `json:"client,omitempty"`
+	// Will is published by the broker if mqtt-get disconnects unexpectedly.
+	Will *Will `json:"will,omitempty"`
+}
+
+// Will is an MQTT Last Will and Testament. It is registered on the first
+// connection only. With OnlinePayload set, Topic becomes a status topic:
+// OnlinePayload is published (with the will's QoS and retain flag) on every
+// connect, and Payload on a graceful shutdown, so subscribers always see
+// whether mqtt-get is up.
+type Will struct {
+	Topic         string `json:"topic"`
+	Payload       string `json:"payload,omitempty"`
+	QoS           byte   `json:"qos,omitempty"`
+	Retain        bool   `json:"retain,omitempty"`
+	DelaySec      uint32 `json:"delay_sec,omitempty"` // MQTT 5: wait this long before publishing it
+	OnlinePayload string `json:"online_payload,omitempty"`
 }
 
 // MQTT client implementations.
@@ -166,6 +182,17 @@ func (b *Broker) Validate() error {
 	}
 	if b.ProtocolVersion != 5 && (b.SessionExpirySec != 0 || b.TopicAliasMaximum != nil) {
 		return errors.New("session_expiry_sec and topic_alias_maximum need protocol_version 5")
+	}
+	if w := b.Will; w != nil {
+		if err := topic.ValidateName(w.Topic); err != nil {
+			return fmt.Errorf("will topic: %w", err)
+		}
+		if w.QoS > 2 {
+			return errors.New("will qos must be 0, 1 or 2")
+		}
+		if w.DelaySec != 0 && b.ProtocolVersion != 5 {
+			return errors.New("will delay_sec needs protocol_version 5")
+		}
 	}
 	if b.Connections > 64 {
 		return errors.New("connections must be <= 64")
@@ -469,6 +496,16 @@ func BrokerFromEnv() (b Broker, ok bool, err error) {
 	if v := Env("MQTT_TOPIC_ALIAS_MAXIMUM"); v != "" {
 		n := uint16(envInt("MQTT_TOPIC_ALIAS_MAXIMUM", 0))
 		b.TopicAliasMaximum = &n
+	}
+	if t := envStr("MQTT_WILL_TOPIC", ""); t != "" {
+		b.Will = &Will{
+			Topic:         t,
+			Payload:       envStr("MQTT_WILL_PAYLOAD", ""),
+			QoS:           byte(envInt("MQTT_WILL_QOS", 0)),
+			Retain:        envBool("MQTT_WILL_RETAIN", false),
+			DelaySec:      uint32(envInt("MQTT_WILL_DELAY_SEC", 0)),
+			OnlinePayload: envStr("MQTT_WILL_ONLINE_PAYLOAD", ""),
+		}
 	}
 	b.TLS = TLS{
 		Enabled:            envBool("MQTT_TLS", false),

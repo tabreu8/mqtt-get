@@ -69,9 +69,16 @@ func newV3(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *v3link {
 			Time:     time.Now().UnixNano(),
 		})
 	})
+	if w := cfg.Will; w != nil && idx == 0 {
+		o.SetBinaryWill(w.Topic, []byte(w.Payload), w.QoS, w.Retain)
+	}
 	o.SetOnConnectHandler(func(cl mqtt.Client) {
 		l.up.Store(true)
 		m.linkUp(clientID)
+		// paho replays its stored in-flight messages concurrently with this
+		// handler after a reconnect; a QoS 1/2 publish made during that
+		// replay is sent twice (and races inside paho). Wait it out.
+		m.announceOnline(cfg, idx, l, 250*time.Millisecond)
 		if len(filters) == 0 {
 			return
 		}

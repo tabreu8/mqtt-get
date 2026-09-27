@@ -181,6 +181,15 @@ func (m *Manager) Close() {
 }
 
 func (m *Manager) disconnectLocked() {
+	if w := m.cfg.Will; w != nil && w.OnlinePayload != "" && len(m.links) > 0 && m.links[0].isUp() {
+		// Status topic: say we are going offline (the broker only publishes
+		// the will after an unexpected disconnect).
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := m.links[0].send(ctx, willMessage(w, w.Payload))(); err != nil {
+			m.log.Warn("mqtt: publishing the offline status failed", "err", err)
+		}
+		cancel()
+	}
 	for _, l := range m.links {
 		l.stop()
 		c := l.stats()
@@ -188,6 +197,27 @@ func (m *Manager) disconnectLocked() {
 		m.retired.bytes.Add(c.bytes.Load())
 	}
 	m.links = nil
+}
+
+func willMessage(w *config.Will, payload string) Message {
+	return Message{Topic: w.Topic, Payload: []byte(payload), QoS: w.QoS, Retain: w.Retain}
+}
+
+// announceOnline publishes the will's online payload on the first
+// connection after it connects (status topics), after delay.
+func (m *Manager) announceOnline(cfg config.Broker, idx int, l link, delay time.Duration) {
+	w := cfg.Will
+	if w == nil || w.OnlinePayload == "" || idx != 0 {
+		return
+	}
+	go func() {
+		time.Sleep(delay)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := l.send(ctx, willMessage(w, w.OnlinePayload))(); err != nil {
+			m.setErr("publishing the online status to " + w.Topic + " failed: " + err.Error())
+		}
+	}()
 }
 
 func clientIDFor(cfg config.Broker, idx int) string {

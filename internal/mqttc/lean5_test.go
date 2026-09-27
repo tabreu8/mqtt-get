@@ -323,3 +323,33 @@ func FuzzLeanReadLoopV5(f *testing.F) {
 		_ = l.readLoop(r) // must not panic
 	})
 }
+
+func TestLeanV5WillEncoding(t *testing.T) {
+	cfg := leanCfg5("tcp://x")
+	cfg.Will = &config.Will{Topic: "svc/status", Payload: "offline", QoS: 1, Retain: true, DelaySec: 30}
+	l := newLean(New(quietLogger(), nil), cfg, nil, 0)
+	_, body, err := readPacket(bufio.NewReader(bytes.NewReader(l.connectPacket())), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flags := body[7]; flags&0x04 == 0 || (flags>>3)&3 != 1 || flags&0x20 == 0 {
+		t.Fatalf("connect flags %08b: want will, will QoS 1, will retain", flags)
+	}
+	_, rest, err := splitProps(body[10:]) // CONNECT properties
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest = rest[2+len("lean-test"):] // client id
+	wp, rest, err := splitProps(rest)
+	if err != nil || !bytes.Equal(wp, u32prop(propWillDelay, 30)) {
+		t.Fatalf("will properties %x (%v)", wp, err)
+	}
+	want := appendStr(appendStr(nil, "svc/status"), "offline")
+	if !bytes.Equal(rest, want) {
+		t.Fatalf("will topic/payload %q, want %q", rest, want)
+	}
+	// Only the first connection carries the will.
+	if l1 := newLean(New(quietLogger(), nil), cfg, nil, 1); bytes.Contains(l1.connectPacket(), []byte("svc/status")) {
+		t.Fatal("connection 1 must not register the will")
+	}
+}

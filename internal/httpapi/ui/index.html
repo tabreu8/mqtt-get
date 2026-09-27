@@ -154,6 +154,17 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
           <div><label>Client key file path</label><input name="tls.key_file"></div>
         </div>
       </details>
+      <details><summary>Last Will &amp; status topic</summary>
+        <p class="muted">The broker publishes the will if mqtt-get disconnects unexpectedly. With an online payload the topic becomes a status topic: that payload is published on every connect, and the will payload on a graceful shutdown.</p>
+        <div class="row">
+          <div><label>Will topic (empty = no will)</label><input name="will.topic" placeholder="mqtt-get/status"></div>
+          <div><label>Will payload</label><input name="will.payload" placeholder="offline"></div>
+          <div><label>Online payload (optional)</label><input name="will.online_payload" placeholder="online"></div>
+          <div><label>QoS</label><select name="will.qos"><option>0</option><option>1</option><option>2</option></select></div>
+          <div><label>Delay (s, MQTT 5)</label><input name="will.delay_sec" type="number" min="0"></div>
+        </div>
+        <label><input type="checkbox" name="will.retain">Retain</label>
+      </details>
       <details><summary>WebSocket headers &amp; scaling</summary>
         <label>WebSocket headers — one per line: <span class="mono">Name: value</span></label>
         <textarea name="ws_headers"></textarea>
@@ -350,6 +361,9 @@ async function loadBroker() {
   for (const k of ['enabled', 'insecure_skip_verify', 'server_name', 'ca_pem', 'cert_pem', 'key_pem', 'ca_file', 'cert_file', 'key_file']) set('tls.' + k, t[k]);
   set('tls.alpn', (t.alpn || []).join(','));
   set('ws_headers', Object.entries(c.ws_headers || {}).map(([k, v]) => k + ': ' + v).join('\n'));
+  const w = c.will || {};
+  for (const k of ['topic', 'payload', 'online_payload', 'retain']) set('will.' + k, w[k]);
+  set('will.qos', w.qos || 0); set('will.delay_sec', w.delay_sec || '');
   set('connections', c.connections || 1); set('shared_group', c.shared_group); set('subscription_mode', c.subscription_mode || 'auto');
 }
 const lines = s => s.split('\n').map(x => x.trim()).filter(Boolean);
@@ -369,6 +383,8 @@ $('#brokerForm').onsubmit = async ev => {
       ca_pem: e['tls.ca_pem'].value, cert_pem: e['tls.cert_pem'].value, key_pem: e['tls.key_pem'].value,
       ca_file: v('tls.ca_file'), cert_file: v('tls.cert_file'), key_file: v('tls.key_file'),
     },
+    will: v('will.topic') ? { topic: v('will.topic'), payload: e['will.payload'].value, online_payload: e['will.online_payload'].value,
+      qos: num('will.qos'), retain: e['will.retain'].checked, ...(num('will.delay_sec') ? { delay_sec: num('will.delay_sec') } : {}) } : null,
     ws_headers: headers(e.ws_headers.value), connections: num('connections') || 1, shared_group: v('shared_group'), subscription_mode: e.subscription_mode.value,
   };
   try { await api('PUT', '/api/v1/broker', body); $('#brokerErr').textContent = ''; toast('Saved — connecting…'); loadBroker(); setTimeout(loadStatus, 1500); }

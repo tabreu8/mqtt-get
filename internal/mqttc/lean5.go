@@ -22,6 +22,7 @@ const (
 	propResponseTopic     = 0x08
 	propCorrelationData   = 0x09
 	propSessionExpiry     = 0x11
+	propWillDelay         = 0x18
 	propAssignedClientID  = 0x12
 	propServerKeepAlive   = 0x13
 	propReasonString      = 0x1F

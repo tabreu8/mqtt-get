@@ -37,15 +37,16 @@ import (
 // password files). MQTT 5 adds message properties (see lean5.go), inbound
 // topic aliases, reason codes, server-side limits (Receive Maximum, Maximum
 // QoS, Retain Available, Maximum Packet Size, Server Keep Alive) and session
-// expiry. Not supported: persisting in-flight messages across restarts (like
-// the default in-memory store of the paho client), wills and MQTT 5
-// enhanced authentication (AUTH).
+// expiry. Persistent sessions are resumed: unacknowledged publishes survive
+// a reconnect and are resent (see resumeLocked). Last Will is supported.
+// In-flight state is kept in memory, not on disk.
 type leanlink struct {
 	m        *Manager
 	cfg      config.Broker
 	tlsCfg   *tls.Config
 	headers  http.Header
 	clientID string
+	idx      int
 	subs     []config.Subscription
 	v5       bool
 	aliasMax uint16 // topic aliases the broker may use towards us (v5)
@@ -106,7 +107,7 @@ var connackErrors = map[byte]string{
 }
 
 func newLean(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *leanlink {
-	l := &leanlink{m: m, cfg: cfg, tlsCfg: tlsCfg, clientID: clientIDFor(cfg, idx), subs: cfg.SubscriptionsFor(idx),
+	l := &leanlink{m: m, cfg: cfg, tlsCfg: tlsCfg, clientID: clientIDFor(cfg, idx), idx: idx, subs: cfg.SubscriptionsFor(idx),
 		quit: make(chan struct{}), done: make(chan struct{}), v5: cfg.ProtocolVersion == 5, aliasMax: defaultTopicAliasMaximum}
 	if cfg.TopicAliasMaximum != nil {
 		l.aliasMax = *cfg.TopicAliasMaximum
@@ -296,6 +297,7 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 			return true, err
 		}
 	}
+	l.m.announceOnline(l.cfg, l.idx, l, 0)
 	if ka > 0 {
 		go l.keepalive(conn, ka, sessionDone)
 	}
@@ -324,6 +326,16 @@ func (l *leanlink) connectPacket() []byte {
 	if pass != "" {
 		flags |= 0x40
 	}
+	will := l.cfg.Will
+	if l.idx != 0 {
+		will = nil // one will per service, on the first connection
+	}
+	if will != nil {
+		flags |= 0x04 | will.QoS<<3
+		if will.Retain {
+			flags |= 0x20
+		}
+	}
 	var b []byte
 	b = appendStr(b, name)
 	b = append(b, level, flags)
@@ -339,6 +351,17 @@ func (l *leanlink) connectPacket() []byte {
 		b = append(appendVarint(b, len(pb)), pb...)
 	}
 	b = appendStr(b, l.clientID)
+	if will != nil {
+		if l.v5 {
+			var pb []byte
+			if will.DelaySec > 0 {
+				pb = binary.BigEndian.AppendUint32(append(pb, propWillDelay), will.DelaySec)
+			}
+			b = append(appendVarint(b, len(pb)), pb...)
+		}
+		b = appendStr(b, will.Topic)
+		b = appendStr(b, will.Payload) // binary data: same encoding
+	}
 	if user != "" {
 		b = appendStr(b, user)
 	}

@@ -23,7 +23,7 @@ curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/values/factory
 - [Reading values (GET)](#reading-values-get)
 - [Publishing (POST)](#publishing-post)
 - [Webhooks](#webhooks)
-- [Connecting to your broker](#connecting-to-your-broker) (auth methods and recipes for Mosquitto, EMQX, HiveMQ, NanoMQ, Coreflux, AWS IoT Core, Azure IoT Hub; [MQTT 5](#mqtt-5))
+- [Connecting to your broker](#connecting-to-your-broker) (auth methods and recipes for Mosquitto, EMQX, HiveMQ, NanoMQ, Coreflux, AWS IoT Core, Azure IoT Hub; [MQTT 5](#mqtt-5), [Last Will](#last-will-and-status-topic), [persistent sessions](#persistent-sessions))
 - [Tested brokers](#tested-brokers)
 - [Configuration](#configuration)
 - [Security and API keys](#security-and-api-keys)
@@ -489,6 +489,35 @@ MQTT_TOPICS="factory/+/+/status:1,factory/+/+/alarm:1,energy/#"   # ":1" sets Qo
 
 `$SYS/...` topics are only received if you subscribe to them explicitly (`$SYS/#`), because `#` never matches them.
 
+### Last Will and status topic
+
+A **Last Will** is a message the broker publishes for mqtt-get if the connection drops without a clean goodbye (crash, network loss, keepalive timeout). Add an **online payload** and the will topic becomes a status topic that always tells subscribers whether mqtt-get is up:
+
+```bash
+MQTT_WILL_TOPIC=mqtt-get/status
+MQTT_WILL_PAYLOAD=offline          # published by the broker on an unexpected disconnect
+MQTT_WILL_ONLINE_PAYLOAD=online    # published by mqtt-get on every (re)connect
+MQTT_WILL_RETAIN=true              # new subscribers see the current state at once
+MQTT_WILL_QOS=1
+```
+
+| Event | Published on `mqtt-get/status` |
+|---|---|
+| mqtt-get connects or reconnects | `online` (by mqtt-get) |
+| Connection lost, process killed, keepalive timeout | `offline` (by the broker, from the will) |
+| Graceful shutdown or broker reconfiguration | `offline` (by mqtt-get, because a clean disconnect discards the will) |
+
+With MQTT 5, `MQTT_WILL_DELAY_SEC` makes the broker wait before publishing the will, and skip it if mqtt-get reconnects in time, so a quick network blip doesn't flap the status. The broker publishes the will anyway when the session ends, so set `MQTT_SESSION_EXPIRY_SEC` (and `MQTT_CLEAN_SESSION=false`) to at least the delay. With several connections (`MQTT_CONNECTIONS`), only the first one registers the will. Also configurable in the web UI (Broker → Last Will & status topic), the API and MCP (`"will": {"topic": …, "payload": …, "online_payload": …, "qos": 1, "retain": true}`).
+
+### Persistent sessions
+
+With `MQTT_CLEAN_SESSION=false` (MQTT 3.1.1), or `MQTT_CLEAN_SESSION=false` plus `MQTT_SESSION_EXPIRY_SEC` (MQTT 5), the broker keeps mqtt-get's session while it is disconnected:
+
+- **Incoming:** the broker queues QoS 1/2 messages for the subscriptions while mqtt-get is away and delivers them on reconnect. mqtt-get acknowledges a message only after storing it (and handing it to webhooks), and QoS 2 messages redelivered after a reconnect are not stored twice.
+- **Outgoing:** a QoS 1/2 publish that was sent but not yet acknowledged when the connection dropped waits for the reconnect and is resent (with the DUP flag, or a PUBREL for QoS 2), so the `POST` still succeeds. If the broker didn't keep the session, it fails with a clear error instead. With clean sessions (the default), in-flight publishes fail as soon as the connection drops, so the caller can retry.
+
+Use a fixed `MQTT_CLIENT_ID` for persistent sessions: the broker finds the session by client id. Nothing is written to disk: a `POST` only returns success once the broker has acknowledged the message, so a publish interrupted by a restart is reported to the caller as failed and can be retried.
+
 ## Tested brokers
 
 mqtt-get ships with an **interoperability suite** that runs the full stack (REST, publish at every QoS, retained replay, binary payloads, wildcards, webhooks and negative auth checks) against real brokers. Last run: **643 passed, 0 failed** over 47 endpoints (MQTT 3.1.1 and MQTT 5).
@@ -538,6 +567,10 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `MQTT_WS_HEADERS` | – | `Name: value`, comma-separated |
 | `MQTT_CONNECTIONS` | `1` | Number of broker connections (see [scaling](#performance-and-scaling)) |
 | `MQTT_SHARED_GROUP` | – | Shared-subscription group spreading ingest over the connections (broker must support `$share`) |
+| `MQTT_WILL_TOPIC` | | [Last Will](#last-will-and-status-topic) topic (empty = no will) |
+| `MQTT_WILL_PAYLOAD` / `MQTT_WILL_QOS` / `MQTT_WILL_RETAIN` | `""` / `0` / `false` | Will message |
+| `MQTT_WILL_ONLINE_PAYLOAD` | | Makes the will topic a status topic: published on every connect (will payload on graceful shutdown) |
+| `MQTT_WILL_DELAY_SEC` | `0` | MQTT 5: delay before the broker publishes the will |
 | `MQTT_CLIENT` | `lean` | MQTT client: `lean` (built-in, fastest, all protocol versions) or `paho` (Eclipse paho for 3.1/3.1.1, Eclipse paho.golang for MQTT 5) |
 | `MQTT_SUBSCRIPTION_MODE` | `auto` | `split` divides `MQTT_TOPICS` between the connections: scale-out without broker support (filters must not overlap) |
 
