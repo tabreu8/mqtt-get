@@ -77,6 +77,8 @@ type leanlink struct {
 
 type pending struct {
 	done   chan error
+	pkt    []byte        // the PUBLISH, kept for retransmission on session resume
+	rel    bool          // QoS 2: PUBREC received, PUBREL sent
 	codes  chan []byte   // SUBACK return codes
 	reason string        // SUBACK reason string (v5), set before codes is sent
 	quota  chan struct{} // slot to release when acknowledged (v5)
@@ -109,6 +111,7 @@ func newLean(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *leanli
 	if cfg.TopicAliasMaximum != nil {
 		l.aliasMax = *cfg.TopicAliasMaximum
 	}
+	l.pending, l.inflight = map[uint16]*pending{}, map[uint16]bool{}
 	if len(cfg.WSHeaders) > 0 {
 		l.headers = http.Header{}
 		for k, v := range cfg.WSHeaders {
@@ -151,6 +154,11 @@ func (l *leanlink) stop() {
 // run connects, serves the session and reconnects until stopped.
 func (l *leanlink) run() {
 	defer close(l.done)
+	defer func() {
+		l.mu.Lock()
+		l.failPendingLocked(ErrNotConnected)
+		l.mu.Unlock()
+	}()
 	for attempt := 0; ; attempt++ {
 		if d := backoff(attempt); d > 0 {
 			select {
@@ -246,14 +254,18 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 
 	l.mu.Lock()
 	l.conn, l.w = conn, w
-	l.pending = map[uint16]*pending{}
-	l.inflight = map[uint16]bool{}
 	l.quota = nil
 	if l.v5 {
 		l.quota = make(chan struct{}, ca.receiveMaximum)
 	}
 	l.maxQoS, l.retainOK, l.maxPacket = ca.maximumQoS, ca.retainAvailable, ca.maximumPacket
 	l.aliases = nil
+	if sessionPresent := body[0]&1 == 1; sessionPresent && l.persistent() {
+		l.resumeLocked()
+	} else {
+		l.failPendingLocked(errSessionLost)
+		l.inflight = map[uint16]bool{}
+	}
 	l.mu.Unlock()
 	l.lastRecv.Store(time.Now().UnixNano())
 	l.up.Store(true)
@@ -266,10 +278,16 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 		l.mu.Lock()
 		conn.Close()
 		l.conn, l.w = nil, nil
-		for id := range l.pending {
-			if p := l.takeLocked(id); p.done != nil {
-				p.done <- ErrNotConnected
+		if l.persistent() && !l.stopped() {
+			// Unacknowledged publishes wait for the next connection: they
+			// are resent if the broker still has the session.
+			for id, p := range l.pending {
+				if p.done == nil {
+					l.takeLocked(id) // SUBSCRIBE: redone on every connection
+				}
 			}
+		} else {
+			l.failPendingLocked(ErrNotConnected)
 		}
 		l.mu.Unlock()
 	}()
@@ -568,6 +586,11 @@ func (l *leanlink) control(h byte, body []byte) error {
 			l.complete(id, errors.New("publish rejected by broker: "+reasonText(code, reason)))
 			return nil
 		}
+		l.mu.Lock()
+		if p := l.pending[id]; p != nil {
+			p.rel, p.pkt = true, nil
+		}
+		l.mu.Unlock()
 		l.writePacket([]byte{pPubrel<<4 | 0x02, 2, byte(id >> 8), byte(id)}, true)
 	case pSuback:
 		rest := body[2:]
@@ -595,6 +618,55 @@ func (l *leanlink) complete(id uint16, err error) {
 	l.mu.Unlock()
 	if p != nil && p.done != nil {
 		p.done <- err
+	}
+}
+
+// errSessionLost fails publishes that were in flight when the connection
+// dropped and the broker did not keep the session: they may or may not have
+// been delivered.
+var errSessionLost = errors.New("connection lost before the broker acknowledged the publish, and the broker did not keep the session")
+
+// persistent reports whether the broker keeps our session across a
+// disconnect: MQTT 3 with clean_session false, MQTT 5 with clean start off
+// and a session expiry.
+func (l *leanlink) persistent() bool {
+	return !l.cfg.UseCleanSession() && (!l.v5 || l.cfg.SessionExpirySec > 0)
+}
+
+// resumeLocked continues a session the broker kept: unacknowledged
+// publishes are resent with the DUP flag, and QoS 2 publishes that were
+// already received by the broker get their PUBREL again (MQTT 3.1.1 4.4,
+// MQTT 5 4.4). Inbound QoS 2 state is kept, so a redelivered PUBLISH is not
+// delivered twice.
+func (l *leanlink) resumeLocked() {
+	for id, p := range l.pending {
+		if p.done == nil {
+			continue
+		}
+		if p.quota != nil { // move the Receive Maximum slot to the new connection
+			p.quota = nil
+			select {
+			case l.quota <- struct{}{}:
+				p.quota = l.quota
+			default:
+			}
+		}
+		if p.rel {
+			_, _ = l.w.Write([]byte{pPubrel<<4 | 0x02, 2, byte(id >> 8), byte(id)})
+		} else {
+			p.pkt[0] |= 0x08 // DUP
+			_, _ = l.w.Write(p.pkt)
+		}
+	}
+	l.flushLocked()
+}
+
+// failPendingLocked ends every pending operation with err.
+func (l *leanlink) failPendingLocked(err error) {
+	for id := range l.pending {
+		if p := l.takeLocked(id); p.done != nil {
+			p.done <- err
+		}
 	}
 }
 
@@ -707,7 +779,6 @@ func (l *leanlink) send(ctx context.Context, msg Message) func() error {
 	if msg.QoS > 0 {
 		id = l.allocIDLocked()
 		p = &pending{done: make(chan error, 1), quota: quota}
-		l.pending[id] = p
 		b = binary.BigEndian.AppendUint16(b, id)
 	}
 	if l.v5 {
@@ -715,14 +786,25 @@ func (l *leanlink) send(ctx context.Context, msg Message) func() error {
 	}
 	b = append(b, msg.Payload...)
 	pkt := packet(h, b)
-	var err error
 	if l.maxPacket > 0 && len(pkt) > l.maxPacket {
-		err = fmt.Errorf("message is %d bytes, over the broker's maximum packet size of %d", len(pkt), l.maxPacket)
-	} else if _, err = l.w.Write(pkt); err == nil {
+		l.mu.Unlock()
+		release()
+		return fail(fmt.Errorf("message is %d bytes, over the broker's maximum packet size of %d", len(pkt), l.maxPacket))
+	}
+	if p != nil {
+		p.pkt = pkt
+		l.pending[id] = p
+	}
+	_, err := l.w.Write(pkt)
+	if err == nil {
 		_ = l.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		err = l.w.Flush()
 	}
-	if err != nil && p != nil {
+	if err != nil && p != nil && l.persistent() {
+		// The connection broke mid-write; the read loop will notice. The
+		// publish stays pending and is resent if the session resumes.
+		err = nil
+	} else if err != nil && p != nil {
 		l.takeLocked(id)
 	}
 	l.mu.Unlock()
