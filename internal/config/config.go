@@ -47,6 +47,10 @@ type Broker struct {
 	Username     string   `json:"username,omitempty"`
 	Password     string   `json:"password,omitempty"`
 	PasswordFile string   `json:"password_file,omitempty"`
+	// AuthMethod selects MQTT 5 enhanced authentication with the username
+	// and password: SCRAM-SHA-1, SCRAM-SHA-256 or SCRAM-SHA-512. The
+	// password is then never sent to the broker.
+	AuthMethod string `json:"auth_method,omitempty"`
 	// ProtocolVersion: 3 = MQTT 3.1, 4 = MQTT 3.1.1 (default), 5 = MQTT 5.
 	ProtocolVersion uint `json:"protocol_version,omitempty"`
 	// MQTT 5 only: session expiry after disconnect (0 = end with the
@@ -182,6 +186,18 @@ func (b *Broker) Validate() error {
 	}
 	if b.ProtocolVersion != 5 && (b.SessionExpirySec != 0 || b.TopicAliasMaximum != nil) {
 		return errors.New("session_expiry_sec and topic_alias_maximum need protocol_version 5")
+	}
+	switch b.AuthMethod {
+	case "":
+	case "SCRAM-SHA-1", "SCRAM-SHA-256", "SCRAM-SHA-512":
+		if b.ProtocolVersion != 5 {
+			return errors.New("auth_method (enhanced authentication) needs protocol_version 5")
+		}
+		if b.Username == "" || (b.Password == "" && b.PasswordFile == "") {
+			return errors.New("auth_method " + b.AuthMethod + " needs a username and a password (or password_file)")
+		}
+	default:
+		return errors.New("auth_method must be SCRAM-SHA-1, SCRAM-SHA-256 or SCRAM-SHA-512")
 	}
 	if w := b.Will; w != nil {
 		if err := topic.ValidateName(w.Topic); err != nil {
@@ -481,6 +497,7 @@ func BrokerFromEnv() (b Broker, ok bool, err error) {
 	b.Username = envStr("MQTT_USERNAME", "")
 	b.Password = envStr("MQTT_PASSWORD", "")
 	b.PasswordFile = envStr("MQTT_PASSWORD_FILE", "")
+	b.AuthMethod = envStr("MQTT_AUTH_METHOD", "")
 	b.ProtocolVersion = uint(envInt("MQTT_PROTOCOL_VERSION", 4))
 	if v := Env("MQTT_CLEAN_SESSION"); v != "" {
 		c := envBool("MQTT_CLEAN_SESSION", true)

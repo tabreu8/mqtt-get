@@ -3,7 +3,6 @@ package mqttc
 import (
 	"encoding/binary"
 	"errors"
-	"strings"
 	"unsafe"
 
 	"github.com/tabreu8/mqtt-get/internal/store"
@@ -23,6 +22,8 @@ const (
 	propCorrelationData   = 0x09
 	propSessionExpiry     = 0x11
 	propWillDelay         = 0x18
+	propAuthMethod        = 0x15
+	propAuthData          = 0x16
 	propAssignedClientID  = 0x12
 	propServerKeepAlive   = 0x13
 	propReasonString      = 0x1F
@@ -206,6 +207,25 @@ func appendPublishProps(b []byte, p *store.Props) []byte {
 	return append(appendVarint(b, len(pb)), pb...)
 }
 
+// authData returns the Authentication Data property, if any.
+func authData(props []byte) []byte {
+	var d []byte
+	_ = forEachProp(props, func(id byte, v []byte) {
+		if id == propAuthData {
+			d = v
+		}
+	})
+	return d
+}
+
+// authPacket builds an MQTT 5 AUTH packet continuing the exchange.
+func authPacket(method string, data []byte) []byte {
+	pb := appendStr([]byte{propAuthMethod}, method)
+	pb = binary.BigEndian.AppendUint16(append(pb, propAuthData), uint16(len(data)))
+	pb = append(pb, data...)
+	return packet(pAuth<<4, append(appendVarint([]byte{0x18}, len(pb)), pb...))
+}
+
 // connack holds what mqtt-get uses from a v5 CONNACK.
 type connack struct {
 	reason           string
@@ -215,6 +235,7 @@ type connack struct {
 	retainAvailable  bool
 	maximumPacket    int // 0 = unlimited
 	assignedClientID string
+	authData         []byte
 }
 
 func parseConnack(props []byte) (connack, error) {
@@ -236,7 +257,9 @@ func parseConnack(props []byte) (connack, error) {
 		case propMaximumPacketSize:
 			c.maximumPacket = int(binary.BigEndian.Uint32(v))
 		case propAssignedClientID:
-			c.assignedClientID = strings.Clone(view(v))
+			c.assignedClientID = string(v)
+		case propAuthData:
+			c.authData = append([]byte(nil), v...)
 		}
 	})
 	return c, err

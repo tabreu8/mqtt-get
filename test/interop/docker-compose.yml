@@ -17,6 +17,13 @@ services:
     volumes: [*certs]
     ports: ["21883:21883", "21083:21083", "21893:21893", "21894:21894", "21094:21094", "21081:21081"]
 
+  emqx-setup: # creates the SCRAM user (EMQX can't bootstrap SCRAM users from a file)
+    image: curlimages/curl:latest
+    depends_on: [emqx]
+    environment: {EMQX_API: "http://emqx:21081"}
+    volumes: [./configs/emqx-setup.sh:/emqx-setup.sh:ro]
+    entrypoint: ["/bin/sh", "/emqx-setup.sh"]
+
   hivemq:
     image: hivemq/hivemq-ce:latest
     volumes: [*certs, ./configs/hivemq.xml:/opt/hivemq/conf/config.xml:ro]

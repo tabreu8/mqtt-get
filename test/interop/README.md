@@ -39,6 +39,9 @@ For every endpoint the suite checks the following. Checks that don't apply to an
 | `mqtt5_message_expiry` | MQTT 5 only: a value published with a 1 s expiry is served, then returns `404 … expired` |
 | `mqtt5_request_response` | MQTT 5 only: publish-and-wait sets response topic + correlation data; a device reply with foreign correlation data is ignored, the correlated one is returned |
 | `split_subscriptions` | 3 connections with `subscription_mode: split` (one filter each): 300 messages ingested exactly once, `[100 100 100]`. Works on every broker, including Coreflux, which lacks `$share` |
+| `last_will` | A status topic with a Last Will: `online` on connect; the connection is cut by a TCP proxy (a network failure, not a clean DISCONNECT) → the broker publishes the will (`offline`); mqtt-get reconnects → `online`; graceful shutdown → `offline` |
+
+The EMQX endpoint `v5-tcp-scram` authenticates with **SCRAM-SHA-256** (MQTT 5 enhanced authentication): the full check list passes, and a wrong password is refused. Its SCRAM user is created by `configs/emqx-setup.sh` (the `emqx-setup` service in Docker Compose), because EMQX can't bootstrap SCRAM users from a file. EMQX 6.3.1 doesn't publish the will of a SCRAM-authenticated client, so `last_will` is skipped on that endpoint (the same happens with the Eclipse paho.golang client, and the same will works with password auth).
 
 Also verified by hand: when the broker is killed and restarted, mqtt-get reports 503 on `/healthz` with a clear error, refuses publishes with "not connected", then reconnects and resubscribes by itself about 1 s after the broker returns.
 

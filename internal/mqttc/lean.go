@@ -55,6 +55,10 @@ type leanlink struct {
 	// Only touched by the read loop; reset on every connection.
 	aliases map[uint16]string
 
+	// auth is the enhanced-authentication exchange of the connection being
+	// set up (MQTT 5 SCRAM), nil otherwise.
+	auth *scram
+
 	ctr  counters
 	up   atomic.Bool
 	quit chan struct{}
@@ -206,6 +210,14 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 	}
 	w := bufio.NewWriterSize(conn, 32<<10)
 	_ = conn.SetDeadline(time.Now().Add(timeout))
+	l.auth = nil
+	if l.v5 && l.cfg.AuthMethod != "" {
+		user, pass := l.m.credentials(l.cfg)
+		if l.auth, err = newSCRAM(l.cfg.AuthMethod, user, pass); err != nil {
+			conn.Close()
+			return false, err
+		}
+	}
 	if _, err := w.Write(l.connectPacket()); err != nil {
 		conn.Close()
 		return false, err
@@ -214,10 +226,42 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 		conn.Close()
 		return false, err
 	}
-	h, body, err := readPacket(r, nil)
-	if err != nil {
-		conn.Close()
-		return false, fmt.Errorf("waiting for CONNACK: %w", err)
+	var h byte
+	var body []byte
+	for {
+		h, body, err = readPacket(r, nil)
+		if err != nil {
+			conn.Close()
+			return false, fmt.Errorf("waiting for CONNACK: %w", err)
+		}
+		if h>>4 != pAuth || l.auth == nil {
+			break
+		}
+		// Enhanced authentication: answer the broker's challenge.
+		if len(body) < 1 || body[0] != 0x18 {
+			conn.Close()
+			return false, errors.New("unexpected AUTH packet during authentication")
+		}
+		props, _, perr := splitProps(body[1:])
+		if perr != nil {
+			conn.Close()
+			return false, fmt.Errorf("AUTH: %w", perr)
+		}
+		final, aerr := l.auth.clientFinal(authData(props))
+		if aerr != nil {
+			_, _ = w.Write([]byte{pDisconnect << 4, 1, 0x87})
+			_ = w.Flush()
+			conn.Close()
+			return false, aerr
+		}
+		if _, err := w.Write(authPacket(l.cfg.AuthMethod, final)); err != nil {
+			conn.Close()
+			return false, err
+		}
+		if err := w.Flush(); err != nil {
+			conn.Close()
+			return false, err
+		}
 	}
 	if h>>4 != pConnack || len(body) < 2 {
 		conn.Close()
@@ -236,6 +280,15 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 		if perr != nil {
 			conn.Close()
 			return false, fmt.Errorf("CONNACK: %w", perr)
+		}
+		if l.auth != nil {
+			// The broker proves it knows the password too.
+			if err := l.auth.verifyServer(ca.authData); err != nil {
+				_, _ = w.Write([]byte{pDisconnect << 4, 1, 0x87})
+				_ = w.Flush()
+				conn.Close()
+				return false, err
+			}
 		}
 	} else if rc := body[1]; rc != 0 {
 		conn.Close()
@@ -320,6 +373,9 @@ func (l *leanlink) connectPacket() []byte {
 	if hasCredentials(l.cfg) {
 		user, pass = l.m.credentials(l.cfg) // re-read on every connect
 	}
+	if l.auth != nil {
+		pass = "" // SCRAM: the password never goes on the wire
+	}
 	if user != "" {
 		flags |= 0x80
 	}
@@ -348,6 +404,12 @@ func (l *leanlink) connectPacket() []byte {
 			pb = binary.BigEndian.AppendUint32(append(pb, propSessionExpiry), l.cfg.SessionExpirySec)
 		}
 		pb = binary.BigEndian.AppendUint16(append(pb, propTopicAliasMaximum), l.aliasMax)
+		if l.auth != nil {
+			first := l.auth.clientFirst()
+			pb = appendStr(append(pb, propAuthMethod), l.cfg.AuthMethod)
+			pb = binary.BigEndian.AppendUint16(append(pb, propAuthData), uint16(len(first)))
+			pb = append(pb, first...)
+		}
 		b = append(appendVarint(b, len(pb)), pb...)
 	}
 	b = appendStr(b, l.clientID)

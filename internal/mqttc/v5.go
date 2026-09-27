@@ -41,7 +41,28 @@ type v5link struct {
 	aliasClient *paho.Client
 
 	serverReason atomic.Pointer[string] // the broker's DISCONNECT reason, if any
+	auth         atomic.Pointer[scram]  // enhanced authentication of the current connect
 }
+
+// Authenticate answers the broker's SCRAM challenge (paho.Auther).
+func (l *v5link) Authenticate(in *paho.Auth) *paho.Auth {
+	out := &paho.Auth{ReasonCode: 0x18, Properties: &paho.AuthProperties{AuthMethod: l.cfg.AuthMethod}}
+	sc := l.auth.Load()
+	if sc == nil || in.Properties == nil {
+		return out
+	}
+	final, err := sc.clientFinal(in.Properties.AuthData)
+	if err != nil {
+		l.m.setErr("connect failed: " + err.Error())
+		return out // no proof: the broker refuses the connection
+	}
+	out.Properties.AuthData = final
+	return out
+}
+
+// Authenticated is called by paho once the exchange succeeded; the broker's
+// signature is checked in OnConnectionUp, which has the CONNACK.
+func (l *v5link) Authenticated() {}
 
 // defaultTopicAliasMaximum is how many topic aliases the broker may use
 // towards mqtt-get unless configured.
@@ -112,6 +133,15 @@ func (l *v5link) start() {
 			if cp.Properties == nil {
 				cp.Properties = &paho.ConnectProperties{}
 			}
+			if cfg.AuthMethod != "" {
+				sc, err := newSCRAM(cfg.AuthMethod, cp.Username, string(cp.Password))
+				if err != nil {
+					return nil, err
+				}
+				l.auth.Store(sc)
+				cp.Password, cp.PasswordFlag = nil, false // never on the wire
+				cp.Properties.AuthMethod, cp.Properties.AuthData = cfg.AuthMethod, sc.clientFirst()
+			}
 			cp.Properties.ReceiveMaximum = &receiveMax
 			cp.Properties.TopicAliasMaximum = &aliasMax
 			cp.Properties.RequestProblemInfo = true
@@ -124,7 +154,19 @@ func (l *v5link) start() {
 			}
 			return cp, nil
 		},
-		OnConnectionUp: func(cm *autopaho.ConnectionManager, _ *paho.Connack) {
+		OnConnectionUp: func(cm *autopaho.ConnectionManager, ca *paho.Connack) {
+			if sc := l.auth.Load(); sc != nil {
+				var data []byte
+				if ca != nil && ca.Properties != nil {
+					data = ca.Properties.AuthData
+				}
+				if err := sc.verifyServer(data); err != nil {
+					// Not the broker we share the password with: stop.
+					l.m.setErr("connect failed: " + err.Error() + "; not reconnecting")
+					go func() { _ = cm.Disconnect(context.Background()) }()
+					return
+				}
+			}
 			l.up.Store(true)
 			l.m.linkUp(l.clientID)
 			if w := cfg.Will; w != nil && w.OnlinePayload != "" && l.idx == 0 {
@@ -153,6 +195,7 @@ func (l *v5link) start() {
 		OnConnectError: func(err error) { l.m.setErr("connect failed: " + describeV5Error(err)) },
 		ClientConfig: paho.ClientConfig{
 			ClientID:          l.clientID,
+			AuthHandler:       l,
 			OnPublishReceived: []func(paho.PublishReceived) (bool, error){l.onPublish},
 			OnClientError:     func(err error) { l.m.setErr("client error: " + err.Error()) },
 			OnServerDisconnect: func(d *paho.Disconnect) {

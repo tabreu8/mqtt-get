@@ -114,6 +114,18 @@
           "password": "mg-pass"
         },
         {
+          "name": "v5-tcp-scram",
+          "url": "tcp://127.0.0.1:21883",
+          "protocol_version": 5,
+          "auth_method": "SCRAM-SHA-256",
+          "username": "scram-user",
+          "password": "scram-pass",
+          "wrong_password_rejected": true,
+          "skip": {
+            "last_will": "EMQX 6.3.1 does not publish the will of a client authenticated with SCRAM (same result with the lean and the paho.golang client; the same will works with password auth on this broker)"
+          }
+        },
+        {
           "name": "v5-tcp-password",
           "url": "tcp://127.0.0.1:21883",
           "username": "mg",

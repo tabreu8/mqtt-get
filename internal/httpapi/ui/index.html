@@ -132,6 +132,7 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
         <div><label>Username</label><input name="username" autocomplete="off"></div>
         <div><label>Password / token</label><input name="password" type="password" autocomplete="new-password"></div>
         <div><label>Password file (optional, re-read on reconnect)</label><input name="password_file"></div>
+        <div><label>Authentication (MQTT 5)</label><select name="auth_method"><option value="">Username / password</option><option>SCRAM-SHA-256</option><option>SCRAM-SHA-512</option><option>SCRAM-SHA-1</option></select></div>
         <div><label>Keep-alive (s)</label><input name="keepalive_sec" type="number"></div>
         <div><label>Session expiry (s, MQTT 5)</label><input name="session_expiry_sec" type="number" min="0"></div>
       </div>
@@ -354,7 +355,7 @@ async function loadBroker() {
   const set = (n, v) => { const el = f.elements[n]; if (!el) return; if (el.type === 'checkbox') el.checked = !!v; else el.value = v ?? ''; };
   set('urls', (c.urls || []).join('\n')); set('client_id', c.client_id); set('protocol_version', c.protocol_version || 4);
   set('username', c.username); set('password', c.password); set('password_file', c.password_file); set('keepalive_sec', c.keepalive_sec);
-  set('session_expiry_sec', c.session_expiry_sec || '');
+  set('session_expiry_sec', c.session_expiry_sec || ''); set('auth_method', c.auth_method || '');
   set('clean_session', c.clean_session !== false);
   set('subscriptions', (c.subscriptions || []).map(s => s.filter + (s.qos ? ' ' + s.qos : '')).join('\n'));
   const t = c.tls || {};
@@ -374,7 +375,7 @@ $('#brokerForm').onsubmit = async ev => {
   const body = {
     urls: lines(e.urls.value), client_id: v('client_id'), protocol_version: num('protocol_version'),
     username: v('username'), password: e.password.value, password_file: v('password_file'), keepalive_sec: num('keepalive_sec'),
-    ...(num('protocol_version') === 5 ? { session_expiry_sec: num('session_expiry_sec') } : {}),
+    ...(num('protocol_version') === 5 ? { session_expiry_sec: num('session_expiry_sec'), auth_method: e.auth_method.value } : {}),
     clean_session: e.clean_session.checked,
     subscriptions: lines(e.subscriptions.value).map(l => { const [f, q] = l.split(/\s+/); return { filter: f, qos: parseInt(q) || 0 }; }),
     tls: {

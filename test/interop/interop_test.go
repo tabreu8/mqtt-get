@@ -17,8 +17,10 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -44,6 +46,8 @@ type Endpoint struct {
 	ProtocolVersion uint   `json:"protocol_version,omitempty"`
 	Username        string `json:"username,omitempty"`
 	Password        string `json:"password,omitempty"`
+	// AuthMethod enables MQTT 5 enhanced authentication (e.g. SCRAM-SHA-256).
+	AuthMethod string `json:"auth_method,omitempty"`
 	// TLS: "" (none), "ca" (verify server with the CA) or "mtls" (also
 	// present the client certificate).
 	TLS        string `json:"tls,omitempty"`
@@ -113,6 +117,7 @@ func (f File) brokerConfig(ep Endpoint, clientID string, topics ...string) confi
 		ClientID:          clientID,
 		Username:          ep.Username,
 		Password:          ep.Password,
+		AuthMethod:        ep.AuthMethod,
 		ConnectTimeoutSec: 5,
 		ProtocolVersion:   ep.ProtocolVersion,
 	}
@@ -284,6 +289,119 @@ func (h *harness) peerPublish(topic string, payload []byte, qos byte, retain boo
 	if err := h.peer.Publish(ctx, topic, payload, qos, retain); err != nil {
 		h.t.Fatalf("peer publish: %v", err)
 	}
+}
+
+// killProxy forwards TCP connections to a broker and can cut them all at
+// once, which the broker sees as a network failure (as opposed to a clean
+// MQTT DISCONNECT).
+type killProxy struct {
+	l      net.Listener
+	target string
+	mu     sync.Mutex
+	conns  []net.Conn
+}
+
+func startKillProxy(t *testing.T, target string) *killProxy {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &killProxy{l: l, target: target}
+	t.Cleanup(func() { l.Close(); p.kill() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", target)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			p.mu.Lock()
+			p.conns = append(p.conns, c, up)
+			p.mu.Unlock()
+			go func() { _, _ = io.Copy(up, c); up.Close() }()
+			go func() { _, _ = io.Copy(c, up); c.Close() }()
+		}
+	}()
+	return p
+}
+
+func (p *killProxy) kill() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, c := range p.conns {
+		c.Close()
+	}
+	p.conns = nil
+}
+
+// testLastWill checks the will as a status topic: online on connect, the
+// will from the broker when the network drops, online again after the
+// reconnect, offline from mqtt-get on a graceful shutdown.
+func testLastWill(t *testing.T, f File, ep Endpoint, h *harness) {
+	u, err := url.Parse(ep.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port := u.Hostname(), u.Port()
+	if port == "" {
+		port = "1883"
+		if strings.HasPrefix(u.Scheme, "ws") {
+			port = "80"
+		}
+		if ep.TLS != "" {
+			port = "8883"
+		}
+	}
+	proxy := startKillProxy(t, net.JoinHostPort(host, port))
+	u.Host = proxy.l.Addr().String()
+
+	topic := h.ns + "/will-status"
+	seen := make(chan string, 16)
+	observer := mqttc.New(quietLog(), func(e store.Entry) {
+		if e.Topic == topic {
+			seen <- string(e.Payload)
+		}
+	})
+	defer observer.Close()
+	if err := observer.Apply(f.brokerConfig(ep, clientID("observer"), topic)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "observer to connect", 15*time.Second, func() bool { return observer.Status().Connected })
+	time.Sleep(300 * time.Millisecond)
+
+	cfg := f.brokerConfig(ep, clientID("will"))
+	cfg.URLs = []string{u.String()}
+	if cfg.TLS.ServerName == "" && ep.TLS != "" {
+		cfg.TLS.ServerName = host
+	}
+	cfg.Subscriptions = []config.Subscription{} // publish only
+	cfg.KeepAliveSec = 5
+	cfg.Will = &config.Will{Topic: topic, Payload: "offline", QoS: 1, OnlinePayload: "online"}
+	m := mqttc.New(quietLog(), func(store.Entry) {})
+	if err := m.Apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	expect := func(want, why string) {
+		t.Helper()
+		select {
+		case got := <-seen:
+			if got != want {
+				t.Fatalf("%s: got %q, want %q", why, got, want)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatalf("%s: no %q on %s", why, want, topic)
+		}
+	}
+	expect("online", "after connect")
+	proxy.kill()
+	expect("offline", "will after the network dropped")
+	expect("online", "after the reconnect")
+	m.Close()
+	expect("offline", "on graceful shutdown")
 }
 
 // --- tests -------------------------------------------------------------
@@ -486,6 +604,7 @@ func runEndpoint(t *testing.T, f File, ep Endpoint) {
 	if ep.SplitSubscriptions {
 		sub("split_subscriptions", func(t *testing.T) { testSplit(t, f, ep, h) })
 	}
+	sub("last_will", func(t *testing.T) { testLastWill(t, f, ep, h) })
 }
 
 func expectRejected(t *testing.T, cfg config.Broker) {

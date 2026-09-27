@@ -394,6 +394,7 @@ var tools = []*tool{
 			"username":            str("Username"),
 			"password":            str("Password or token"),
 			"password_file":       str("File to read the password from on every connect"),
+			"auth_method":         enum("MQTT 5 enhanced authentication with username/password; the password is never sent (needs protocol_version 5). Empty = plain username/password", "", "SCRAM-SHA-1", "SCRAM-SHA-256", "SCRAM-SHA-512"),
 			"protocol_version":    enum("4 = MQTT 3.1.1 (default), 3 = MQTT 3.1, 5 = MQTT 5 (properties, reason codes, request/response)", 3, 4, 5),
 			"session_expiry_sec":  integer("MQTT 5: keep the session this long after a disconnect", 0, 1<<31-1),
 			"topic_alias_maximum": integer("MQTT 5: topic aliases the broker may use towards mqtt-get (default 1024)", 0, 65535),

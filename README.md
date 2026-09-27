@@ -331,6 +331,7 @@ function verify(headers, rawBody /* Buffer */) {
 |---|---|---|
 | Anonymous | `MQTT_URL` | |
 | Username + password | `MQTT_USERNAME`, `MQTT_PASSWORD` | Also used for **tokens** (JWT, SAS, API keys) sent as the password |
+| **SCRAM** (MQTT 5 enhanced auth) | `MQTT_AUTH_METHOD=SCRAM-SHA-256` + username/password | The password never crosses the wire, and the broker must prove it knows it too (mqtt-get refuses a broker that can't). Also `SCRAM-SHA-512`, `SCRAM-SHA-1`. Needs `MQTT_PROTOCOL_VERSION=5`; tested on EMQX |
 | Rotating token / Docker secret | `MQTT_PASSWORD_FILE` | The file is **re-read on every reconnect**, so update the file and the next reconnect uses the new token |
 | TLS, public CA | `mqtts://host:8883` | Uses the system trust store |
 | TLS, private CA | `+ MQTT_TLS_CA_FILE` or `MQTT_TLS_CA_PEM` | Added to the system roots |
@@ -376,7 +377,7 @@ curl -X POST -H "Authorization: Bearer $KEY" -H "X-MQTT-Content-Type: text/plain
 
 Header names: `X-MQTT-Content-Type`, `X-MQTT-Response-Topic`, `X-MQTT-Correlation-Data` (base64), `X-MQTT-Message-Expiry` (seconds), `X-MQTT-User-Property` (`key=value`, repeatable) and `X-MQTT-Payload-Format` (`utf8`). Publishing properties over an MQTT 3.1.1 connection returns `400`.
 
-Tested on Mosquitto, EMQX, HiveMQ CE, NanoMQ and Coreflux over TCP, TLS, mTLS and WSS (see [Tested brokers](#tested-brokers)). MQTT 5 enhanced authentication (AUTH packets, e.g. SCRAM) isn't supported yet.
+Tested on Mosquitto, EMQX, HiveMQ CE, NanoMQ and Coreflux over TCP, TLS, mTLS and WSS (see [Tested brokers](#tested-brokers)). **Enhanced authentication** (AUTH packets) is supported with SCRAM-SHA-1/256/512 (`MQTT_AUTH_METHOD`, see the table above); other methods (e.g. Kerberos, custom challenge/response) aren't.
 
 > Over WebSocket, mqtt-get always sends one complete MQTT packet per WebSocket frame. The MQTT spec allows packets to be split across frames, but Mosquitto 2 rejects that for MQTT 5, and aligned frames work everywhere.
 
@@ -406,7 +407,7 @@ MQTT_USERNAME=bridge
 MQTT_PASSWORD=secret
 # WebSocket alternative:  MQTT_URL=wss://…:8084/mqtt
 ```
-Shared subscriptions are supported.
+Shared subscriptions are supported. With a SCRAM authenticator (built-in database) you can use `MQTT_PROTOCOL_VERSION=5` and `MQTT_AUTH_METHOD=SCRAM-SHA-256` so the password never goes over the connection. EMQX 6.3 doesn't publish the Last Will of SCRAM-authenticated clients, so use password auth if you rely on a [status topic](#last-will-and-status-topic).
 </details>
 
 <details><summary><b>HiveMQ</b> (HiveMQ Cloud or self-hosted)</summary>
@@ -551,6 +552,7 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `MQTT_CLIENT_ID` | `mqtt-get-<hostname>` | Must be unique on the broker |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | – | |
 | `MQTT_PASSWORD_FILE` | – | Read on every (re)connect; trailing newline stripped |
+| `MQTT_AUTH_METHOD` | – | MQTT 5 enhanced authentication: `SCRAM-SHA-256`, `SCRAM-SHA-512` or `SCRAM-SHA-1` (uses the username and password; the password is never sent) |
 | `MQTT_PROTOCOL_VERSION` | `4` | `4` = MQTT 3.1.1, `5` = [MQTT 5](#mqtt-5), `3` = MQTT 3.1 |
 | `MQTT_SESSION_EXPIRY_SEC` | `0` | MQTT 5: keep the session this long after a disconnect |
 | `MQTT_TOPIC_ALIAS_MAXIMUM` | `1024` | MQTT 5: topic aliases the broker may use towards mqtt-get (`0` disables) |
@@ -1043,4 +1045,4 @@ internal/config     configuration model and environment parsing
 test/interop        real-broker interoperability suite + docker-compose
 ```
 
-**Limitations** (by design, for now): MQTT 5 enhanced authentication (AUTH packets) isn't supported; values and webhook queues live in memory; there is no history, only the latest value per topic.
+**Limitations** (by design, for now): enhanced authentication supports SCRAM only; values and webhook queues live in memory; there is no history, only the latest value per topic.
