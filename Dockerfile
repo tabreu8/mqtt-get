@@ -5,7 +5,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/tabreu8/mqtt-get/internal/api.Version=${VERSION}" \
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/tabreu8/mqtt-get/internal/core.Version=${VERSION}" \
     -o /out/mqtt-get ./cmd/mqtt-get
 
 FROM gcr.io/distroless/static-debian12:nonroot

@@ -1,4 +1,4 @@
-package api
+package httpapi
 
 import (
 	"fmt"
@@ -10,7 +10,7 @@ import (
 
 // handleMetrics writes Prometheus text-format metrics.
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	st := s.mqtt.Status()
+	st := s.svc.MQTTStatus()
 	var b strings.Builder
 	metric := func(name, typ, help string, v any) {
 		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n%s %v\n", name, help, name, typ, name, v)
@@ -27,14 +27,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	metric("mqttget_bytes_received_total", "counter", "MQTT payload bytes received.", st.BytesReceived)
 	metric("mqttget_messages_published_total", "counter", "MQTT messages published via the API.", st.MessagesSent)
 	metric("mqttget_publish_errors_total", "counter", "Failed publish attempts.", st.PublishErrors)
-	metric("mqttget_topics", "gauge", "Distinct topics with a stored latest value.", s.store.Len())
-	metric("mqttget_topics_dropped_total", "counter", "Messages not stored because MAX_TOPICS was reached.", s.store.Dropped())
+	metric("mqttget_topics", "gauge", "Distinct topics with a stored latest value.", s.svc.Store().Len())
+	metric("mqttget_topics_dropped_total", "counter", "Messages not stored because MAX_TOPICS was reached.", s.svc.Store().Dropped())
+	metric("mqttget_active_watchers", "gauge", "Active waits and MCP resource subscriptions.", s.svc.Status().Watchers)
 	metric("mqttget_goroutines", "gauge", "Number of goroutines.", runtime.NumGoroutine())
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	metric("mqttget_heap_bytes", "gauge", "Heap bytes in use.", ms.HeapInuse)
 
-	stats := s.hooks.AllStats()
+	stats := s.svc.WebhookStats()
 	ids := make([]string, 0, len(stats))
 	for id := range stats {
 		ids = append(ids, id)

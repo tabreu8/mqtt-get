@@ -441,11 +441,14 @@ curl -X POST -H "Authorization: Bearer ${k}" -H 'Content-Type: application/json'
 curl -H "Authorization: Bearer ${k}" ${o}/metrics`;
   $('#mcpText').textContent = `Streamable HTTP endpoint: ${o}/mcp  (header  Authorization: Bearer ${k})
 
-# Claude Code
+# Claude Code (remote)
 claude mcp add --transport http mqtt ${o}/mcp --header "Authorization: Bearer ${k}"
 
-# stdio clients (e.g. Claude Desktop) via the built-in bridge
-{"mcpServers":{"mqtt":{"command":"mqtt-get","args":["mcp","--url","${o}"],"env":{"MQTT_GET_API_KEY":"${k}"}}}}`;
+# stdio clients (e.g. Claude Desktop), proxied to this server
+{"mcpServers":{"mqtt":{"command":"mqtt-get","args":["mcp","--url","${o}"],"env":{"MQTT_GET_API_KEY":"${k}"}}}}
+
+# stdio, standalone: the agent runs its own mqtt-get (no server needed)
+{"mcpServers":{"mqtt":{"command":"mqtt-get","args":["mcp"],"env":{"MQTT_URL":"tcp://broker:1883","MCP_SCOPES":"read"}}}}`;
 }
 
 async function start() {

@@ -1,4 +1,4 @@
-package api
+package httpapi
 
 import (
 	"encoding/json"
@@ -18,6 +18,8 @@ import (
 	"github.com/mochi-mqtt/server/v2/listeners"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
+	"github.com/tabreu8/mqtt-get/internal/core"
+	"github.com/tabreu8/mqtt-get/internal/mcp"
 	"github.com/tabreu8/mqtt-get/internal/state"
 	"github.com/tabreu8/mqtt-get/internal/store"
 )
@@ -52,7 +54,8 @@ func startBroker(t *testing.T) (*mochi.Server, string) {
 
 type env struct {
 	t      *testing.T
-	srv    *Server
+	svc    *core.Service
+	st     *state.State
 	http   *httptest.Server
 	broker *mochi.Server
 	admin  string
@@ -68,23 +71,27 @@ func setup(t *testing.T, password string) *env {
 	}
 	st.SetEnvKeys([]string{"admin-key"}, []string{"read-key"}, nil)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(cfg, log, st)
+	svc := core.New(cfg, log, st)
 	b := config.Broker{URLs: []string{"tcp://" + addr}, Username: "user", Password: password, ClientID: "test"}
-	if err := srv.Start(b, true); err != nil {
+	if err := svc.Start(b, true); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(srv.Close)
-	hs := httptest.NewServer(srv.Handler())
+	t.Cleanup(svc.Close)
+	// Wire it exactly like main: REST + MCP over the same core.
+	ms := mcp.New(svc, log, mcp.Options{})
+	t.Cleanup(ms.Close)
+	mh := ms.HTTPHandler(func(r *http.Request) (*core.Principal, error) { return svc.Authenticate(APIKey(r, false)) }, 0)
+	hs := httptest.NewServer(New(svc, mh).Handler())
 	t.Cleanup(hs.Close)
-	return &env{t: t, srv: srv, http: hs, broker: broker, admin: "admin-key"}
+	return &env{t: t, svc: svc, st: st, http: hs, broker: broker, admin: "admin-key"}
 }
 
 func (e *env) waitConnected() {
 	e.t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for !e.srv.mqtt.Status().Connected {
+	for !e.svc.MQTTStatus().Connected {
 		if time.Now().After(deadline) {
-			e.t.Fatalf("not connected: %+v", e.srv.mqtt.Status())
+			e.t.Fatalf("not connected: %+v", e.svc.MQTTStatus())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -131,7 +138,7 @@ func TestEndToEnd(t *testing.T) {
 
 	// Message from another MQTT client lands in the store.
 	_ = e.broker.Publish("sensors/kitchen/temp", []byte(`{"c":21.5}`), false, 0)
-	eventually(t, func() bool { _, ok := e.srv.store.Get("sensors/kitchen/temp"); return ok })
+	eventually(t, func() bool { _, ok := e.svc.Store().Get("sensors/kitchen/temp"); return ok })
 	code, body, hdr := e.do("GET", "/api/v1/values/sensors/kitchen/temp", "read-key", "")
 	if code != 200 || !strings.Contains(body, `"payload":{"c":21.5},"encoding":"json"`) {
 		t.Fatalf("get: %d %s", code, body)
@@ -155,8 +162,8 @@ func TestEndToEnd(t *testing.T) {
 	if code, body, _ := e.do("POST", "/api/v1/publish", e.admin, batch); code != 200 || !strings.Contains(body, `"published":2`) {
 		t.Fatalf("publish json: %d %s", code, body)
 	}
-	eventually(t, func() bool { _, ok := e.srv.store.Get("cmd/b"); return ok })
-	if v, _ := e.srv.store.Get("cmd/light"); v == nil || string(v.Payload) != "on" {
+	eventually(t, func() bool { _, ok := e.svc.Store().Get("cmd/b"); return ok })
+	if v, _ := e.svc.Store().Get("cmd/light"); v == nil || string(v.Payload) != "on" {
 		t.Fatalf("cmd/light = %+v", v)
 	}
 	code, body, _ = e.do("GET", "/api/v1/values?filter=cmd/%2B", "read-key", "")
@@ -188,7 +195,7 @@ func TestEndToEnd(t *testing.T) {
 	_ = e.broker.Publish("other/x", []byte("ignored"), false, 0)
 	var delivered uint64
 	eventually(t, func() bool {
-		for _, st := range e.srv.hooks.AllStats() {
+		for _, st := range e.svc.WebhookStats() {
 			delivered = st.Delivered
 		}
 		return delivered == 5
@@ -224,7 +231,7 @@ func TestMCP(t *testing.T) {
 	e := setup(t, "secret")
 	e.waitConnected()
 	_ = e.broker.Publish("room/1", []byte("22"), false, 0)
-	eventually(t, func() bool { _, ok := e.srv.store.Get("room/1"); return ok })
+	eventually(t, func() bool { _, ok := e.svc.Store().Get("room/1"); return ok })
 
 	rpc := func(key, body string) map[string]any {
 		code, out, _ := e.do("POST", "/mcp", key, body)
@@ -251,22 +258,22 @@ func TestMCP(t *testing.T) {
 			t.Fatal("read key must not see admin tools")
 		}
 	}
-	res := rpc("read-key", `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_latest_value","arguments":{"topic":"room/1"}}}`)
+	res := rpc("read-key", `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_value","arguments":{"topic":"room/1"}}}`)
 	text := res["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"].(string)
-	if !strings.Contains(text, `"payload": 22`) {
+	if !strings.Contains(text, `"payload":22`) {
 		t.Fatalf("get_latest_value: %s", text)
 	}
 	res = rpc(e.admin, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"publish","arguments":{"topic":"room/2","payload":"hi"}}}`)
 	if res["result"].(map[string]any)["isError"] == true {
 		t.Fatalf("publish: %v", res)
 	}
-	eventually(t, func() bool { _, ok := e.srv.store.Get("room/2"); return ok })
+	eventually(t, func() bool { _, ok := e.svc.Store().Get("room/2"); return ok })
 }
 
 func TestBrokerConfigViaAPI(t *testing.T) {
 	e := setup(t, "wrong-password")
 	time.Sleep(300 * time.Millisecond)
-	if e.srv.mqtt.Status().Connected {
+	if e.svc.MQTTStatus().Connected {
 		t.Fatal("should not connect with wrong password")
 	}
 	code, body, _ := e.do("GET", "/api/v1/broker", e.admin, "")
@@ -287,7 +294,7 @@ func TestBrokerConfigViaAPI(t *testing.T) {
 	if code, _, _ := e.do("PUT", "/api/v1/broker", e.admin, string(b)); code != 200 {
 		t.Fatal("re-put")
 	}
-	if saved, ok := e.srv.state.Broker(); !ok || saved.Password != "secret" {
+	if saved, ok := e.st.Broker(); !ok || saved.Password != "secret" {
 		t.Fatalf("persisted: %+v", saved)
 	}
 	e.waitConnected()
@@ -296,9 +303,9 @@ func TestBrokerConfigViaAPI(t *testing.T) {
 func BenchmarkGetValueHTTP(b *testing.B) {
 	st, _ := state.Open("")
 	st.SetEnvKeys([]string{"k"}, nil, nil)
-	srv := New(config.Server{MaxBodyBytes: 1 << 20}, slog.New(slog.NewTextHandler(io.Discard, nil)), st)
-	srv.ingest(storeEntry("a/b", `{"v":1}`))
-	h := srv.Handler()
+	svc := core.New(config.Server{MaxBodyBytes: 1 << 20}, slog.New(slog.NewTextHandler(io.Discard, nil)), st)
+	svc.Ingest(storeEntry("a/b", `{"v":1}`))
+	h := New(svc, nil).Handler()
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		req := httptest.NewRequest("GET", "/api/v1/values/a/b", nil)
@@ -319,8 +326,10 @@ func storeEntry(topic, payload string) *store.Entry {
 
 func BenchmarkIngest(b *testing.B) {
 	st, _ := state.Open("")
-	srv := New(config.Server{}, slog.New(slog.NewTextHandler(io.Discard, nil)), st)
-	srv.hooks.Put(config.Webhook{ID: "w", URL: "http://127.0.0.1:1", Topics: []string{"other/#"}})
+	svc := core.New(config.Server{}, slog.New(slog.NewTextHandler(io.Discard, nil)), st)
+	if _, err := svc.PutWebhook(config.Webhook{ID: "w", URL: "http://127.0.0.1:1", Topics: []string{"other/#"}}, true); err != nil {
+		b.Fatal(err)
+	}
 	topics := make([]string, 10000)
 	for i := range topics {
 		topics[i] = "devices/" + strconv.Itoa(i) + "/state"
@@ -329,6 +338,6 @@ func BenchmarkIngest(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		srv.ingest(&store.Entry{Topic: topics[i%len(topics)], Payload: p, Time: int64(i)})
+		svc.Ingest(&store.Entry{Topic: topics[i%len(topics)], Payload: p, Time: int64(i)})
 	}
 }

@@ -1,6 +1,6 @@
 # mqtt-get
 
-**A fast, lightweight bridge between MQTT and HTTP.** mqtt-get connects to your MQTT broker, remembers the **latest value of every topic**, and exposes it over a simple **REST API**. You can also **publish** over HTTP, forward messages to **webhooks**, and configure everything from **environment variables, the REST API, an AI agent (MCP) or a built-in web UI**.
+**A fast, lightweight bridge between MQTT, systems and AI agents.** mqtt-get connects to your MQTT broker and remembers the **latest value of every topic**. It serves that data through two interfaces built on the same core: a **REST API** for systems and an **MCP server** for AI agents. You can also **publish**, forward messages to **webhooks**, and configure everything from **environment variables, REST, MCP or a built-in web UI**.
 
 [![ci](https://github.com/tabreu8/mqtt-get/actions/workflows/ci.yml/badge.svg)](https://github.com/tabreu8/mqtt-get/actions/workflows/ci.yml)
 
@@ -46,6 +46,7 @@ MQTT is great for devices and poor for everything else. A dashboard, a spreadshe
 |---|---|
 | **Latest value, instantly** | Every message is kept in memory per topic. `GET` returns the newest one; `?filter=home/+/temp` returns many at once. |
 | **Publish over HTTP** | Raw body or JSON, single messages or batches, QoS 0/1/2, retain. |
+| **Built for agents too** | A full MCP server (tools, resources with live notifications, prompts, completion) over HTTP or stdio, tested with the official TypeScript and Python SDKs. |
 | **Webhooks** | Push matching messages to any URL, with batching, retries, HMAC signatures and backpressure. |
 | **Every common broker auth method** | Anonymous, username/password or token, rotating password files, TLS, custom CA, **mutual TLS**, SNI, ALPN, WebSockets with headers, failover URLs. |
 | **Simple to run** | One ~8 MB static binary or container, no dependencies, no database. |
@@ -102,22 +103,25 @@ flowchart LR
     D1[Devices / PLCs / sensors] -- MQTT --> B[(MQTT broker)]
     B -- "subscribe (e.g. #)" --> I
     subgraph mqtt-get
-      I[MQTT client<br/>1..N connections] --> S[(Latest-value store<br/>256 shards, in memory)]
-      I --> R{Topic trie}
-      R --> Q1[Webhook queue 1] --> W1[Workers]
-      R --> Q2[Webhook queue 2] --> W2[Workers]
-      H[HTTP server<br/>REST · MCP · UI · metrics] --> S
-      H -- publish --> I
+      subgraph core [core: one foundation]
+        I[MQTT client<br/>1..N connections] --> S[(Latest-value store<br/>256 shards, in memory)]
+        I --> R{Topic trie}
+        R --> Q[Webhook queues<br/>+ workers]
+        R --> WT[Watchers<br/>waits · subscriptions]
+      end
+      REST[REST API<br/>for systems] --> core
+      MCP[MCP server<br/>for agents<br/>HTTP · stdio] --> core
+      UI[Web UI] --> REST
     end
-    C[Apps, dashboards, scripts, AI agents] -- "GET / POST" --> H
-    W1 -- POST --> E1[Your webhook endpoints]
-    W2 -- POST --> E1
+    C[Apps, dashboards, scripts] -- "GET / POST" --> REST
+    A[AI agents<br/>Claude, IDEs, custom] -- MCP --> MCP
+    Q -- POST --> E1[Your webhook endpoints]
 ```
 
 1. mqtt-get subscribes to the filters you choose (default `#`, everything).
 2. Every message replaces the previous value for its topic in a sharded in-memory map. The payload is stored as-is and never copied again.
-3. The message is matched against webhook filters with a lock-free topic trie and put on each matching webhook's own bounded queue.
-4. HTTP requests read from the map, and publish requests go straight to the broker.
+3. The message is matched, using lock-free topic tries, against webhook filters (each webhook has its own bounded queue) and against active watchers (agents waiting for events, resource subscriptions).
+4. **REST and MCP are two thin interfaces over the same core.** Every operation, validation rule, scope check and error is implemented once, so both behave the same way. The interfaces only differ in presentation: REST speaks HTTP and JSON for systems, while MCP adds what agents need (discovery, events, safety hints).
 
 Values live in memory. After a restart they are rebuilt as messages arrive, and **retained** messages are replayed by the broker immediately on subscribe. Configuration (broker settings, webhooks, API keys) is persisted to `DATA_DIR/state.json`.
 
@@ -514,6 +518,7 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `PUBLISH_TIMEOUT_MS` | `5000` | Maximum wait for broker acknowledgement |
 | `UI_ENABLED` | `true` | Serve the web UI at `/` |
 | `MCP_ENABLED` | `true` | Serve MCP at `/mcp` |
+| `MCP_SCOPES` | `admin` | Scopes of the local agent in standalone `mqtt-get mcp` (stdio) mode, e.g. `read` or `read,publish` |
 | `METRICS_PUBLIC` | `false` | Serve `/metrics` without an API key |
 | `CORS_ORIGINS` | – | e.g. `*` or `https://dash.example.com,https://app.example.com` |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
@@ -607,40 +612,95 @@ Open `http://<host>:8080/` and sign in with an API key. The UI uses the same RES
 
 ## AI agents (MCP)
 
-mqtt-get is also a **Model Context Protocol** server, so an AI assistant can read sensor values, publish commands, and even set up the broker connection and webhooks, all limited by its API key's scopes.
+REST is the interface for **systems**; MCP (Model Context Protocol) is the interface for **agents**. Both run on the same core, so an agent can do everything a REST client can, limited by its API key's scopes. On top of that it gets features built for how agents work:
 
-**Claude Code** (or any client that supports remote HTTP MCP servers):
+| Agents need to… | mqtt-get provides |
+|---|---|
+| **Discover** an unknown namespace | `describe_topic_tree` summarizes the topic hierarchy level by level (topic counts, last update), so a namespace of 1M topics can be explored in a few calls. Near-miss topic names get *"did you mean"* suggestions. |
+| **React** to events instead of polling | `wait_for_message` blocks until a matching message arrives. **Resource subscriptions** push `notifications/resources/updated` when a topic changes, coalesced to at most one per second per resource. |
+| **Act and confirm** | `publish_and_wait` sends a command and returns the device's response or state change (e.g. publish to `lamp/set`, wait on `lamp/state`). |
+| **Stay safe** | Tool annotations mark `publish` and configuration changes as destructive, so clients ask the user first. Server instructions tell agents to confirm before actuating devices and never guess payload formats. Keys only see the tools their scopes allow. |
+| **Save context** | Compact JSON results with `structuredContent`, `age_seconds` on every value (spot stale data), large payloads truncated at 16 KB, and strict argument checking (a misspelled parameter returns an error that names it). |
+| **Be guided** | Prompts for common jobs: `explore_namespace`, `monitor_topics`, `control_device`, `troubleshoot_connection`. |
+
+### Connecting an agent
+
+**Remote (Streamable HTTP)**, for any MCP client that supports HTTP servers:
 
 ```bash
+# Claude Code
 claude mcp add --transport http mqtt http://localhost:8080/mcp --header "Authorization: Bearer $KEY"
 ```
 
-**Claude Desktop** and other stdio-only clients use the built-in bridge (`mqtt-get mcp`):
+**Local, standalone (stdio).** `mqtt-get mcp` runs the whole service inside the agent's process. There is no HTTP server to run; configure it with the usual `MQTT_*` variables. This is ideal for Claude Desktop, IDEs and CLI agents on a laptop:
 
 ```json
 {
   "mcpServers": {
     "mqtt": {
       "command": "/usr/local/bin/mqtt-get",
-      "args": ["mcp", "--url", "http://localhost:8080"],
-      "env": {"MQTT_GET_API_KEY": "mg_…"}
+      "args": ["mcp"],
+      "env": {
+        "MQTT_URL": "mqtts://broker.example.com:8883",
+        "MQTT_USERNAME": "agent",
+        "MQTT_PASSWORD": "…",
+        "MCP_SCOPES": "read"
+      }
     }
   }
 }
 ```
 
-| Tool | Scope | |
-|---|---|---|
-| `get_latest_value` | read | Latest message on a topic |
-| `query_values` | read | Latest values matching a filter |
-| `list_topics` | read | Known topic names |
-| `get_status` | read | Connection and counters |
-| `publish` | publish | Send a message |
-| `get_broker_config` / `configure_broker` | admin | View or change the connection (partial updates) |
-| `list_webhooks` / `create_webhook` / `update_webhook` / `delete_webhook` / `test_webhook` | admin | Manage webhooks |
-| `create_api_key` | admin | Create a scoped key |
+`MCP_SCOPES` limits what the local agent may do: `read`, `read,publish` or `admin` (the default). State is kept in your user config directory (e.g. `~/.config/mqtt-get`) unless `DATA_DIR` is set.
 
-An agent only sees the tools its key is allowed to use. Give assistants a **read-only** key unless you want them to act on your devices.
+**Local client, remote server (stdio proxy).** `mqtt-get mcp --url` connects a stdio-only client to a running mqtt-get server, keeping the session and relaying notifications:
+
+```json
+{"mcpServers": {"mqtt": {"command": "mqtt-get", "args": ["mcp", "--url", "https://mqtt-get.example.com"],
+                         "env": {"MQTT_GET_API_KEY": "mg_…"}}}}
+```
+
+### Tools
+
+| Tool | Scope | Annotations | |
+|---|---|---|---|
+| `get_status` | read | read-only | Connection state and counters |
+| `describe_topic_tree` | read | read-only | Namespace discovery, level by level |
+| `list_topics` | read | read-only | Topic names with age and size |
+| `get_value` | read | read-only | Latest value of one topic (`max_age_seconds` detects stale data) |
+| `get_values` | read | read-only | Several topics, or all matching a filter |
+| `wait_for_message` | read | read-only | Block until a matching message arrives (up to 5 min) |
+| `publish` | publish | **destructive**, open-world | Send a message (string, JSON value or base64) |
+| `publish_and_wait` | publish | **destructive**, open-world | Send a command, return the response or state change |
+| `get_broker_config` | admin | read-only | Connection settings (secrets redacted) |
+| `configure_broker` | admin | **destructive** | Change only the given fields; reconnects and saves |
+| `reconnect_broker` | admin | | Force a reconnect |
+| `list_webhooks`, `create_webhook`, `update_webhook`, `delete_webhook`, `test_webhook` | admin | `delete_webhook` is **destructive** | Webhooks with delivery stats |
+| `list_api_keys`, `create_api_key`, `revoke_api_key` | admin | `revoke_api_key` is **destructive** | Scoped API keys |
+
+### Resources
+
+| URI | |
+|---|---|
+| `mqtt-get://topic/{+topic}` | Latest value of a topic. **Subscribable**: you get `notifications/resources/updated` when it changes. Listed (paginated) in `resources/list`. |
+| `mqtt-get://values{?filter,limit}` | Latest values matching a filter (URL-encode `#` as `%23`). **Subscribable**: notifies when any matching topic changes. |
+| `mqtt-get://status` | Service status |
+| `mqtt-get://topic-tree` | Top two levels of the namespace |
+| `mqtt-get://broker` | Broker settings (admin) |
+
+**Completion** (`completion/complete`) suggests topic names one level at a time (`home/` → `home/kitchen/`, `home/lamp/`) for the `topic` template and prompt arguments.
+
+### Protocol details
+
+- Protocol revisions **2025-11-25**, 2025-06-18, 2025-03-26 and 2024-11-05 (negotiated).
+- **Streamable HTTP** at `/mcp`: `POST` for JSON-RPC (single or batch), `GET` for the SSE notification stream, `DELETE` to end a session. A session (`Mcp-Session-Id`) is created on `initialize`. Requests without one are served statelessly, where everything works except subscriptions. Idle sessions expire after 30 minutes.
+- **Security**: API key required (`Authorization: Bearer`). Browser `Origin` headers must be same-origin or listed in `CORS_ORIGINS` (DNS-rebinding protection). A session is bound to the key that created it. Unsupported `MCP-Protocol-Version` headers are rejected.
+- Long calls run concurrently and can be cancelled (`notifications/cancelled` stops a `wait_for_message` at once, and no response is sent).
+- **Tested** with the official **TypeScript SDK (1.30)** over HTTP, stdio and the stdio proxy (19 checks each, including live notifications), and with the official **Python SDK (2.2)** over HTTP and stdio.
+
+### REST equivalents
+
+The same core features are available to systems: `GET /api/v1/tree?prefix=&depth=` (namespace summary) and `GET /api/v1/wait?filter=&timeout=30s` (long-poll for the next message; `204` on timeout).
 
 ## Monitoring
 
@@ -812,6 +872,8 @@ All endpoints are under `/api/v1` and take and return JSON unless noted. Errors 
 | GET | `/values?topic=…` | read | Same, topic as a query parameter |
 | GET | `/values?filter=…&limit=…` | read | Latest values matching a filter |
 | GET | `/topics?filter=…&limit=…` | read | Topic names, sizes, timestamps |
+| GET | `/tree?prefix=…&depth=…&max_children=…` | read | Topic namespace summary |
+| GET | `/wait?filter=…&timeout=30s&include_current=` | read | Long-poll for the next matching message (`204` on timeout) |
 | DELETE | `/values/{topic...}` | admin | Forget one topic |
 | DELETE | `/values` | admin | Forget all topics |
 | POST | `/publish/{topic...}?qos=&retain=` | publish | Publish the raw body |
@@ -828,11 +890,11 @@ All endpoints are under `/api/v1` and take and return JSON unless noted. Errors 
 | GET | `/whoami` | any | The calling key's name and scopes |
 | GET | `/healthz` | none | Health (outside `/api/v1`) |
 | GET | `/metrics` | read | Prometheus (outside `/api/v1`) |
-| POST | `/mcp` | per tool | MCP endpoint (outside `/api/v1`) |
+| POST · GET · DELETE | `/mcp` | per tool | MCP Streamable HTTP endpoint (outside `/api/v1`) |
 
-Status codes: `200`/`201`/`204` success · `400` invalid input · `401` missing or invalid key · `403` key lacks the scope · `404` unknown topic or id · `409` duplicate webhook id · `413` body too large · `502` broker or webhook error · `503` not connected to the broker.
+Status codes: `200`/`201`/`204` success · `400` invalid input · `401` missing or invalid key · `403` key lacks the scope · `404` unknown topic or id · `409` duplicate webhook id · `413` body too large · `429` too many concurrent waits · `502` broker or webhook error · `503` not connected to the broker.
 
-CLI: `mqtt-get [serve]` (default) · `mqtt-get mcp --url … --key …` · `mqtt-get healthcheck` · `mqtt-get version`.
+CLI: `mqtt-get [serve]` (default: REST, MCP and UI over HTTP) · `mqtt-get mcp` (standalone MCP on stdio) · `mqtt-get mcp --url … --key …` (stdio proxy to a server) · `mqtt-get healthcheck` · `mqtt-get version`.
 
 ## Development
 
@@ -846,15 +908,17 @@ make interop-up && make interop && make interop-down   # real-broker suite (Dock
 The regular tests need nothing installed. They start embedded MQTT brokers (plain, TLS, mTLS, WS and WSS, with generated certificates) and cover auth, TLS verification, SNI, password-file rotation, the REST API, webhooks and MCP.
 
 ```
-cmd/mqtt-get        entry point, stdio MCP bridge, healthcheck
+cmd/mqtt-get        entry point: serve, mcp (standalone stdio / proxy), healthcheck
 cmd/loadgen         MQTT load generator
+internal/core       THE foundation: every operation, scopes, typed errors, watchers, topic tree
+internal/httpapi    REST interface for systems + web UI (httpapi/ui/index.html) + metrics
+internal/mcp        MCP interface for agents: tools, resources, prompts, completion; HTTP + stdio transports
 internal/mqttc      broker connections: auth, TLS, dialing, publish, reconnect
 internal/store      sharded latest-value store + JSON encoding
 internal/topic      MQTT topic validation, matching, filter trie
 internal/webhook    webhook queues, batching, retries, signatures
 internal/state      persisted settings, webhooks and API keys
 internal/config     configuration model and environment parsing
-internal/api        REST, MCP, metrics and the embedded web UI (api/ui/index.html)
 test/interop        real-broker interoperability suite + docker-compose
 ```
 

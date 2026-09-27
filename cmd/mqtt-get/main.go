@@ -1,16 +1,12 @@
-// Command mqtt-get bridges an MQTT broker to HTTP: REST access to the latest
-// value of every topic, publishing over HTTP, webhooks, an MCP endpoint and a
-// small web UI.
+// Command mqtt-get bridges an MQTT broker to systems and agents: a REST API
+// (latest value of every topic, publishing, webhooks) and an MCP server, both
+// over the same core, plus a small web UI.
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
-	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/pprof"
@@ -20,8 +16,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tabreu8/mqtt-get/internal/api"
 	"github.com/tabreu8/mqtt-get/internal/config"
+	"github.com/tabreu8/mqtt-get/internal/core"
+	"github.com/tabreu8/mqtt-get/internal/httpapi"
+	"github.com/tabreu8/mqtt-get/internal/mcp"
 	"github.com/tabreu8/mqtt-get/internal/state"
 )
 
@@ -36,11 +34,11 @@ func main() {
 	case "serve":
 		err = serve()
 	case "mcp":
-		err = mcpStdio()
+		err = mcpCommand()
 	case "healthcheck":
 		err = healthcheck()
 	case "version":
-		fmt.Println(api.Version)
+		fmt.Println(core.Version)
 	default:
 		fmt.Fprintf(os.Stderr, "usage: mqtt-get [serve|mcp|healthcheck|version]\n")
 		os.Exit(2)
@@ -90,11 +88,21 @@ func serve() error {
 		return fmt.Errorf("MQTT configuration: %w", err)
 	}
 
-	srv := api.New(cfg, log, st)
-	if err := srv.Start(envBroker, envOK); err != nil {
+	svc := core.New(cfg, log, st)
+	if err := svc.Start(envBroker, envOK); err != nil {
 		log.Error("broker configuration error", "err", err)
 	}
-	defer srv.Close()
+	defer svc.Close()
+
+	var mcpHandler http.Handler
+	if cfg.MCPEnabled {
+		ms := mcp.New(svc, log, mcp.Options{AllowedOrigins: splitList(cfg.CORSOrigins)})
+		defer ms.Close()
+		mcpHandler = ms.HTTPHandler(func(r *http.Request) (*core.Principal, error) {
+			return svc.Authenticate(httpapi.APIKey(r, cfg.AllowQueryAPIKey))
+		}, cfg.MaxBodyBytes)
+	}
+	srv := httpapi.New(svc, mcpHandler)
 
 	if addr := os.Getenv("PPROF_ADDR"); addr != "" {
 		pm := http.NewServeMux()
@@ -136,54 +144,6 @@ func serve() error {
 	return hs.Shutdown(sctx)
 }
 
-// mcpStdio bridges MCP over stdio (for clients such as Claude Desktop) to a
-// running mqtt-get server's /mcp endpoint.
-func mcpStdio() error {
-	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
-	url := fs.String("url", envOr("MQTT_GET_URL", "http://localhost:8080"), "mqtt-get base URL (env MQTT_GET_URL)")
-	key := fs.String("key", os.Getenv("MQTT_GET_API_KEY"), "API key (env MQTT_GET_API_KEY)")
-	_ = fs.Parse(os.Args[1:])
-	endpoint := strings.TrimRight(*url, "/") + "/mcp"
-	client := &http.Client{Timeout: 60 * time.Second}
-
-	in := bufio.NewScanner(os.Stdin)
-	in.Buffer(make([]byte, 64<<10), 16<<20)
-	out := bufio.NewWriter(os.Stdout)
-	for in.Scan() {
-		line := bytes.TrimSpace(in.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(line))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		if *key != "" {
-			req.Header.Set("Authorization", "Bearer "+*key)
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "mqtt-get mcp:", err)
-			continue
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusAccepted {
-			continue
-		}
-		if resp.StatusCode != http.StatusOK {
-			fmt.Fprintf(os.Stderr, "mqtt-get mcp: HTTP %d: %s\n", resp.StatusCode, bytes.TrimSpace(body))
-			continue
-		}
-		out.Write(bytes.TrimSpace(body))
-		out.WriteByte('\n')
-		out.Flush()
-	}
-	return in.Err()
-}
-
 // healthcheck exits non-zero if the local server is unhealthy (for Docker
 // HEALTHCHECK in images without curl).
 func healthcheck() error {
@@ -205,6 +165,16 @@ func healthcheck() error {
 		return fmt.Errorf("unhealthy: HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envOr(k, def string) string {

@@ -1,4 +1,7 @@
-package api
+// Package httpapi is the REST interface (for systems) over internal/core,
+// plus the web UI, metrics and health endpoints. The MCP interface (for
+// agents) lives in internal/mcp and is mounted at /mcp.
+package httpapi
 
 import (
 	"context"
@@ -16,21 +19,32 @@ import (
 	"time"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
+	"github.com/tabreu8/mqtt-get/internal/core"
 	"github.com/tabreu8/mqtt-get/internal/mqttc"
-	"github.com/tabreu8/mqtt-get/internal/state"
 	"github.com/tabreu8/mqtt-get/internal/store"
 )
 
 //go:embed ui
 var uiFS embed.FS
 
+// Server serves the REST API, UI, metrics and (optionally) MCP.
+type Server struct {
+	svc *core.Service
+	cfg config.Server
+	mcp http.Handler
+}
+
+// New creates the HTTP interface. mcp may be nil (MCP disabled).
+func New(svc *core.Service, mcp http.Handler) *Server {
+	return &Server{svc: svc, cfg: svc.Config(), mcp: mcp}
+}
+
 type ctxKey struct{}
 
-// keyFrom returns the API key that authenticated the request (nil when auth
-// is disabled).
-func keyFrom(ctx context.Context) *config.APIKey {
-	k, _ := ctx.Value(ctxKey{}).(*config.APIKey)
-	return k
+// principalFrom returns the authenticated caller.
+func principalFrom(ctx context.Context) *core.Principal {
+	p, _ := ctx.Value(ctxKey{}).(*core.Principal)
+	return p
 }
 
 // Handler returns the HTTP handler for the whole service.
@@ -72,12 +86,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/keys", s.auth(admin, s.handleKeyCreate))
 	mux.HandleFunc("DELETE /api/v1/keys/{id}", s.auth(admin, s.handleKeyDelete))
 
-	if s.cfg.MCPEnabled {
-		mux.HandleFunc("POST /mcp", s.auth("", s.handleMCP))
-		mux.HandleFunc("GET /mcp", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Allow", "POST")
-			http.Error(w, "SSE stream not supported; use POST", http.StatusMethodNotAllowed)
-		})
+	mux.HandleFunc("GET /api/v1/tree", s.auth(read, s.handleTree))
+	mux.HandleFunc("GET /api/v1/wait", s.auth(read, s.handleWait))
+
+	if s.mcp != nil {
+		for _, m := range []string{"GET", "POST", "DELETE"} {
+			mux.Handle(m+" /mcp", s.mcp)
+		}
 	}
 
 	if s.cfg.UIEnabled {
@@ -94,7 +109,9 @@ func (s *Server) Handler() http.Handler {
 
 // --- middleware ---
 
-func (s *Server) apiKey(r *http.Request) string {
+// APIKey extracts the API key from a request (Authorization: Bearer,
+// X-API-Key or, if allowed, ?api_key=).
+func APIKey(r *http.Request, allowQuery bool) string {
 	if h := r.Header.Get("Authorization"); h != "" {
 		if k, ok := strings.CutPrefix(h, "Bearer "); ok {
 			return strings.TrimSpace(k)
@@ -103,7 +120,7 @@ func (s *Server) apiKey(r *http.Request) string {
 	if k := r.Header.Get("X-API-Key"); k != "" {
 		return k
 	}
-	if s.cfg.AllowQueryAPIKey {
+	if allowQuery {
 		return r.URL.Query().Get("api_key")
 	}
 	return ""
@@ -112,21 +129,19 @@ func (s *Server) apiKey(r *http.Request) string {
 // auth requires a valid API key with the given scope ("" = any valid key).
 func (s *Server) auth(scope string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.AuthDisabled {
-			next(w, r)
-			return
-		}
-		k, ok := s.state.Lookup(s.apiKey(r))
-		if !ok {
+		p, err := s.svc.Authenticate(APIKey(r, s.cfg.AllowQueryAPIKey))
+		if err != nil {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="mqtt-get"`)
-			writeError(w, &apiError{Status: 401, Msg: "missing or invalid API key"})
+			writeError(w, err)
 			return
 		}
-		if scope != "" && !state.HasScope(k, scope) {
-			writeError(w, &apiError{Status: 403, Msg: "API key lacks the " + scope + " scope"})
-			return
+		if scope != "" {
+			if err := core.Require(p, scope); err != nil {
+				writeError(w, err)
+				return
+			}
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, k)))
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, p)))
 	}
 }
 
@@ -166,13 +181,39 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = enc.Encode(v)
 }
 
-func writeError(w http.ResponseWriter, err error) {
-	var ae *apiError
-	if !errors.As(err, &ae) {
-		ae = &apiError{Status: 500, Msg: err.Error()}
-	}
-	writeJSON(w, ae.Status, map[string]string{"error": ae.Msg})
+// httpError is a transport-level error with an explicit status.
+type httpError struct {
+	status int
+	msg    string
 }
+
+func (e *httpError) Error() string { return e.msg }
+
+var kindStatus = map[core.Kind]int{
+	core.Internal:        500,
+	core.Invalid:         400,
+	core.NotFound:        404,
+	core.Conflict:        409,
+	core.Unauthenticated: 401,
+	core.Forbidden:       403,
+	core.Unavailable:     503,
+	core.Upstream:        502,
+	core.Busy:            429,
+}
+
+func statusOf(err error) int {
+	var he *httpError
+	if errors.As(err, &he) {
+		return he.status
+	}
+	return kindStatus[core.KindOf(err)]
+}
+
+func writeError(w http.ResponseWriter, err error) {
+	writeJSON(w, statusOf(err), map[string]string{"error": err.Error()})
+}
+
+func badRequest(err error) error { return &httpError{400, err.Error()} }
 
 func (s *Server) decode(w http.ResponseWriter, r *http.Request, v any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
@@ -203,7 +244,7 @@ func intParam(r *http.Request, name string, def int) int {
 // --- handlers ---
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	st := s.mqtt.Status()
+	st := s.svc.MQTTStatus()
 	code := http.StatusOK
 	if st.Configured && !st.Connected {
 		code = http.StatusServiceUnavailable
@@ -212,20 +253,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, s.status())
+	writeJSON(w, 200, s.svc.Status())
 }
 
 func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
-	k := keyFrom(r.Context())
-	if k == nil {
-		writeJSON(w, 200, map[string]any{"auth_disabled": true, "scopes": []string{config.ScopeAdmin}})
-		return
-	}
-	writeJSON(w, 200, map[string]any{"id": k.ID, "name": k.Name, "scopes": k.Scopes})
+	p := principalFrom(r.Context())
+	writeJSON(w, 200, map[string]any{"id": p.ID, "name": p.Name, "scopes": p.Scopes, "auth_disabled": s.cfg.AuthDisabled})
 }
 
 func (s *Server) handleValue(w http.ResponseWriter, r *http.Request) {
-	e, err := s.latest(topicParam(r))
+	e, err := s.svc.Latest(topicParam(r))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -241,7 +278,7 @@ func (s *Server) writeEntry(w http.ResponseWriter, r *http.Request, e *store.Ent
 			return
 		}
 		if time.Since(time.Unix(0, e.Time)) > d {
-			writeError(w, notFound("latest value for %q is older than %s", e.Topic, d))
+			writeError(w, &httpError{404, fmt.Sprintf("latest value for %q is older than %s", e.Topic, d)})
 			return
 		}
 	}
@@ -281,7 +318,7 @@ func (s *Server) handleValues(w http.ResponseWriter, r *http.Request) {
 		s.handleValue(w, r)
 		return
 	}
-	res, total, err := s.query(r.URL.Query().Get("filter"), intParam(r, "limit", 1000))
+	res, total, err := s.svc.Query(r.URL.Query().Get("filter"), intParam(r, "limit", 1000))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -305,7 +342,7 @@ func (s *Server) handleValues(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
-	res, total, err := s.query(r.URL.Query().Get("filter"), intParam(r, "limit", 1000))
+	res, total, err := s.svc.Query(r.URL.Query().Get("filter"), intParam(r, "limit", 1000))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -323,8 +360,8 @@ func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteValue(w http.ResponseWriter, r *http.Request) {
-	if !s.store.Delete(topicParam(r)) {
-		writeError(w, notFound("topic not found"))
+	if err := s.svc.Forget(topicParam(r)); err != nil {
+		writeError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -335,7 +372,7 @@ func (s *Server) handleClearValues(w http.ResponseWriter, r *http.Request) {
 		s.handleDeleteValue(w, r)
 		return
 	}
-	s.store.Clear()
+	_ = s.svc.Forget("")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -345,21 +382,21 @@ func (s *Server) handlePublishRaw(w http.ResponseWriter, r *http.Request) {
 	retain, _ := strconv.ParseBool(q.Get("retain"))
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes))
 	if err != nil {
-		writeError(w, &apiError{Status: 413, Msg: err.Error()})
+		writeError(w, &httpError{413, err.Error()})
 		return
 	}
-	req := publishRequest{Topic: topicParam(r), QoS: byte(qos), Retain: retain}
+	req := core.PublishRequest{Topic: topicParam(r), QoS: byte(qos), Retain: retain}
 	if qos < 0 || qos > 2 {
 		writeError(w, badRequest(errors.New("qos must be 0, 1 or 2")))
 		return
 	}
-	msg, err := req.toMessage()
+	msg, err := req.Message()
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	msg.Payload = body
-	n, err := s.publish(r.Context(), []mqttc.Message{msg})
+	n, err := s.svc.Publish(r.Context(), []mqttc.Message{msg})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -371,17 +408,17 @@ func (s *Server) handlePublishJSON(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, &apiError{Status: 413, Msg: err.Error()})
+		writeError(w, &httpError{413, err.Error()})
 		return
 	}
-	var reqs []publishRequest
+	var reqs []core.PublishRequest
 	trimmed := strings.TrimSpace(string(raw))
 	if strings.HasPrefix(trimmed, "[") {
 		err = json.Unmarshal(raw, &reqs)
 	} else {
-		var one publishRequest
+		var one core.PublishRequest
 		err = json.Unmarshal(raw, &one)
-		reqs = []publishRequest{one}
+		reqs = []core.PublishRequest{one}
 	}
 	if err != nil {
 		writeError(w, badRequest(fmt.Errorf("invalid JSON body: %w", err)))
@@ -393,25 +430,25 @@ func (s *Server) handlePublishJSON(w http.ResponseWriter, r *http.Request) {
 	}
 	msgs := make([]mqttc.Message, len(reqs))
 	for i, p := range reqs {
-		if msgs[i], err = p.toMessage(); err != nil {
+		if msgs[i], err = p.Message(); err != nil {
 			writeError(w, err)
 			return
 		}
 	}
-	n, err := s.publish(r.Context(), msgs)
+	n, err := s.svc.Publish(r.Context(), msgs)
 	if err != nil {
-		writeJSON(w, err.(*apiError).Status, map[string]any{"error": err.Error(), "published": n})
+		writeJSON(w, statusOf(err), map[string]any{"error": err.Error(), "published": n})
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "published": n})
 }
 
 func (s *Server) handleWebhookList(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, map[string]any{"webhooks": s.webhookList()})
+	writeJSON(w, 200, map[string]any{"webhooks": s.svc.Webhooks()})
 }
 
 func (s *Server) handleWebhookGet(w http.ResponseWriter, r *http.Request) {
-	v, err := s.webhookGet(r.PathValue("id"))
+	v, err := s.svc.Webhook(r.PathValue("id"))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -425,7 +462,7 @@ func (s *Server) handleWebhookCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	v, err := s.webhookPut(wh, true)
+	v, err := s.svc.PutWebhook(wh, true)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -440,7 +477,7 @@ func (s *Server) handleWebhookUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wh.ID = r.PathValue("id")
-	v, err := s.webhookPut(wh, false)
+	v, err := s.svc.PutWebhook(wh, false)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -449,7 +486,7 @@ func (s *Server) handleWebhookUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWebhookDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.webhookDelete(r.PathValue("id")); err != nil {
+	if err := s.svc.DeleteWebhook(r.PathValue("id")); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -463,7 +500,7 @@ func (s *Server) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes))
 	if err != nil {
-		writeError(w, &apiError{Status: 413, Msg: err.Error()})
+		writeError(w, &httpError{413, err.Error()})
 		return
 	}
 	if len(strings.TrimSpace(string(raw))) > 0 {
@@ -474,15 +511,15 @@ func (s *Server) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
 	}
 	var payload []byte
 	if len(body.Payload) > 0 {
-		p := publishRequest{Topic: "x", Payload: body.Payload}
-		m, err := p.toMessage()
+		p := core.PublishRequest{Topic: "x", Payload: body.Payload}
+		m, err := p.Message()
 		if err != nil {
 			writeError(w, err)
 			return
 		}
 		payload = m.Payload
 	}
-	if err := s.webhookTest(r.PathValue("id"), body.Topic, payload); err != nil {
+	if err := s.svc.TestWebhook(r.PathValue("id"), body.Topic, payload); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -490,7 +527,7 @@ func (s *Server) handleWebhookTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBrokerGet(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, s.brokerInfo())
+	writeJSON(w, 200, s.svc.Broker())
 }
 
 func (s *Server) handleBrokerPut(w http.ResponseWriter, r *http.Request) {
@@ -499,23 +536,23 @@ func (s *Server) handleBrokerPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.setBroker(b); err != nil {
+	if err := s.svc.SetBroker(b); err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, 200, s.brokerInfo())
+	writeJSON(w, 200, s.svc.Broker())
 }
 
 func (s *Server) handleBrokerReconnect(w http.ResponseWriter, _ *http.Request) {
-	if err := s.mqtt.Reconnect(); err != nil {
-		writeError(w, badRequest(err))
+	if err := s.svc.Reconnect(); err != nil {
+		writeError(w, err)
 		return
 	}
-	writeJSON(w, 200, s.brokerInfo())
+	writeJSON(w, 200, s.svc.Broker())
 }
 
 func (s *Server) handleKeyList(w http.ResponseWriter, _ *http.Request) {
-	keys := s.state.Keys()
+	keys := s.svc.Keys()
 	sort.SliceStable(keys, func(i, j int) bool { return keys[i].CreatedAt.Before(keys[j].CreatedAt) })
 	writeJSON(w, 200, map[string]any{"keys": keys})
 }
@@ -529,9 +566,9 @@ func (s *Server) handleKeyCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	k, secret, err := s.state.CreateKey(body.Name, body.Scopes)
+	k, secret, err := s.svc.CreateKey(body.Name, body.Scopes)
 	if err != nil {
-		writeError(w, badRequest(err))
+		writeError(w, err)
 		return
 	}
 	writeJSON(w, 201, map[string]any{"key": secret, "info": k,
@@ -539,14 +576,45 @@ func (s *Server) handleKeyCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if k := keyFrom(r.Context()); k != nil && k.ID == id {
-		writeError(w, badRequest(errors.New("refusing to delete the key used for this request")))
-		return
-	}
-	if err := s.state.DeleteKey(id); err != nil {
-		writeError(w, notFound("key %q not found (environment keys cannot be deleted)", id))
+	if err := s.svc.DeleteKey(principalFrom(r.Context()), r.PathValue("id")); err != nil {
+		writeError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	tree, err := s.svc.TopicTree(q.Get("prefix"), intParam(r, "depth", 2), intParam(r, "max_children", 50))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, 200, tree)
+}
+
+// handleWait long-polls for the next message matching ?filter= (up to
+// ?timeout=30s, max 5m). 204 when nothing arrived in time.
+func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	timeout := core.DefaultWaitTimeout
+	if v := q.Get("timeout"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			writeError(w, badRequest(fmt.Errorf("timeout: %w", err)))
+			return
+		}
+		timeout = d
+	}
+	current, _ := strconv.ParseBool(q.Get("include_current"))
+	e, err := s.svc.Wait(r.Context(), q.Get("filter"), timeout, current)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if e == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	s.writeEntry(w, r, e)
 }

@@ -27,8 +27,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tabreu8/mqtt-get/internal/api"
 	"github.com/tabreu8/mqtt-get/internal/config"
+	"github.com/tabreu8/mqtt-get/internal/core"
+	"github.com/tabreu8/mqtt-get/internal/httpapi"
 	"github.com/tabreu8/mqtt-get/internal/mqttc"
 	"github.com/tabreu8/mqtt-get/internal/state"
 	"github.com/tabreu8/mqtt-get/internal/store"
@@ -130,7 +131,7 @@ type harness struct {
 	f    File
 	ep   Endpoint
 	ns   string // unique topic namespace for this run
-	srv  *api.Server
+	srv  *core.Service
 	http *httptest.Server
 
 	peer *mqttc.Manager // independent client acting as a device
@@ -149,12 +150,12 @@ func newHarness(t *testing.T, f File, ep Endpoint) *harness {
 	}
 	st.SetEnvKeys([]string{apiKey}, nil, nil)
 	cfg := config.Server{MaxTopics: 100000, MaxBodyBytes: 1 << 20, PublishTimeout: 10 * time.Second}
-	h.srv = api.New(cfg, quietLog(), st)
+	h.srv = core.New(cfg, quietLog(), st)
 	if err := h.srv.Start(f.brokerConfig(ep, clientID("mg"), h.ns+"/#"), true); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(h.srv.Close)
-	h.http = httptest.NewServer(h.srv.Handler())
+	h.http = httptest.NewServer(httpapi.New(h.srv, nil).Handler())
 	t.Cleanup(h.http.Close)
 
 	h.peer = mqttc.New(quietLog(), func(e *store.Entry) {
@@ -500,7 +501,7 @@ func expectRejected(t *testing.T, cfg config.Broker) {
 func testShared(t *testing.T, f File, ep Endpoint, h *harness) {
 	ns := h.ns + "/shared"
 	st, _ := state.Open("")
-	srv := api.New(config.Server{MaxTopics: 100000}, quietLog(), st)
+	srv := core.New(config.Server{MaxTopics: 100000}, quietLog(), st)
 	cfg := f.brokerConfig(ep, clientID("mgshared"), ns+"/#")
 	cfg.Connections = 3
 	cfg.SharedGroup = "mginterop" + strconv.Itoa(rand.Intn(1e6))
@@ -532,4 +533,4 @@ func testShared(t *testing.T, f File, ep Endpoint, h *harness) {
 	}
 }
 
-func srvConnected(s *api.Server) int { return s.MQTTStatus().ConnectedCount }
+func srvConnected(s *core.Service) int { return s.MQTTStatus().ConnectedCount }
