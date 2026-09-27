@@ -157,9 +157,11 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		if o := r.Header.Get("Origin"); o != "" && (all || allowed[o]) {
 			w.Header().Set("Access-Control-Allow-Origin", o)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, "+
+				"X-MQTT-Content-Type, X-MQTT-Response-Topic, X-MQTT-Correlation-Data, X-MQTT-Message-Expiry, X-MQTT-User-Property, X-MQTT-Payload-Format")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Expose-Headers", "X-MQTT-Topic, X-MQTT-QoS, X-MQTT-Retained, X-MQTT-Timestamp")
+			w.Header().Set("Access-Control-Expose-Headers", "X-MQTT-Topic, X-MQTT-QoS, X-MQTT-Retained, X-MQTT-Timestamp, "+
+				"X-MQTT-Content-Type, X-MQTT-Response-Topic, X-MQTT-Correlation-Data, X-MQTT-Message-Expiry, X-MQTT-User-Property, X-MQTT-Payload-Format")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -289,10 +291,13 @@ func (s *Server) writeEntry(w http.ResponseWriter, r *http.Request, e *store.Ent
 	h.Set("X-MQTT-Timestamp", time.Unix(0, e.Time).UTC().Format(time.RFC3339Nano))
 	h.Set("Cache-Control", "no-store")
 	if r.URL.Query().Get("format") == "raw" {
-		switch store.Encoding(e.Payload) {
-		case store.EncJSON:
+		e.Props.WriteHeaders(h.Add)
+		switch {
+		case e.Props != nil && e.Props.ContentType != "":
+			h.Set("Content-Type", e.Props.ContentType) // MQTT 5 content type wins
+		case store.Encoding(e.Payload) == store.EncJSON:
 			h.Set("Content-Type", "application/json")
-		case store.EncUTF8:
+		case store.Encoding(e.Payload) == store.EncUTF8:
 			h.Set("Content-Type", "text/plain; charset=utf-8")
 		default:
 			h.Set("Content-Type", "application/octet-stream")
@@ -385,7 +390,7 @@ func (s *Server) handlePublishRaw(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &httpError{413, err.Error()})
 		return
 	}
-	req := core.PublishRequest{Topic: topicParam(r), QoS: byte(qos), Retain: retain}
+	req := core.PublishRequest{Topic: topicParam(r), QoS: byte(qos), Retain: retain, Properties: propsFromHeaders(r.Header)}
 	if qos < 0 || qos > 2 {
 		writeError(w, badRequest(errors.New("qos must be 0, 1 or 2")))
 		return
@@ -617,4 +622,33 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeEntry(w, r, e)
+}
+
+// propsFromHeaders reads MQTT 5 publish properties from X-MQTT-* headers
+// (raw publish). Returns nil when none are present.
+func propsFromHeaders(h http.Header) *core.PublishProps {
+	pp := &core.PublishProps{
+		ContentType:           h.Get(store.HeaderContentType),
+		ResponseTopic:         h.Get(store.HeaderResponseTopic),
+		CorrelationDataBase64: h.Get(store.HeaderCorrelationData),
+		PayloadFormat:         h.Get(store.HeaderPayloadFormat),
+	}
+	if v := h.Get(store.HeaderMessageExpiry); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 32); err == nil {
+			pp.MessageExpirySec = uint32(n)
+		}
+	}
+	var ups []store.UserProperty
+	for _, v := range h.Values(store.HeaderUserProperty) {
+		k, val, _ := strings.Cut(v, "=")
+		ups = append(ups, store.UserProperty{Key: strings.TrimSpace(k), Value: strings.TrimSpace(val)})
+	}
+	if len(ups) > 0 {
+		pp.UserProperties, _ = json.Marshal(ups)
+	}
+	if pp.ContentType == "" && pp.ResponseTopic == "" && pp.CorrelationDataBase64 == "" &&
+		pp.PayloadFormat == "" && pp.MessageExpirySec == 0 && len(ups) == 0 {
+		return nil
+	}
+	return pp
 }

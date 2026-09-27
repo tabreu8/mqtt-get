@@ -61,10 +61,20 @@ func enum(desc string, values ...any) map[string]any {
 }
 
 var (
-	pQoS      = enum("MQTT QoS level (default 0)", 0, 1, 2)
-	pFilter   = str(`MQTT topic filter; "+" matches one level, "#" all remaining levels (e.g. "home/+/temperature", "factory/#")`)
-	pPayload  = map[string]any{"description": `Message payload. A string is sent as text; any other JSON value (object, number, boolean, array) is sent as its JSON encoding.`}
-	pEncoding = enum(`How to interpret a string payload: "text" (default) or "base64" for binary data`, "text", "base64")
+	pQoS        = enum("MQTT QoS level (default 0)", 0, 1, 2)
+	pFilter     = str(`MQTT topic filter; "+" matches one level, "#" all remaining levels (e.g. "home/+/temperature", "factory/#")`)
+	pPayload    = map[string]any{"description": `Message payload. A string is sent as text; any other JSON value (object, number, boolean, array) is sent as its JSON encoding.`}
+	pEncoding   = enum(`How to interpret a string payload: "text" (default) or "base64" for binary data`, "text", "base64")
+	pProperties = object(map[string]any{
+		"content_type":            str("MIME type of the payload, e.g. application/json"),
+		"response_topic":          str("Topic the receiver should reply to"),
+		"correlation_data":        str("Id linking a reply to this request (text)"),
+		"correlation_data_base64": str("Id linking a reply to this request (binary, base64)"),
+		"user_properties": map[string]any{"description": `Application key/value pairs: {"k":"v"} or [{"key":"k","value":"v"}]`,
+			"type": []string{"object", "array"}},
+		"message_expiry_sec": integer("Broker drops the message after this many seconds", 1, 1<<31-1),
+		"payload_format":     enum(`"utf8" marks the payload as UTF-8 text`, "utf8", "bytes"),
+	})
 )
 
 func annotations(title string, readOnly, destructive, idempotent, openWorld bool) map[string]any {
@@ -292,11 +302,12 @@ var tools = []*tool{
 		Description: "Publish a message to an MQTT topic. This can control real devices: confirm with the user first, and check the device's existing topics for the expected payload format. " +
 			"To confirm the device reacted, use publish_and_wait instead.",
 		InputSchema: object(map[string]any{
-			"topic":    str("Topic name to publish to (no wildcards)"),
-			"payload":  pPayload,
-			"encoding": pEncoding,
-			"qos":      pQoS,
-			"retain":   boolean("Ask the broker to retain the message as the topic's last known value (default false)"),
+			"topic":      str("Topic name to publish to (no wildcards)"),
+			"payload":    pPayload,
+			"encoding":   pEncoding,
+			"qos":        pQoS,
+			"retain":     boolean("Ask the broker to retain the message as the topic's last known value (default false)"),
+			"properties": withDesc(pProperties, "MQTT 5 properties (only when the broker connection uses protocol_version 5)"),
 		}, "topic", "payload"),
 		Annotations: annotations("Publish a message", false, true, false, true),
 		scope:       config.ScopePublish,
@@ -325,6 +336,7 @@ var tools = []*tool{
 			"encoding":        pEncoding,
 			"qos":             pQoS,
 			"retain":          boolean("Retain the command message (default false)"),
+			"properties":      withDesc(pProperties, "MQTT 5 properties. Over MQTT 5, response_topic and correlation_data are set automatically"),
 			"response_filter": str("Topic or filter where the response/state is published"),
 			"timeout_seconds": map[string]any{"type": "number", "description": "How long to wait for the response (default 10, max 300)"},
 		}, "topic", "payload", "response_filter"),
@@ -353,7 +365,9 @@ var tools = []*tool{
 				return map[string]any{"published": true, "response_received": false, "waited_seconds": timeout.Seconds(),
 					"hint": "no message on " + a.ResponseFilter + "; the device may be offline, use another response topic, or need a different payload"}, nil
 			}
-			return map[string]any{"published": true, "response_received": true, "response_after_ms": time.Since(start).Milliseconds(), "response": viewOf(e)}, nil
+			correlated := e.Props != nil && len(e.Props.CorrelationData) > 0
+			return map[string]any{"published": true, "response_received": true, "response_after_ms": time.Since(start).Milliseconds(),
+				"correlated": correlated, "response": viewOf(e)}, nil
 		},
 	},
 	// --- administration ---
@@ -375,14 +389,16 @@ var tools = []*tool{
 		Description: "Change the MQTT broker connection. Only the given fields change; the service reconnects immediately and saves the settings. " +
 			"urls accept tcp://, mqtt://, ssl://, mqtts://, ws://, wss://. Auth: username/password (or a token as password), TLS with a custom CA (tls.ca_pem), mutual TLS (tls.cert_pem + tls.key_pem).",
 		InputSchema: object(map[string]any{
-			"urls":             strList("Broker URLs (failover order)"),
-			"client_id":        str("MQTT client id"),
-			"username":         str("Username"),
-			"password":         str("Password or token"),
-			"password_file":    str("File to read the password from on every connect"),
-			"protocol_version": enum("4 = MQTT 3.1.1, 3 = MQTT 3.1", 3, 4),
-			"clean_session":    boolean("Clean session (default true)"),
-			"keepalive_sec":    integer("Keep-alive in seconds", 1, 3600),
+			"urls":                strList("Broker URLs (failover order)"),
+			"client_id":           str("MQTT client id"),
+			"username":            str("Username"),
+			"password":            str("Password or token"),
+			"password_file":       str("File to read the password from on every connect"),
+			"protocol_version":    enum("4 = MQTT 3.1.1 (default), 3 = MQTT 3.1, 5 = MQTT 5 (properties, reason codes, request/response)", 3, 4, 5),
+			"session_expiry_sec":  integer("MQTT 5: keep the session this long after a disconnect", 0, 1<<31-1),
+			"topic_alias_maximum": integer("MQTT 5: topic aliases the broker may use towards mqtt-get (default 1024)", 0, 65535),
+			"clean_session":       boolean("Clean session (default true)"),
+			"keepalive_sec":       integer("Keep-alive in seconds", 1, 3600),
 			"subscriptions": map[string]any{"type": "array", "description": "Filters to subscribe to", "items": object(map[string]any{
 				"filter": str("Topic filter"), "qos": pQoS}, "filter")},
 			"tls": object(map[string]any{
@@ -593,18 +609,27 @@ func init() {
 }
 
 type publishArgs struct {
-	Topic    string          `json:"topic"`
-	Payload  json.RawMessage `json:"payload"`
-	Encoding string          `json:"encoding"`
-	QoS      byte            `json:"qos"`
-	Retain   bool            `json:"retain"`
+	Topic      string             `json:"topic"`
+	Payload    json.RawMessage    `json:"payload"`
+	Encoding   string             `json:"encoding"`
+	QoS        byte               `json:"qos"`
+	Retain     bool               `json:"retain"`
+	Properties *core.PublishProps `json:"properties"`
+}
+
+func withDesc(schema map[string]any, desc string) map[string]any {
+	out := map[string]any{"description": desc}
+	for k, v := range schema {
+		out[k] = v
+	}
+	return out
 }
 
 func (a publishArgs) message() (mqttc.Message, error) {
 	if len(a.Payload) == 0 {
 		return mqttc.Message{}, core.Invalidf("payload is required (use \"\" for an empty message)")
 	}
-	return core.PublishRequest{Topic: a.Topic, Payload: a.Payload, Encoding: a.Encoding, QoS: a.QoS, Retain: a.Retain}.Message()
+	return core.PublishRequest{Topic: a.Topic, Payload: a.Payload, Encoding: a.Encoding, QoS: a.QoS, Retain: a.Retain, Properties: a.Properties}.Message()
 }
 
 func webhookSchema(update bool) map[string]any {

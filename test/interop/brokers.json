@@ -38,6 +38,38 @@
           "name": "wss",
           "url": "wss://127.0.0.1:11094",
           "tls": "ca"
+        },
+        {
+          "name": "v5-tcp-anonymous",
+          "url": "tcp://127.0.0.1:11883",
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-tcp-password",
+          "url": "mqtt://127.0.0.1:11884",
+          "username": "mg",
+          "password": "mg-pass",
+          "wrong_password_rejected": true,
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-tls",
+          "url": "mqtts://127.0.0.1:11893",
+          "tls": "ca",
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-mtls",
+          "url": "mqtts://127.0.0.1:11894",
+          "tls": "mtls",
+          "no_client_cert_rejected": true,
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-wss",
+          "url": "wss://127.0.0.1:11094",
+          "tls": "ca",
+          "protocol_version": 5
         }
       ]
     },
@@ -80,6 +112,39 @@
           "tls": "ca",
           "username": "mg",
           "password": "mg-pass"
+        },
+        {
+          "name": "v5-tcp-password",
+          "url": "tcp://127.0.0.1:21883",
+          "username": "mg",
+          "password": "mg-pass",
+          "wrong_password_rejected": true,
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-tls-password",
+          "url": "ssl://127.0.0.1:21893",
+          "tls": "ca",
+          "username": "mg",
+          "password": "mg-pass",
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-mtls-password",
+          "url": "mqtts://127.0.0.1:21894",
+          "tls": "mtls",
+          "username": "mg",
+          "password": "mg-pass",
+          "no_client_cert_rejected": true,
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-wss-password",
+          "url": "wss://127.0.0.1:21094/mqtt",
+          "tls": "ca",
+          "username": "mg",
+          "password": "mg-pass",
+          "protocol_version": 5
         }
       ]
     },
@@ -111,6 +176,30 @@
           "name": "wss-mtls",
           "url": "wss://127.0.0.1:31094/mqtt",
           "tls": "mtls"
+        },
+        {
+          "name": "v5-tcp",
+          "url": "tcp://127.0.0.1:31883",
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-tls",
+          "url": "mqtts://127.0.0.1:31893",
+          "tls": "ca",
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-mtls",
+          "url": "mqtts://127.0.0.1:31894",
+          "tls": "mtls",
+          "no_client_cert_rejected": true,
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-wss-mtls",
+          "url": "wss://127.0.0.1:31094/mqtt",
+          "tls": "mtls",
+          "protocol_version": 5
         }
       ]
     },
@@ -151,6 +240,37 @@
           "url": "mqtts://127.0.0.1:42894",
           "tls": "mtls",
           "no_client_cert_rejected": true
+        },
+        {
+          "name": "v5-tcp-password",
+          "url": "tcp://127.0.0.1:41883",
+          "username": "mg",
+          "password": "mg-pass",
+          "wrong_password_rejected": true,
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-tls-password",
+          "url": "tls://127.0.0.1:41893",
+          "tls": "ca",
+          "username": "mg",
+          "password": "mg-pass",
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-wss-password",
+          "url": "wss://127.0.0.1:41094/mqtt",
+          "tls": "ca",
+          "username": "mg",
+          "password": "mg-pass",
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-mtls",
+          "url": "mqtts://127.0.0.1:42894",
+          "tls": "mtls",
+          "no_client_cert_rejected": true,
+          "protocol_version": 5
         }
       ]
     },
@@ -194,6 +314,37 @@
           "url": "mqtts://127.0.0.1:52894",
           "tls": "mtls",
           "no_client_cert_rejected": true
+        },
+        {
+          "name": "v5-tcp-password",
+          "url": "tcp://127.0.0.1:51883",
+          "username": "mg",
+          "password": "mg-pass",
+          "wrong_password_rejected": true,
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-tls-password",
+          "url": "mqtts://127.0.0.1:51893",
+          "tls": "ca",
+          "username": "mg",
+          "password": "mg-pass",
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-wss-password",
+          "url": "wss://127.0.0.1:51094/mqtt",
+          "tls": "ca",
+          "username": "mg",
+          "password": "mg-pass",
+          "protocol_version": 5
+        },
+        {
+          "name": "v5-mtls",
+          "url": "mqtts://127.0.0.1:52894",
+          "tls": "mtls",
+          "no_client_cert_rejected": true,
+          "protocol_version": 5
         }
       ]
     }

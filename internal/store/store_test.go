@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -101,5 +102,32 @@ func TestPayloadRoundTrip(t *testing.T) {
 	}
 	if sz := unsafe.Sizeof(slot{}); sz > 32 {
 		t.Fatalf("slot is %d bytes, want <= 32", sz)
+	}
+}
+
+func TestPropsJSONAndExpiry(t *testing.T) {
+	e := &Entry{Topic: "t", Payload: []byte("1"), Time: time.Now().Add(-2 * time.Second).UnixNano(), Props: &Props{
+		ContentType: "application/json", ResponseTopic: "r/1", CorrelationData: []byte{0xff, 1},
+		UserProperties: []UserProperty{{"site", "lisbon"}, {"site", "porto"}}, MessageExpiry: 1, PayloadUTF8: true,
+	}}
+	got := string(AppendJSON(nil, e))
+	want := `"properties":{"content_type":"application/json","response_topic":"r/1","correlation_data_base64":"/wE=","user_properties":[{"key":"site","value":"lisbon"},{"key":"site","value":"porto"}],"message_expiry_sec":1,"payload_format":"utf8"}}`
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("got %s", got)
+	}
+	var v map[string]any
+	if err := json.Unmarshal([]byte(got), &v); err != nil {
+		t.Fatal(err)
+	}
+	if !e.Expired(time.Now()) {
+		t.Fatal("expired 1s-expiry message received 2s ago")
+	}
+	if strings.Contains(string(AppendJSON(nil, &Entry{Topic: "t", Props: &Props{}})), "properties") {
+		t.Fatal("empty props must not be rendered")
+	}
+	s := New(0)
+	s.Set(e)
+	if g, _ := s.Get("t"); g.Props == nil || g.Props.ResponseTopic != "r/1" {
+		t.Fatal("props not stored")
 	}
 }

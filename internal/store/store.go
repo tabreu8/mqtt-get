@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/tabreu8/mqtt-get/internal/topic"
@@ -22,7 +23,8 @@ type Entry struct {
 	Payload  []byte
 	QoS      byte
 	Retained bool
-	Time     int64 // unix nanoseconds when received
+	Time     int64  // unix nanoseconds when received
+	Props    *Props // MQTT 5 properties (nil for MQTT 3.1.1 or none)
 }
 
 // slot holds the latest value of one topic. It is allocated once per topic
@@ -38,10 +40,11 @@ type slot struct {
 	qos      byte
 	retained bool
 	time     int64
+	props    *Props
 }
 
 func newSlot(e *Entry) slot {
-	return slot{payload: unsafe.SliceData(e.Payload), n: uint32(len(e.Payload)), qos: e.QoS, retained: e.Retained, time: e.Time}
+	return slot{payload: unsafe.SliceData(e.Payload), n: uint32(len(e.Payload)), qos: e.QoS, retained: e.Retained, time: e.Time, props: e.Props}
 }
 
 func (sl *slot) bytes() []byte {
@@ -52,7 +55,7 @@ func (sl *slot) bytes() []byte {
 }
 
 func (sl *slot) value(topic string) Entry {
-	return Entry{Topic: topic, Payload: sl.bytes(), QoS: sl.qos, Retained: sl.retained, Time: sl.time}
+	return Entry{Topic: topic, Payload: sl.bytes(), QoS: sl.qos, Retained: sl.retained, Time: sl.time, Props: sl.props}
 }
 
 func (sl *slot) entry(topic string) *Entry {
@@ -114,8 +117,15 @@ func (s *Store) Set(e *Entry) bool {
 	}
 	if ok {
 		// In place: no allocation, and the caller's copy of the topic name
-		// is not retained.
-		*old = newSlot(e)
+		// is not retained. Fields are written one by one so pointer writes
+		// (which cost a GC write barrier while the collector runs) happen
+		// only when needed: props is nil for all MQTT 3.1.1 traffic.
+		old.payload = unsafe.SliceData(e.Payload)
+		old.n = uint32(len(e.Payload))
+		old.qos, old.retained, old.time = e.QoS, e.Retained, e.Time
+		if old.props != e.Props {
+			old.props = e.Props
+		}
 	} else {
 		sl := newSlot(e)
 		sh.m[e.Topic] = &sl
@@ -173,13 +183,16 @@ func (s *Store) Dropped() uint64 { return s.dropped.Load() }
 // returns the total number of matches.
 func (s *Store) Query(filter string, limit int) ([]*Entry, int) {
 	all := filter == "" || filter == "#"
+	now := time.Now()
 	var vals []Entry // one backing array instead of one allocation per result
 	for i := range s.shards {
 		sh := &s.shards[i]
 		sh.mu.RLock()
 		for name, sl := range sh.m {
 			if all || topic.Match(filter, name) {
-				vals = append(vals, sl.value(name))
+				if v := sl.value(name); !v.Expired(now) { // MQTT 5 message expiry
+					vals = append(vals, v)
+				}
 			}
 		}
 		sh.mu.RUnlock()

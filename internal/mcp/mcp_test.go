@@ -24,6 +24,7 @@ import (
 
 	"github.com/tabreu8/mqtt-get/internal/config"
 	"github.com/tabreu8/mqtt-get/internal/core"
+	"github.com/tabreu8/mqtt-get/internal/mqttc"
 	"github.com/tabreu8/mqtt-get/internal/state"
 	"github.com/tabreu8/mqtt-get/internal/store"
 )
@@ -41,6 +42,10 @@ var (
 // newService returns a core service; with a broker it is connected to an
 // embedded MQTT broker (returned) whose inline client can play a device.
 func newService(t *testing.T, withBroker bool) (*core.Service, *mochi.Server) {
+	return newServiceVersion(t, withBroker, 4)
+}
+
+func newServiceVersion(t *testing.T, withBroker bool, version uint) (*core.Service, *mochi.Server) {
 	t.Helper()
 	st, err := state.Open(t.TempDir())
 	if err != nil {
@@ -69,7 +74,7 @@ func newService(t *testing.T, withBroker bool) (*core.Service, *mochi.Server) {
 	if !withBroker {
 		return svc, nil
 	}
-	if err := svc.Start(config.Broker{URLs: []string{"tcp://" + addr}, ClientID: "mcp-test", Password: "pw", Username: "u"}, true); err != nil {
+	if err := svc.Start(config.Broker{URLs: []string{"tcp://" + addr}, ClientID: "mcp-test", Password: "pw", Username: "u", ProtocolVersion: version}, true); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, "broker connection", func() bool { return svc.MQTTStatus().Connected })
@@ -879,5 +884,57 @@ func TestHTTPStatelessAndSecurity(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer read-key")
 	if r, _ := http.DefaultClient.Do(req); r.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("GET without event-stream accept: %d", r.StatusCode)
+	}
+}
+
+// Over MQTT 5, publish_and_wait uses response topic + correlation data: a
+// reply correlated to someone else's request is ignored.
+func TestPublishAndWaitMQTT5Correlation(t *testing.T) {
+	svc, _ := newServiceVersion(t, true, 5)
+	s := New(svc, quiet(), Options{})
+	defer s.Close()
+	// A separate MQTT 5 device on the same broker that answers requests.
+	var sawResponseTopic atomic.Value
+	var device *mqttc.Manager
+	device = mqttc.New(quiet(), func(e store.Entry) {
+		if e.Topic != "rpc/request" || e.Props == nil {
+			return
+		}
+		sawResponseTopic.Store(e.Props.ResponseTopic)
+		rt, corr := e.Props.ResponseTopic, e.Props.CorrelationData
+		go func() {
+			ctx := context.Background()
+			// First an answer to someone else's request, then ours.
+			_, _ = device.PublishMany(ctx, []mqttc.Message{{Topic: rt, Payload: []byte(`{"answer":"wrong"}`), QoS: 1,
+				Props: &store.Props{CorrelationData: []byte("someone-else")}}})
+			time.Sleep(50 * time.Millisecond)
+			_, _ = device.PublishMany(ctx, []mqttc.Message{{Topic: rt, Payload: []byte(`{"answer":42}`), QoS: 1,
+				Props: &store.Props{CorrelationData: corr}}})
+		}()
+	})
+	cfg := svc.BrokerConfig()
+	cfg.ClientID, cfg.Subscriptions = "device", []config.Subscription{{Filter: "rpc/request", QoS: 1}}
+	if err := device.Apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	defer device.Close()
+	waitUntil(t, "device connection", func() bool { return device.Status().Connected })
+	time.Sleep(200 * time.Millisecond)
+
+	c := newStdio(t, s, operatr)
+	c.initialize("2025-06-18")
+	r := c.mustTool("publish_and_wait", map[string]any{
+		"topic": "rpc/request", "payload": map[string]any{"q": "?"}, "qos": 1,
+		"response_filter": "rpc/response", "timeout_seconds": 5})
+	resp, _ := r["response"].(map[string]any)
+	if r["response_received"] != true || r["correlated"] != true || resp["payload"].(map[string]any)["answer"] != 42.0 {
+		t.Fatalf("publish_and_wait: %v", r)
+	}
+	if sawResponseTopic.Load() != "rpc/response" {
+		t.Fatalf("request carried response topic %v", sawResponseTopic.Load())
+	}
+	props := resp["properties"].(map[string]any)
+	if !strings.HasPrefix(props["correlation_data"].(string), "mqtt-get-") {
+		t.Fatalf("correlation data: %v", props)
 	}
 }

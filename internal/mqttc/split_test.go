@@ -2,6 +2,7 @@ package mqttc
 
 import (
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
@@ -62,5 +63,32 @@ func TestSplitSubscriptions(t *testing.T) {
 	}
 	if st.FiltersPerConnection[1][0] != "energy/#" {
 		t.Fatalf("filters per connection: %v", st.FiltersPerConnection)
+	}
+}
+
+type recordConn struct {
+	net.Conn
+	frames [][]byte
+}
+
+func (r *recordConn) Write(p []byte) (int, error) {
+	r.frames = append(r.frames, append([]byte(nil), p...))
+	return len(p), nil
+}
+
+func TestPacketFramedConn(t *testing.T) {
+	rec := &recordConn{}
+	c := &packetFramedConn{Conn: rec}
+	pingreq := []byte{0xC0, 0x00}
+	big := append([]byte{0x30, 0x80, 0x01}, make([]byte, 128)...) // remaining length 128 (2-byte varint)
+	// Header and body written separately, and two packets in one write.
+	writes := [][]byte{big[:2], big[2:3], big[3:70], append(big[70:], pingreq...)}
+	for _, w := range writes {
+		if n, err := c.Write(w); err != nil || n != len(w) {
+			t.Fatal(n, err)
+		}
+	}
+	if len(rec.frames) != 2 || len(rec.frames[0]) != len(big) || string(rec.frames[1]) != string(pingreq) {
+		t.Fatalf("frames: %d %v", len(rec.frames), rec.frames)
 	}
 }

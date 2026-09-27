@@ -458,3 +458,7 @@ func TestUsernamePassword(t *testing.T) {
 		expectConnected(t, m, r)
 	})
 }
+
+func writeFileAt(path, content string) error { return os.WriteFile(path, []byte(content), 0o600) }
+
+func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

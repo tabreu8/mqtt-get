@@ -341,6 +341,10 @@ func (d *Dispatcher) send(h *hook, body []byte, contentType string, batch []*sto
 		req.Header.Set("X-MQTT-QoS", strconv.Itoa(int(e.QoS)))
 		req.Header.Set("X-MQTT-Retained", strconv.FormatBool(e.Retained))
 		req.Header.Set("X-MQTT-Timestamp", time.Unix(0, e.Time).UTC().Format(time.RFC3339Nano))
+		e.Props.WriteHeaders(req.Header.Add)
+		if e.Props != nil && e.Props.ContentType != "" {
+			req.Header.Set("Content-Type", e.Props.ContentType)
+		}
 	}
 	for k, v := range cfg.Headers {
 		req.Header.Set(k, v)

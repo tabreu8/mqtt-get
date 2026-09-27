@@ -1,7 +1,10 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -167,14 +170,41 @@ func (s *Service) newest(filter string) *store.Entry {
 // responseFilter (request/response, e.g. command topic -> state topic).
 // Messages on msg.Topic itself are ignored so the command's own echo never
 // counts as the response. Returns (nil, nil) on timeout.
+//
+// Over MQTT 5 it uses native request/response: the request carries a
+// response topic (when responseFilter is a plain topic) and random
+// correlation data, and replies carrying other correlation data (answers to
+// someone else's request) are ignored. Replies without correlation data
+// (plain state updates) still count.
 func (s *Service) PublishAndWait(ctx context.Context, msg mqttc.Message, responseFilter string, timeout time.Duration) (*store.Entry, error) {
 	if err := topic.ValidateFilter(responseFilter); err != nil {
 		return nil, invalid(err)
+	}
+	var correlation []byte
+	if s.mqtt.Config().ProtocolVersion == 5 {
+		p := store.Props{}
+		if msg.Props != nil {
+			p = *msg.Props
+		}
+		if len(p.CorrelationData) == 0 {
+			var b [12]byte
+			_, _ = rand.Read(b[:])
+			p.CorrelationData = []byte("mqtt-get-" + hex.EncodeToString(b[:]))
+		}
+		if p.ResponseTopic == "" && !topic.HasWildcard(responseFilter) {
+			p.ResponseTopic = responseFilter
+		}
+		correlation = p.CorrelationData
+		msg.Props = &p
 	}
 	ch := make(chan *store.Entry, 1)
 	cancel, err := s.watch.add(responseFilter, func(e *store.Entry) {
 		if e.Topic == msg.Topic {
 			return
+		}
+		if correlation != nil && e.Props != nil && len(e.Props.CorrelationData) > 0 &&
+			!bytes.Equal(e.Props.CorrelationData, correlation) {
+			return // a response to another request
 		}
 		select {
 		case ch <- e:

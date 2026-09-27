@@ -26,6 +26,9 @@ type value struct {
 	AgeSeconds   float64 `json:"age_seconds"`
 	PayloadBytes int     `json:"payload_bytes"`
 	Truncated    bool    `json:"truncated,omitempty"`
+	// MQTT 5 only.
+	Properties       map[string]any `json:"properties,omitempty"`
+	ExpiresInSeconds *float64       `json:"expires_in_seconds,omitempty"`
 }
 
 func viewOf(e *store.Entry) value {
@@ -37,6 +40,33 @@ func viewOf(e *store.Entry) value {
 		AgeSeconds:   math.Round(time.Since(time.Unix(0, e.Time)).Seconds()*10) / 10,
 		PayloadBytes: len(e.Payload),
 		Encoding:     store.Encoding(e.Payload),
+	}
+	if pr := e.Props; !pr.Empty() {
+		v.Properties = map[string]any{}
+		if pr.ContentType != "" {
+			v.Properties["content_type"] = pr.ContentType
+		}
+		if pr.ResponseTopic != "" {
+			v.Properties["response_topic"] = pr.ResponseTopic
+		}
+		if len(pr.CorrelationData) > 0 {
+			if utf8.Valid(pr.CorrelationData) {
+				v.Properties["correlation_data"] = string(pr.CorrelationData)
+			} else {
+				v.Properties["correlation_data_base64"] = base64.StdEncoding.EncodeToString(pr.CorrelationData)
+			}
+		}
+		if len(pr.UserProperties) > 0 {
+			v.Properties["user_properties"] = pr.UserProperties
+		}
+		if pr.MessageExpiry > 0 {
+			v.Properties["message_expiry_sec"] = pr.MessageExpiry
+			left := math.Round(time.Until(e.ExpiresAt()).Seconds()*10) / 10
+			v.ExpiresInSeconds = &left
+		}
+		if pr.PayloadUTF8 {
+			v.Properties["payload_format"] = "utf8"
+		}
 	}
 	p := e.Payload
 	if len(p) > maxPayloadBytes {

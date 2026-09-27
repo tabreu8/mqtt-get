@@ -23,7 +23,7 @@ curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/values/factory
 - [Reading values (GET)](#reading-values-get)
 - [Publishing (POST)](#publishing-post)
 - [Webhooks](#webhooks)
-- [Connecting to your broker](#connecting-to-your-broker) (auth methods and recipes for Mosquitto, EMQX, HiveMQ, NanoMQ, Coreflux, AWS IoT Core, Azure IoT Hub)
+- [Connecting to your broker](#connecting-to-your-broker) (auth methods and recipes for Mosquitto, EMQX, HiveMQ, NanoMQ, Coreflux, AWS IoT Core, Azure IoT Hub; [MQTT 5](#mqtt-5))
 - [Tested brokers](#tested-brokers)
 - [Configuration](#configuration)
 - [Security and API keys](#security-and-api-keys)
@@ -344,7 +344,40 @@ function verify(headers, rawBody /* Buffer */) {
 | Unix socket | `unix:///run/mosquitto.sock` | |
 | Failover | `MQTT_URL=ssl://a:8883,ssl://b:8883` | Tried in order |
 
-URL schemes: `tcp`, `mqtt`, `ssl`, `tls`, `mqtts`, `mqtt+ssl`, `tcps`, `ws`, `wss`, `unix`. Default ports are 1883 (plain) and 8883 (TLS). Protocols: MQTT **3.1.1** (default) and 3.1. MQTT 5-only features such as enhanced AUTH aren't supported; MQTT 5 brokers accept 3.1.1 clients.
+URL schemes: `tcp`, `mqtt`, `ssl`, `tls`, `mqtts`, `mqtt+ssl`, `tcps`, `ws`, `wss`, `unix`. Default ports are 1883 (plain) and 8883 (TLS). Protocols: MQTT **3.1.1** (default), **MQTT 5** (`MQTT_PROTOCOL_VERSION=5`, see [MQTT 5](#mqtt-5)) and 3.1. Every authentication method and transport above works with both.
+
+### MQTT 5
+
+Set `MQTT_PROTOCOL_VERSION=5` (or `protocol_version: 5` in the UI, API or MCP) to get:
+
+| Feature | What mqtt-get does with it |
+|---|---|
+| **Message properties** | Content type, response topic, correlation data, user properties (repeated keys kept), message expiry and payload format are stored with each value. They are returned by REST (`"properties": {…}` in JSON, `X-MQTT-*` headers with `?format=raw`), MCP and webhooks. You can set them when publishing. |
+| **Message expiry** | A value published with `message_expiry_sec` is no longer served after it expires: `GET` returns `404 … expired`, and it drops out of filters and listings. MCP shows `expires_in_seconds`. |
+| **Request/response** | MCP `publish_and_wait` (and the core behind it) sets a **response topic** and random **correlation data** on the request. Replies carrying someone else's correlation data are ignored; the result says whether it was `correlated`. |
+| **Reason codes** | Refused connections, rejected subscriptions and publishes, and server disconnects show the MQTT 5 reason, e.g. `connect failed: reason 0x86 bad user name or password`. |
+| **Topic aliases** | The broker may replace long topic names with 2-byte aliases (up to `MQTT_TOPIC_ALIAS_MAXIMUM`, default 1024), which saves bandwidth. mqtt-get resolves them per connection. |
+| **Sessions and flow control** | `MQTT_SESSION_EXPIRY_SEC` keeps the session across reconnects; mqtt-get allows up to 65535 in-flight QoS 1/2 messages (receive maximum). |
+
+Publishing with properties:
+
+```bash
+# JSON
+curl -X POST -H "Authorization: Bearer $KEY" localhost:8080/api/v1/publish -d '{
+  "topic": "devices/lamp/set", "payload": {"state": "ON"}, "qos": 1,
+  "properties": {"content_type": "application/json", "response_topic": "devices/lamp/reply",
+                 "correlation_data": "req-42", "user_properties": {"source": "dashboard"}, "message_expiry_sec": 30}}'
+
+# raw body + headers (X-MQTT-User-Property can repeat)
+curl -X POST -H "Authorization: Bearer $KEY" -H "X-MQTT-Content-Type: text/plain" \
+     -H "X-MQTT-User-Property: source=cron" --data 'ON' localhost:8080/api/v1/publish/devices/lamp/set
+```
+
+Header names: `X-MQTT-Content-Type`, `X-MQTT-Response-Topic`, `X-MQTT-Correlation-Data` (base64), `X-MQTT-Message-Expiry` (seconds), `X-MQTT-User-Property` (`key=value`, repeatable) and `X-MQTT-Payload-Format` (`utf8`). Publishing properties over an MQTT 3.1.1 connection returns `400`.
+
+Tested on Mosquitto, EMQX, HiveMQ CE, NanoMQ and Coreflux over TCP, TLS, mTLS and WSS (see [Tested brokers](#tested-brokers)). MQTT 5 enhanced authentication (AUTH packets, e.g. SCRAM) isn't supported yet.
+
+> Over WebSocket, mqtt-get always sends one complete MQTT packet per WebSocket frame. The MQTT spec allows packets to be split across frames, but Mosquitto 2 rejects that for MQTT 5, and aligned frames work everywhere.
 
 TLS settings can be given as **file paths** (good for mounted secrets) or **inline PEM** (good for the UI and API). If you set both, the PEM wins. TLS 1.2+ is enforced.
 
@@ -457,16 +490,18 @@ MQTT_TOPICS="factory/+/+/status:1,factory/+/+/alarm:1,energy/#"   # ":1" sets Qo
 
 ## Tested brokers
 
-mqtt-get ships with an **interoperability suite** that runs the full stack (REST, publish at every QoS, retained replay, binary payloads, wildcards, webhooks and negative auth checks) against real brokers. Last run: **325 passed, 0 failed**.
+mqtt-get ships with an **interoperability suite** that runs the full stack (REST, publish at every QoS, retained replay, binary payloads, wildcards, webhooks and negative auth checks) against real brokers. Last run: **643 passed, 0 failed** over 47 endpoints (MQTT 3.1.1 and MQTT 5).
 
-| Broker | Version | TCP | Password | WS | TLS | mTLS | WSS | `split` scale-out | `$share` scale-out |
-|---|---|---|---|---|---|---|---|---|---|
-| Eclipse Mosquitto | 2.1.2 / 2.0.18 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| EMQX | 6.3.1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| HiveMQ CE | 2026.5 | ✅ | n/a | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| NanoMQ (`-full`) | 0.25.6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Coreflux | 2.14.3 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ not supported by broker |
-| mochi-mqtt | 2.7.9 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | – |
+| Broker | Version | TCP | Password | WS | TLS | mTLS | WSS | MQTT 5 | `split` scale-out | `$share` scale-out |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Eclipse Mosquitto | 2.1.2 / 2.0.18 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| EMQX | 6.3.1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| HiveMQ CE | 2026.5 | ✅ | n/a | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| NanoMQ (`-full`) | 0.25.6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Coreflux | 2.14.3 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ not supported by broker |
+| mochi-mqtt | 2.7.9 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | – |
+
+"MQTT 5" means every transport and auth method of that broker was also run over MQTT 5, plus properties both ways, message expiry and correlated request/response.
 
 Details, per-check results, broker configuration notes and instructions for running it against **your own broker** are in [`test/interop/README.md`](test/interop/README.md).
 
@@ -486,7 +521,9 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `MQTT_CLIENT_ID` | `mqtt-get-<hostname>` | Must be unique on the broker |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | – | |
 | `MQTT_PASSWORD_FILE` | – | Read on every (re)connect; trailing newline stripped |
-| `MQTT_PROTOCOL_VERSION` | `4` | `4` = MQTT 3.1.1, `3` = MQTT 3.1 |
+| `MQTT_PROTOCOL_VERSION` | `4` | `4` = MQTT 3.1.1, `5` = [MQTT 5](#mqtt-5), `3` = MQTT 3.1 |
+| `MQTT_SESSION_EXPIRY_SEC` | `0` | MQTT 5: keep the session this long after a disconnect |
+| `MQTT_TOPIC_ALIAS_MAXIMUM` | `1024` | MQTT 5: topic aliases the broker may use towards mqtt-get (`0` disables) |
 | `MQTT_CLEAN_SESSION` | `true` | |
 | `MQTT_KEEPALIVE_SEC` | `30` | |
 | `MQTT_CONNECT_TIMEOUT_SEC` | `10` | |
@@ -745,6 +782,7 @@ Suggested alerts: `mqttget_mqtt_connected == 0` for 1 minute; `rate(mqttget_webh
 |---|---|
 | mqtt-get's own cost per message (store + webhook routing) | **~200 ns, 0 allocations** |
 | Ingest capacity (fake broker, no broker bottleneck) | ~160k msg/s on 1 connection; **~690k msg/s with 4 split connections** |
+| Same, over MQTT 5 | ~250k msg/s on 1 connection (the MQTT 5 client pipelines better); ~540–590k with 4 split connections |
 | One connection, 64-byte payloads, 10k topics | **~225k msg/s, no loss.** Mosquitto (single-threaded) was the bottleneck. |
 | `GET` one value (in-process benchmark) | ~1.7 µs |
 | Memory with 10k topics | ~16–30 MB RSS |
@@ -962,4 +1000,4 @@ internal/config     configuration model and environment parsing
 test/interop        real-broker interoperability suite + docker-compose
 ```
 
-**Limitations** (by design, for now): MQTT 5-only features (enhanced AUTH, user properties, topic aliases) aren't used; values and webhook queues live in memory; there is no history, only the latest value per topic.
+**Limitations** (by design, for now): MQTT 5 enhanced authentication (AUTH packets) isn't supported; values and webhook queues live in memory; there is no history, only the latest value per topic.

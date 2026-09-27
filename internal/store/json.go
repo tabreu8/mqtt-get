@@ -52,8 +52,9 @@ func AppendJSON(buf []byte, e *Entry) []byte {
 	buf = strconv.AppendBool(buf, e.Retained)
 	buf = append(buf, `,"timestamp":"`...)
 	buf = time.Unix(0, e.Time).UTC().AppendFormat(buf, time.RFC3339Nano)
-	buf = append(buf, `"}`...)
-	return buf
+	buf = append(buf, '"')
+	buf = appendProps(buf, e.Props)
+	return append(buf, '}')
 }
 
 const hexDigits = "0123456789abcdef"

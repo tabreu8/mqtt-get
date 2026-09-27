@@ -4,7 +4,7 @@ This suite runs mqtt-get end to end against real MQTT brokers, with every authen
 
 ## Last results
 
-**325 checks passed, 0 failed, 1 skipped (a known broker limitation)** across 26 endpoints on 5 brokers. Run on 2026-09-27.
+**643 checks passed, 0 failed, 1 skipped (a known broker limitation)** across 47 endpoints on 5 brokers: every endpoint over MQTT 3.1.1, and 21 of them again over MQTT 5. Run on 2026-09-27.
 
 | Broker | Version | TCP | Password auth | WebSocket | TLS | mTLS | WSS | `$share` |
 |---|---|---|---|---|---|---|---|---|
@@ -35,6 +35,9 @@ For every endpoint the suite checks the following. Checks that don't apply to an
 | `no_client_cert_rejected` | An mTLS listener refuses a client with no certificate |
 | `untrusted_ca_rejected` | Without the custom CA, the server certificate is refused |
 | `shared_subscriptions` | 3 connections in a `$share` group: 300 messages ingested **exactly once** and spread over all connections |
+| `mqtt5_properties` | MQTT 5 only: content type, response topic, correlation data, user properties, expiry and payload format survive device → mqtt-get (REST) and REST → device |
+| `mqtt5_message_expiry` | MQTT 5 only: a value published with a 1 s expiry is served, then returns `404 … expired` |
+| `mqtt5_request_response` | MQTT 5 only: publish-and-wait sets response topic + correlation data; a device reply with foreign correlation data is ignored, the correlated one is returned |
 | `split_subscriptions` | 3 connections with `subscription_mode: split` (one filter each): 300 messages ingested exactly once, `[100 100 100]`. Works on every broker, including Coreflux, which lacks `$share` |
 
 Also verified by hand: when the broker is killed and restarted, mqtt-get reports 503 on `/healthz` with a clear error, refuses publishes with "not connected", then reconnects and resubscribes by itself about 1 s after the broker returns.
@@ -96,6 +99,7 @@ Endpoint fields:
 | Field | |
 |---|---|
 | `url` | Any URL mqtt-get accepts: `tcp://`, `mqtt://`, `ssl://`, `tls://`, `mqtts://`, `ws://`, `wss://` |
+| `protocol_version` | `4` (default) or `5`; version 5 also runs the `mqtt5_*` checks |
 | `username`, `password` | Credentials |
 | `tls` | `""` (none), `"ca"` (verify the server with `ca_file`) or `"mtls"` (also send the client certificate) |
 | `server_name` | TLS SNI / verification name override |
@@ -108,6 +112,7 @@ All test traffic stays under `mginterop/<endpoint>/<random>/...`, and the retain
 
 These notes come from getting each broker running. See `configs/` for the exact files.
 
+- **Mosquitto**: MQTT 5 over WebSocket rejects MQTT packets split across WebSocket frames (reason 0x81 malformed packet), although the spec allows it; mqtt-get sends one packet per frame.
 - **Mosquitto**: one `listener` block per auth method with `per_listener_settings true`. The password file must be hashed with `mosquitto_passwd`. `use_identity_as_username true` makes the certificate CN the username on the mTLS listener.
 - **EMQX**: everything is configured with `EMQX_*` environment variables (`configs/emqx.env`). A second SSL listener named `mtls` sets `verify_peer` and `fail_if_no_peer_cert`. Users come from a bootstrap CSV for the built-in database. Authentication is global, so the mTLS endpoint also sends the password.
 - **HiveMQ CE**: TLS uses a PKCS#12 keystore; mTLS also needs a truststore and `client-authentication-mode REQUIRED`. `gen-certs.sh` builds `trust.p12` with `keytool`, OpenSSL ≥ 3.2, or the HiveMQ image's `keytool`.

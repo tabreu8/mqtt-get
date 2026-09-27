@@ -112,6 +112,9 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
       </div>
     </div>
     <label>Payload</label><textarea id="pubPayload" placeholder='{"state":"ON"}'></textarea>
+    <details><summary>MQTT 5 properties (optional)</summary>
+      <textarea id="pubProps" placeholder='{"content_type":"application/json","response_topic":"devices/lamp/reply","user_properties":{"source":"ui"},"message_expiry_sec":60}'></textarea>
+    </details>
     <div class="actions"><button class="btn" id="pubBtn">Publish</button></div>
   </div>
 </section>
@@ -125,11 +128,12 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
       <textarea name="urls" style="min-height:48px" placeholder="tcp://broker.local:1883"></textarea>
       <div class="row">
         <div><label>Client ID</label><input name="client_id"></div>
-        <div><label>Protocol</label><select name="protocol_version"><option value="4">MQTT 3.1.1</option><option value="3">MQTT 3.1</option></select></div>
+        <div><label>Protocol</label><select name="protocol_version"><option value="4">MQTT 3.1.1</option><option value="5">MQTT 5</option><option value="3">MQTT 3.1</option></select></div>
         <div><label>Username</label><input name="username" autocomplete="off"></div>
         <div><label>Password / token</label><input name="password" type="password" autocomplete="new-password"></div>
         <div><label>Password file (optional, re-read on reconnect)</label><input name="password_file"></div>
         <div><label>Keep-alive (s)</label><input name="keepalive_sec" type="number"></div>
+        <div><label>Session expiry (s, MQTT 5)</label><input name="session_expiry_sec" type="number" min="0"></div>
       </div>
       <label><input type="checkbox" name="clean_session">Clean session</label>
       <label>Subscriptions — one per line: <span class="mono">filter [qos]</span></label>
@@ -320,6 +324,11 @@ $('#pubBtn').onclick = async () => {
   const t = $('#pubTopic').value.trim();
   if (!t) return toast('Topic required');
   try {
+    const props = $('#pubProps').value.trim();
+    if (props) {
+      let p; try { p = JSON.parse(props); } catch { return toast('Properties must be JSON'); }
+      await api('POST', '/api/v1/publish', { topic: t, payload: $('#pubPayload').value, qos: +$('#pubQos').value, retain: $('#pubRetain').checked, properties: p });
+    } else
     await api('POST', `/api/v1/publish/${t.split('/').map(encodeURIComponent).join('/')}?qos=${$('#pubQos').value}&retain=${$('#pubRetain').checked}`, $('#pubPayload').value, true);
     toast('Published'); setTimeout(loadValues, 300);
   } catch (e) { toast(e.message) }
@@ -333,6 +342,7 @@ async function loadBroker() {
   const set = (n, v) => { const el = f.elements[n]; if (!el) return; if (el.type === 'checkbox') el.checked = !!v; else el.value = v ?? ''; };
   set('urls', (c.urls || []).join('\n')); set('client_id', c.client_id); set('protocol_version', c.protocol_version || 4);
   set('username', c.username); set('password', c.password); set('password_file', c.password_file); set('keepalive_sec', c.keepalive_sec);
+  set('session_expiry_sec', c.session_expiry_sec || '');
   set('clean_session', c.clean_session !== false);
   set('subscriptions', (c.subscriptions || []).map(s => s.filter + (s.qos ? ' ' + s.qos : '')).join('\n'));
   const t = c.tls || {};
@@ -349,6 +359,7 @@ $('#brokerForm').onsubmit = async ev => {
   const body = {
     urls: lines(e.urls.value), client_id: v('client_id'), protocol_version: num('protocol_version'),
     username: v('username'), password: e.password.value, password_file: v('password_file'), keepalive_sec: num('keepalive_sec'),
+    ...(num('protocol_version') === 5 ? { session_expiry_sec: num('session_expiry_sec') } : {}),
     clean_session: e.clean_session.checked,
     subscriptions: lines(e.subscriptions.value).map(l => { const [f, q] = l.split(/\s+/); return { filter: f, qos: parseInt(q) || 0 }; }),
     tls: {

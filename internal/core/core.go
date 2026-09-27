@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -166,6 +167,10 @@ func (s *Service) Latest(name string) (*store.Entry, error) {
 	if !ok {
 		return nil, notFound("no value received yet for topic %q", name)
 	}
+	if e.Expired(time.Now()) {
+		return nil, notFound("the latest value of %q expired at %s (MQTT 5 message_expiry_sec=%d)",
+			name, e.ExpiresAt().UTC().Format(time.RFC3339), e.Props.MessageExpiry)
+	}
 	return e, nil
 }
 
@@ -207,10 +212,81 @@ type PublishRequest struct {
 	Topic string `json:"topic"`
 	// Payload: a JSON string is sent as its text; any other JSON value is
 	// sent as its JSON encoding.
-	Payload  json.RawMessage `json:"payload"`
-	Encoding string          `json:"encoding,omitempty"` // "", "text" or "base64"
-	QoS      byte            `json:"qos"`
-	Retain   bool            `json:"retain"`
+	Payload    json.RawMessage `json:"payload"`
+	Encoding   string          `json:"encoding,omitempty"` // "", "text" or "base64"
+	QoS        byte            `json:"qos"`
+	Retain     bool            `json:"retain"`
+	Properties *PublishProps   `json:"properties,omitempty"` // MQTT 5 only
+}
+
+// PublishProps are MQTT 5 publish properties as accepted from clients.
+type PublishProps struct {
+	ContentType           string `json:"content_type,omitempty"`
+	ResponseTopic         string `json:"response_topic,omitempty"`
+	CorrelationData       string `json:"correlation_data,omitempty"`
+	CorrelationDataBase64 string `json:"correlation_data_base64,omitempty"`
+	// UserProperties: [{"key":"k","value":"v"}, ...] (keys may repeat) or
+	// {"k":"v", ...}.
+	UserProperties   json.RawMessage `json:"user_properties,omitempty"`
+	MessageExpirySec uint32          `json:"message_expiry_sec,omitempty"`
+	PayloadFormat    string          `json:"payload_format,omitempty"` // "utf8" or "" / "bytes"
+}
+
+// Props converts the client form to store.Props.
+func (pp *PublishProps) Props() (*store.Props, error) {
+	if pp == nil {
+		return nil, nil
+	}
+	p := &store.Props{ContentType: pp.ContentType, ResponseTopic: pp.ResponseTopic, MessageExpiry: pp.MessageExpirySec}
+	if pp.ResponseTopic != "" {
+		if err := topic.ValidateName(pp.ResponseTopic); err != nil {
+			return nil, invalid(fmt.Errorf("response_topic: %w", err))
+		}
+	}
+	switch {
+	case pp.CorrelationData != "" && pp.CorrelationDataBase64 != "":
+		return nil, invalid(errors.New("give correlation_data or correlation_data_base64, not both"))
+	case pp.CorrelationData != "":
+		p.CorrelationData = []byte(pp.CorrelationData)
+	case pp.CorrelationDataBase64 != "":
+		b, err := base64.StdEncoding.DecodeString(pp.CorrelationDataBase64)
+		if err != nil {
+			return nil, invalid(fmt.Errorf("correlation_data_base64: %w", err))
+		}
+		p.CorrelationData = b
+	}
+	switch pp.PayloadFormat {
+	case "":
+	case "utf8":
+		p.PayloadUTF8 = true
+	case "bytes":
+	default:
+		return nil, invalid(errors.New(`payload_format must be "utf8" or "bytes"`))
+	}
+	if raw := strings.TrimSpace(string(pp.UserProperties)); raw != "" && raw != "null" {
+		if raw[0] == '[' {
+			if err := json.Unmarshal(pp.UserProperties, &p.UserProperties); err != nil {
+				return nil, invalid(fmt.Errorf("user_properties: %w", err))
+			}
+		} else {
+			var m map[string]string
+			if err := json.Unmarshal(pp.UserProperties, &m); err != nil {
+				return nil, invalid(fmt.Errorf("user_properties: %w", err))
+			}
+			keys := make([]string, 0, len(m))
+			for k := range m {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				p.UserProperties = append(p.UserProperties, store.UserProperty{Key: k, Value: m[k]})
+			}
+		}
+	}
+	if p.Empty() {
+		return nil, nil
+	}
+	return p, nil
 }
 
 // Message validates the request and converts it to an MQTT message.
@@ -246,13 +322,24 @@ func (p PublishRequest) Message() (mqttc.Message, error) {
 	default:
 		payload = []byte(raw)
 	}
-	return mqttc.Message{Topic: p.Topic, Payload: payload, QoS: p.QoS, Retain: p.Retain}, nil
+	props, err := p.Properties.Props()
+	if err != nil {
+		return mqttc.Message{}, err
+	}
+	return mqttc.Message{Topic: p.Topic, Payload: payload, QoS: p.QoS, Retain: p.Retain, Props: props}, nil
 }
 
 // Publish sends messages, waiting for broker acknowledgements (QoS > 0).
 func (s *Service) Publish(ctx context.Context, msgs []mqttc.Message) (int, error) {
 	if len(msgs) == 0 {
 		return 0, invalid(errors.New("no messages to publish"))
+	}
+	if s.mqtt.Config().ProtocolVersion != 5 {
+		for _, m := range msgs {
+			if !m.Props.Empty() {
+				return 0, invalid(mqttc.ErrPropertiesNeedV5)
+			}
+		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.PublishTimeout)
 	defer cancel()

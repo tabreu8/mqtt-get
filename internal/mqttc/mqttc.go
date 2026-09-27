@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -18,8 +17,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
 	"github.com/tabreu8/mqtt-get/internal/store"
@@ -36,6 +33,7 @@ type Handler func(e store.Entry)
 type Status struct {
 	Configured       bool      `json:"configured"`
 	Connected        bool      `json:"connected"`
+	Protocol         string    `json:"protocol,omitempty"`
 	Connections      int       `json:"connections"`
 	ConnectedCount   int       `json:"connected_count"`
 	URLs             []string  `json:"urls"`
@@ -52,10 +50,17 @@ type Status struct {
 	FiltersPerConnection [][]string `json:"filters_per_connection,omitempty"`
 }
 
-type conn struct {
-	client    mqtt.Client
-	connected atomic.Bool
-	received  atomic.Uint64
+// link is one broker connection. Implementations: v3link (MQTT 3.1/3.1.1)
+// and v5link (MQTT 5).
+type link interface {
+	start()
+	stop()
+	isUp() bool
+	stats() *counters
+	// send starts publishing msg and returns a function that waits for the
+	// result (broker acknowledgement for QoS > 0). Starting all sends before
+	// waiting pipelines a batch.
+	send(ctx context.Context, msg Message) func() error
 }
 
 // Manager owns the broker connections.
@@ -65,11 +70,10 @@ type Manager struct {
 
 	mu    sync.Mutex
 	cfg   config.Broker
-	conns []*conn
+	links []link
 
 	rr        atomic.Uint64
-	received  atomic.Uint64
-	bytes     atomic.Uint64
+	retired   counters // totals of links replaced by Apply/Reconnect
 	sent      atomic.Uint64
 	pubErrors atomic.Uint64
 
@@ -115,20 +119,33 @@ func (m *Manager) Apply(cfg config.Broker) error {
 	if !cfg.IsConfigured() {
 		return nil
 	}
-	m.conns = make([]*conn, cfg.Connections)
-	for i := range m.conns {
-		c := &conn{}
-		c.client = mqtt.NewClient(m.options(cfg, tlsCfg, i, c))
-		m.conns[i] = c
-		c.client.Connect() // retries in the background (ConnectRetry)
+	m.links = make([]link, cfg.Connections)
+	for i := range m.links {
+		if cfg.ProtocolVersion == 5 {
+			m.links[i] = newV5(m, cfg, tlsCfg, i)
+		} else {
+			m.links[i] = newV3(m, cfg, tlsCfg, i)
+		}
+		m.links[i].start()
 	}
-	m.log.Info("mqtt: connecting", "urls", cfg.URLs, "connections", cfg.Connections, "client_id", cfg.ClientID,
+	m.log.Info("mqtt: connecting", "urls", cfg.URLs, "protocol", protocolName(cfg.ProtocolVersion),
+		"connections", cfg.Connections, "client_id", cfg.ClientID,
 		"subscription_mode", cfg.SubscriptionMode, "shared_group", cfg.SharedGroup)
 	if cfg.SubscriptionMode == config.SubscriptionSplit && cfg.Connections > len(cfg.Subscriptions) {
 		m.log.Warn("mqtt: split mode has more connections than filters; the extra connections only publish",
 			"connections", cfg.Connections, "filters", len(cfg.Subscriptions))
 	}
 	return nil
+}
+
+func protocolName(v uint) string {
+	switch v {
+	case 3:
+		return "MQTT 3.1"
+	case 5:
+		return "MQTT 5"
+	}
+	return "MQTT 3.1.1"
 }
 
 // Reconnect drops and re-establishes the connections with the current config.
@@ -142,124 +159,68 @@ func (m *Manager) Close() {
 }
 
 func (m *Manager) disconnectLocked() {
-	for _, c := range m.conns {
-		c.client.Disconnect(250)
-		c.connected.Store(false)
+	for _, l := range m.links {
+		l.stop()
+		c := l.stats()
+		m.retired.recv.Add(c.recv.Load())
+		m.retired.bytes.Add(c.bytes.Load())
 	}
-	m.conns = nil
+	m.links = nil
 }
 
-func (m *Manager) options(cfg config.Broker, tlsCfg *tls.Config, idx int, c *conn) *mqtt.ClientOptions {
-	o := mqtt.NewClientOptions()
-	for _, u := range cfg.URLs {
-		o.AddBroker(u)
-	}
-	clientID := cfg.ClientID
+func clientIDFor(cfg config.Broker, idx int) string {
 	if cfg.Connections > 1 {
-		clientID += "-" + strconv.Itoa(idx)
+		return cfg.ClientID + "-" + strconv.Itoa(idx)
 	}
-	o.SetClientID(clientID)
-	o.SetProtocolVersion(cfg.ProtocolVersion)
-	o.SetCleanSession(cfg.UseCleanSession())
-	o.SetKeepAlive(time.Duration(cfg.KeepAliveSec) * time.Second)
-	o.SetConnectTimeout(time.Duration(cfg.ConnectTimeoutSec) * time.Second)
-	o.SetWriteTimeout(10 * time.Second)
-	o.SetAutoReconnect(true)
-	o.SetConnectRetry(true)
-	o.SetConnectRetryInterval(2 * time.Second)
-	o.SetMaxReconnectInterval(30 * time.Second)
-	// Deliver messages sequentially on the connection's goroutine: our
-	// handler is non-blocking, and this avoids a goroutine per message.
-	o.SetOrderMatters(true)
-	o.SetCustomOpenConnectionFn(dialer(cfg.TLS.Enabled))
-	if tlsCfg != nil {
-		o.SetTLSConfig(tlsCfg)
-	}
-	if len(cfg.WSHeaders) > 0 {
-		h := http.Header{}
-		for k, v := range cfg.WSHeaders {
-			h.Set(k, v)
-		}
-		o.SetHTTPHeaders(h)
-	}
-	if cfg.Username != "" || cfg.Password != "" || cfg.PasswordFile != "" {
-		username, password, passwordFile := cfg.Username, cfg.Password, cfg.PasswordFile
-		// Evaluated on every (re)connect so rotated tokens in files are picked up.
-		o.SetCredentialsProvider(func() (string, string) {
-			if passwordFile != "" {
-				if b, err := os.ReadFile(passwordFile); err == nil {
-					return username, strings.TrimRight(string(b), "\r\n")
-				} else {
-					m.log.Error("mqtt: reading password file", "err", err)
-				}
-			}
-			return username, password
-		})
-	}
+	return cfg.ClientID
+}
 
-	subs := cfg.SubscriptionsFor(idx)
-	subscribe := len(subs) > 0
-	filters := make(map[string]byte, len(subs))
-	for _, s := range subs {
-		filters[s.Filter] = s.QoS
+// credentials returns the username and the current password; the password
+// file is re-read on every (re)connect so rotated tokens are picked up.
+func (m *Manager) credentials(cfg config.Broker) (string, string) {
+	if cfg.PasswordFile != "" {
+		b, err := os.ReadFile(cfg.PasswordFile)
+		if err == nil {
+			return cfg.Username, strings.TrimRight(string(b), "\r\n")
+		}
+		m.log.Error("mqtt: reading password file", "err", err)
 	}
+	return cfg.Username, cfg.Password
+}
 
-	o.SetDefaultPublishHandler(func(_ mqtt.Client, msg mqtt.Message) {
-		c.received.Add(1)
-		m.onMessage(msg)
-	})
-	o.SetOnConnectHandler(func(cl mqtt.Client) {
-		c.connected.Store(true)
-		m.errMu.Lock()
-		if m.since.IsZero() {
-			m.since = time.Now()
-		}
-		m.lastErr = ""
-		m.errMu.Unlock()
-		m.log.Info("mqtt: connected", "client_id", clientID)
-		if subscribe && len(filters) > 0 {
-			// nil callback: messages go to the default publish handler.
-			tok := cl.SubscribeMultiple(filters, nil)
-			go func() {
-				if !tok.WaitTimeout(30 * time.Second) {
-					m.setErr("subscribe timed out")
-					return
-				}
-				if err := tok.Error(); err != nil {
-					m.setErr("subscribe: " + err.Error())
-					return
-				}
-				if st, ok := tok.(*mqtt.SubscribeToken); ok {
-					for f, code := range st.Result() {
-						if code == 0x80 {
-							msg := "subscription rejected by broker (check ACLs): " + f
-							if strings.HasPrefix(f, "$share/") {
-								msg = "shared subscription rejected by broker: " + f +
-									" (the broker may not support $share: use subscription_mode \"split\" / MQTT_SUBSCRIPTION_MODE=split instead of shared_group)"
-							}
-							m.setErr(msg)
-						}
-					}
-				}
-			}()
-		}
-	})
-	o.SetConnectionLostHandler(func(_ mqtt.Client, err error) {
-		c.connected.Store(false)
-		m.errMu.Lock()
-		m.since = time.Time{}
-		m.errMu.Unlock()
-		m.setErr("connection lost: " + err.Error())
-	})
-	o.SetConnectionNotificationHandler(func(_ mqtt.Client, n mqtt.ConnectionNotification) {
-		if f, ok := n.(mqtt.ConnectionNotificationFailed); ok {
-			m.setErr("connect failed: " + f.Reason.Error())
-		}
-		if f, ok := n.(mqtt.ConnectionNotificationBrokerFailed); ok {
-			m.setErr("connect to " + f.Broker.Redacted() + " failed: " + f.Reason.Error())
-		}
-	})
-	return o
+func hasCredentials(cfg config.Broker) bool {
+	return cfg.Username != "" || cfg.Password != "" || cfg.PasswordFile != ""
+}
+
+// --- callbacks shared by all link implementations ---
+
+func (m *Manager) linkUp(clientID string) {
+	m.errMu.Lock()
+	if m.since.IsZero() {
+		m.since = time.Now()
+	}
+	m.lastErr = ""
+	m.errMu.Unlock()
+	m.log.Info("mqtt: connected", "client_id", clientID)
+}
+
+func (m *Manager) linkDown(reason string) {
+	m.errMu.Lock()
+	m.since = time.Time{}
+	m.errMu.Unlock()
+	m.setErr("connection lost: " + reason)
+}
+
+func (m *Manager) subscriptionRejected(filter, detail string) {
+	msg := "subscription rejected by broker (check ACLs): " + filter
+	if strings.HasPrefix(filter, "$share/") {
+		msg = "shared subscription rejected by broker: " + filter +
+			" (the broker may not support $share: use subscription_mode \"split\" / MQTT_SUBSCRIPTION_MODE=split instead of shared_group)"
+	}
+	if detail != "" {
+		msg += " [" + detail + "]"
+	}
+	m.setErr(msg)
 }
 
 func (m *Manager) setErr(s string) {
@@ -275,55 +236,38 @@ func (m *Manager) setErr(s string) {
 	}
 }
 
-func (m *Manager) onMessage(msg mqtt.Message) {
-	p := msg.Payload()
-	m.received.Add(1)
-	m.bytes.Add(uint64(len(p)))
-	m.handler(store.Entry{
-		Topic:    msg.Topic(),
-		Payload:  p,
-		QoS:      msg.Qos(),
-		Retained: msg.Retained(),
-		Time:     time.Now().UnixNano(),
-	})
+// counters are per connection (on their own cache line), so connections on
+// different cores never contend on a shared counter; Status sums them.
+type counters struct {
+	recv  atomic.Uint64
+	bytes atomic.Uint64
+	_     [48]byte
 }
 
-// Publish sends a message, spreading load round-robin over connected
-// connections. For QoS > 0 it waits for the broker acknowledgement.
+func (m *Manager) deliver(c *counters, e store.Entry) {
+	c.recv.Add(1)
+	c.bytes.Add(uint64(len(e.Payload)))
+	m.handler(e)
+}
+
+// Publish sends one message and waits for the result.
 func (m *Manager) Publish(ctx context.Context, topic string, payload []byte, qos byte, retain bool) error {
-	c := m.pick()
-	if c == nil {
-		m.pubErrors.Add(1)
-		return ErrNotConnected
-	}
-	tok := c.client.Publish(topic, qos, retain, payload)
-	select {
-	case <-tok.Done():
-	case <-ctx.Done():
-		m.pubErrors.Add(1)
-		return fmt.Errorf("publish: %w", ctx.Err())
-	}
-	if err := tok.Error(); err != nil {
-		m.pubErrors.Add(1)
-		return err
-	}
-	m.sent.Add(1)
-	return nil
+	_, err := m.PublishMany(ctx, []Message{{Topic: topic, Payload: payload, QoS: qos, Retain: retain}})
+	return err
 }
 
-func (m *Manager) pick() *conn {
+func (m *Manager) pick() link {
 	m.mu.Lock()
-	conns := m.conns
+	links := m.links
 	m.mu.Unlock()
-	n := len(conns)
+	n := len(links)
 	if n == 0 {
 		return nil
 	}
 	start := int(m.rr.Add(1) % uint64(n))
 	for i := 0; i < n; i++ {
-		c := conns[(start+i)%n]
-		if c.connected.Load() {
-			return c
+		if l := links[(start+i)%n]; l.isUp() {
+			return l
 		}
 	}
 	return nil
@@ -335,13 +279,17 @@ func (m *Manager) Status() Status {
 	cfg := m.cfg
 	connected := 0
 	var perConn []uint64
-	for _, c := range m.conns {
-		if c.connected.Load() {
+	received, bytes := m.retired.recv.Load(), m.retired.bytes.Load()
+	for _, l := range m.links {
+		if l.isUp() {
 			connected++
 		}
-		perConn = append(perConn, c.received.Load())
+		c := l.stats()
+		perConn = append(perConn, c.recv.Load())
+		received += c.recv.Load()
+		bytes += c.bytes.Load()
 	}
-	total := len(m.conns)
+	total := len(m.links)
 	m.mu.Unlock()
 	m.errMu.Lock()
 	defer m.errMu.Unlock()
@@ -352,14 +300,18 @@ func (m *Manager) Status() Status {
 	st := Status{
 		Configured:       cfg.IsConfigured(),
 		Connected:        connected > 0,
+		Protocol:         protocolName(cfg.ProtocolVersion),
 		Connections:      total,
 		ConnectedCount:   connected,
 		URLs:             urls,
 		LastError:        m.lastErr,
-		MessagesReceived: m.received.Load(),
-		BytesReceived:    m.bytes.Load(),
+		MessagesReceived: received,
+		BytesReceived:    bytes,
 		MessagesSent:     m.sent.Load(),
 		PublishErrors:    m.pubErrors.Load(),
+	}
+	if !cfg.IsConfigured() {
+		st.Protocol = ""
 	}
 	if len(perConn) > 1 {
 		st.ReceivedPerConnection = perConn
@@ -458,41 +410,37 @@ type Message struct {
 	Payload []byte
 	QoS     byte
 	Retain  bool
+	Props   *store.Props // MQTT 5 only
 }
+
+// ErrPropertiesNeedV5 is returned when publishing properties over MQTT 3.
+var ErrPropertiesNeedV5 = errors.New("message properties need an MQTT 5 connection (protocol_version 5)")
 
 // PublishMany sends all messages, pipelining them before waiting for
 // acknowledgements. It returns how many were published successfully and the
 // first error.
 func (m *Manager) PublishMany(ctx context.Context, msgs []Message) (int, error) {
-	toks := make([]mqtt.Token, 0, len(msgs))
+	waits := make([]func() error, 0, len(msgs))
 	for _, msg := range msgs {
-		c := m.pick()
-		if c == nil {
-			m.pubErrors.Add(uint64(len(msgs) - len(toks)))
+		l := m.pick()
+		if l == nil {
+			m.pubErrors.Add(uint64(len(msgs) - len(waits)))
 			break
 		}
-		toks = append(toks, c.client.Publish(msg.Topic, msg.QoS, msg.Retain, msg.Payload))
+		waits = append(waits, l.send(ctx, msg))
 	}
 	ok := 0
 	var firstErr error
-	for _, tok := range toks {
-		select {
-		case <-tok.Done():
-			if err := tok.Error(); err != nil {
-				m.pubErrors.Add(1)
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
-			}
-			ok++
-			m.sent.Add(1)
-		case <-ctx.Done():
+	for _, wait := range waits {
+		if err := wait(); err != nil {
 			m.pubErrors.Add(1)
 			if firstErr == nil {
-				firstErr = fmt.Errorf("publish: %w", ctx.Err())
+				firstErr = err
 			}
+			continue
 		}
+		ok++
+		m.sent.Add(1)
 	}
 	if firstErr == nil && ok < len(msgs) {
 		firstErr = ErrNotConnected

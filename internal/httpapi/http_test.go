@@ -61,7 +61,9 @@ type env struct {
 	admin  string
 }
 
-func setup(t *testing.T, password string) *env {
+func setup(t *testing.T, password string) *env { return setupVersion(t, password, 4) }
+
+func setupVersion(t *testing.T, password string, version uint) *env {
 	t.Helper()
 	broker, addr := startBroker(t)
 	cfg := config.Server{MaxTopics: 1000, MaxBodyBytes: 1 << 20, UIEnabled: true, MCPEnabled: true, PublishTimeout: 5 * time.Second}
@@ -72,7 +74,7 @@ func setup(t *testing.T, password string) *env {
 	st.SetEnvKeys([]string{"admin-key"}, []string{"read-key"}, nil)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := core.New(cfg, log, st)
-	b := config.Broker{URLs: []string{"tcp://" + addr}, Username: "user", Password: password, ClientID: "test"}
+	b := config.Broker{URLs: []string{"tcp://" + addr}, Username: "user", Password: password, ClientID: "test", ProtocolVersion: version}
 	if err := svc.Start(b, true); err != nil {
 		t.Fatal(err)
 	}
@@ -339,5 +341,75 @@ func BenchmarkIngest(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		svc.Ingest(store.Entry{Topic: topics[i%len(topics)], Payload: p, Time: int64(i)})
+	}
+}
+
+func TestMQTT5EndToEnd(t *testing.T) {
+	e := setupVersion(t, "secret", 5)
+	e.waitConnected()
+
+	// JSON publish with properties; they come back on GET.
+	body := `{"topic":"v5/a","payload":{"x":1},"qos":1,"properties":{"content_type":"application/vnd.demo+json",
+		"response_topic":"v5/reply","correlation_data":"req-1","user_properties":[{"key":"site","value":"lisbon"}],"message_expiry_sec":300}}`
+	if code, out, _ := e.do("POST", "/api/v1/publish", e.admin, body); code != 200 {
+		t.Fatalf("publish: %d %s", code, out)
+	}
+	eventually(t, func() bool { _, ok := e.svc.Store().Get("v5/a"); return ok })
+	_, out, _ := e.do("GET", "/api/v1/values/v5/a", "read-key", "")
+	for _, want := range []string{`"content_type":"application/vnd.demo+json"`, `"response_topic":"v5/reply"`,
+		`"correlation_data":"req-1"`, `"user_properties":[{"key":"site","value":"lisbon"}]`, `"message_expiry_sec":`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("GET missing %s: %s", want, out)
+		}
+	}
+	// Raw GET: properties as headers, Content-Type from the message.
+	_, _, hdr := e.do("GET", "/api/v1/values/v5/a?format=raw", "read-key", "")
+	if hdr.Get("Content-Type") != "application/vnd.demo+json" || hdr.Get("X-MQTT-Response-Topic") != "v5/reply" ||
+		hdr.Get("X-MQTT-User-Property") != "site=lisbon" {
+		t.Fatalf("raw headers: %v", hdr)
+	}
+
+	// Raw publish with property headers.
+	req, _ := http.NewRequest("POST", e.http.URL+"/api/v1/publish/v5/b?qos=1", strings.NewReader("hello"))
+	req.Header.Set("Authorization", "Bearer "+e.admin)
+	req.Header.Set("X-MQTT-Content-Type", "text/plain")
+	req.Header.Add("X-MQTT-User-Property", "a=1")
+	req.Header.Add("X-MQTT-User-Property", "a=2")
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("raw publish: %v %v", err, resp)
+	}
+	eventually(t, func() bool {
+		v, ok := e.svc.Store().Get("v5/b")
+		return ok && v.Props != nil && len(v.Props.UserProperties) == 2
+	})
+
+	// Message expiry: an expired value is no longer served.
+	if code, out, _ := e.do("POST", "/api/v1/publish", e.admin, `{"topic":"v5/short","payload":"x","qos":1,"properties":{"message_expiry_sec":1}}`); code != 200 {
+		t.Fatalf("publish: %d %s", code, out)
+	}
+	eventually(t, func() bool { _, ok := e.svc.Store().Get("v5/short"); return ok })
+	if code, _, _ := e.do("GET", "/api/v1/values/v5/short", "read-key", ""); code != 200 {
+		t.Fatal("value must be available before it expires")
+	}
+	time.Sleep(1100 * time.Millisecond)
+	code, out, _ := e.do("GET", "/api/v1/values/v5/short", "read-key", "")
+	if code != 404 || !strings.Contains(out, "expired") {
+		t.Fatalf("expired value: %d %s", code, out)
+	}
+	if _, out, _ := e.do("GET", "/api/v1/values?filter=v5/%23", "read-key", ""); strings.Contains(out, "v5/short") {
+		t.Fatal("expired value listed")
+	}
+
+	if st := e.svc.MQTTStatus(); st.Protocol != "MQTT 5" {
+		t.Fatalf("protocol %q", st.Protocol)
+	}
+}
+
+func TestPropertiesNeedMQTT5(t *testing.T) {
+	e := setup(t, "secret") // MQTT 3.1.1
+	e.waitConnected()
+	code, out, _ := e.do("POST", "/api/v1/publish", e.admin, `{"topic":"x","payload":"y","properties":{"content_type":"text/plain"}}`)
+	if code != 400 || !strings.Contains(out, "protocol_version 5") {
+		t.Fatalf("want 400 mentioning protocol_version 5, got %d %s", code, out)
 	}
 }

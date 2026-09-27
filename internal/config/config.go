@@ -47,8 +47,13 @@ type Broker struct {
 	Username     string   `json:"username,omitempty"`
 	Password     string   `json:"password,omitempty"`
 	PasswordFile string   `json:"password_file,omitempty"`
-	// ProtocolVersion: 3 = MQTT 3.1, 4 = MQTT 3.1.1 (default 4).
-	ProtocolVersion   uint              `json:"protocol_version,omitempty"`
+	// ProtocolVersion: 3 = MQTT 3.1, 4 = MQTT 3.1.1 (default), 5 = MQTT 5.
+	ProtocolVersion uint `json:"protocol_version,omitempty"`
+	// MQTT 5 only: session expiry after disconnect (0 = end with the
+	// connection) and how many topic aliases the broker may use towards us
+	// (saves bandwidth on long topic names; default 1024, 0 disables).
+	SessionExpirySec  uint32            `json:"session_expiry_sec,omitempty"`
+	TopicAliasMaximum *uint16           `json:"topic_alias_maximum,omitempty"`
 	CleanSession      *bool             `json:"clean_session,omitempty"`
 	KeepAliveSec      int               `json:"keepalive_sec,omitempty"`
 	ConnectTimeoutSec int               `json:"connect_timeout_sec,omitempty"`
@@ -146,8 +151,11 @@ func (b *Broker) Validate() error {
 			return fmt.Errorf("unsupported broker url scheme %q (use tcp, mqtt, ssl, mqtts, ws, wss or unix)", pu.Scheme)
 		}
 	}
-	if b.ProtocolVersion != 3 && b.ProtocolVersion != 4 {
-		return errors.New("protocol_version must be 3 (MQTT 3.1) or 4 (MQTT 3.1.1)")
+	if b.ProtocolVersion < 3 || b.ProtocolVersion > 5 {
+		return errors.New("protocol_version must be 3 (MQTT 3.1), 4 (MQTT 3.1.1) or 5 (MQTT 5)")
+	}
+	if b.ProtocolVersion != 5 && (b.SessionExpirySec != 0 || b.TopicAliasMaximum != nil) {
+		return errors.New("session_expiry_sec and topic_alias_maximum need protocol_version 5")
 	}
 	if b.Connections > 64 {
 		return errors.New("connections must be <= 64")
@@ -441,6 +449,11 @@ func BrokerFromEnv() (b Broker, ok bool, err error) {
 	b.Connections = envInt("MQTT_CONNECTIONS", 1)
 	b.SharedGroup = envStr("MQTT_SHARED_GROUP", "")
 	b.SubscriptionMode = envStr("MQTT_SUBSCRIPTION_MODE", "")
+	b.SessionExpirySec = uint32(envInt("MQTT_SESSION_EXPIRY_SEC", 0))
+	if v := Env("MQTT_TOPIC_ALIAS_MAXIMUM"); v != "" {
+		n := uint16(envInt("MQTT_TOPIC_ALIAS_MAXIMUM", 0))
+		b.TopicAliasMaximum = &n
+	}
 	b.TLS = TLS{
 		Enabled:            envBool("MQTT_TLS", false),
 		CAFile:             envStr("MQTT_TLS_CA_FILE", ""),

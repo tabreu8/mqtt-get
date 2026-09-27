@@ -37,10 +37,13 @@ import (
 
 // Endpoint is one way of connecting to a broker.
 type Endpoint struct {
-	Name     string `json:"name"`
-	URL      string `json:"url"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	// ProtocolVersion: 4 (MQTT 3.1.1, default) or 5 (MQTT 5, also runs the
+	// mqtt5_* checks).
+	ProtocolVersion uint   `json:"protocol_version,omitempty"`
+	Username        string `json:"username,omitempty"`
+	Password        string `json:"password,omitempty"`
 	// TLS: "" (none), "ca" (verify server with the CA) or "mtls" (also
 	// present the client certificate).
 	TLS        string `json:"tls,omitempty"`
@@ -111,6 +114,7 @@ func (f File) brokerConfig(ep Endpoint, clientID string, topics ...string) confi
 		Username:          ep.Username,
 		Password:          ep.Password,
 		ConnectTimeoutSec: 5,
+		ProtocolVersion:   ep.ProtocolVersion,
 	}
 	for _, tp := range topics {
 		b.Subscriptions = append(b.Subscriptions, config.Subscription{Filter: tp, QoS: 1})
@@ -474,6 +478,11 @@ func runEndpoint(t *testing.T, f File, ep Endpoint) {
 	if ep.SharedSubscriptions {
 		sub("shared_subscriptions", func(t *testing.T) { testShared(t, f, ep, h) })
 	}
+	if ep.ProtocolVersion == 5 {
+		sub("mqtt5_properties", func(t *testing.T) { testV5Properties(t, h) })
+		sub("mqtt5_message_expiry", func(t *testing.T) { testV5Expiry(t, h) })
+		sub("mqtt5_request_response", func(t *testing.T) { testV5RequestResponse(t, f, ep, h) })
+	}
 	if ep.SplitSubscriptions {
 		sub("split_subscriptions", func(t *testing.T) { testSplit(t, f, ep, h) })
 	}
@@ -574,5 +583,96 @@ func testSplit(t *testing.T, f File, ep Endpoint, h *harness) {
 		if c != per {
 			t.Fatalf("connection %d received %d, want %d: %v", i, c, per, st2.ReceivedPerConnection)
 		}
+	}
+}
+
+// testV5Properties: properties survive device -> broker -> mqtt-get (REST)
+// and REST -> broker -> device.
+func testV5Properties(t *testing.T, h *harness) {
+	in := h.ns + "/v5/in"
+	props := &store.Props{ContentType: "application/json", ResponseTopic: h.ns + "/v5/reply", CorrelationData: []byte("c-1"),
+		UserProperties: []store.UserProperty{{Key: "site", Value: "lisbon"}}, MessageExpiry: 300, PayloadUTF8: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := h.peer.PublishMany(ctx, []mqttc.Message{{Topic: in, Payload: []byte(`{"v":1}`), QoS: 1, Props: props}}); err != nil {
+		t.Fatal(err)
+	}
+	var body []byte
+	waitFor(t, "value with properties", 10*time.Second, func() bool {
+		code, b := h.do("GET", "/api/v1/values?topic="+in, "")
+		body = b
+		return code == 200
+	})
+	for _, want := range []string{`"content_type":"application/json"`, `"response_topic":"` + h.ns + `/v5/reply"`,
+		`"correlation_data":"c-1"`, `{"key":"site","value":"lisbon"}`, `"message_expiry_sec":`, `"payload_format":"utf8"`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("GET missing %s: %s", want, body)
+		}
+	}
+	out := h.ns + "/to-device/v5"
+	code, b := h.do("POST", "/api/v1/publish", fmt.Sprintf(`{"topic":%q,"payload":"x","qos":1,"properties":{"content_type":"text/plain","user_properties":{"k":"v"}}}`, out))
+	if code != 200 {
+		t.Fatalf("publish: %d %s", code, b)
+	}
+	e := h.expectPeer(out)
+	if e.Props == nil || e.Props.ContentType != "text/plain" || len(e.Props.UserProperties) != 1 || e.Props.UserProperties[0].Value != "v" {
+		t.Fatalf("device got properties %+v", e.Props)
+	}
+}
+
+// testV5Expiry: a value published with a 1 s expiry stops being served.
+func testV5Expiry(t *testing.T, h *harness) {
+	tp := h.ns + "/v5/expiring"
+	code, b := h.do("POST", "/api/v1/publish", fmt.Sprintf(`{"topic":%q,"payload":"x","qos":1,"properties":{"message_expiry_sec":1}}`, h.ns+"/to-device/expire"))
+	if code != 200 {
+		t.Fatalf("publish: %d %s", code, b)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := h.peer.PublishMany(ctx, []mqttc.Message{{Topic: tp, Payload: []byte("soon gone"), QoS: 1, Props: &store.Props{MessageExpiry: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "expiring value", 10*time.Second, func() bool { c, _ := h.do("GET", "/api/v1/values?topic="+tp, ""); return c == 200 })
+	time.Sleep(1300 * time.Millisecond)
+	code, b = h.do("GET", "/api/v1/values?topic="+tp, "")
+	if code != 404 || !strings.Contains(string(b), "expired") {
+		t.Fatalf("after expiry: %d %s", code, b)
+	}
+}
+
+// testV5RequestResponse: mqtt-get's publish-and-wait sets response topic and
+// correlation data; a device answers with the same correlation data, and an
+// answer carrying other correlation data is ignored.
+func testV5RequestResponse(t *testing.T, f File, ep Endpoint, h *harness) {
+	reqTopic, respTopic := h.ns+"/v5/rpc/req", h.ns+"/v5/rpc/resp"
+	var device *mqttc.Manager
+	device = mqttc.New(quietLog(), func(e store.Entry) {
+		if e.Topic != reqTopic || e.Props == nil || e.Props.ResponseTopic == "" {
+			return
+		}
+		rt, corr := e.Props.ResponseTopic, e.Props.CorrelationData
+		go func() {
+			ctx := context.Background()
+			_, _ = device.PublishMany(ctx, []mqttc.Message{{Topic: rt, Payload: []byte(`{"answer":"wrong"}`), QoS: 1, Props: &store.Props{CorrelationData: []byte("other")}}})
+			time.Sleep(50 * time.Millisecond)
+			_, _ = device.PublishMany(ctx, []mqttc.Message{{Topic: rt, Payload: []byte(`{"answer":42}`), QoS: 1, Props: &store.Props{CorrelationData: corr}}})
+		}()
+	})
+	if err := device.Apply(f.brokerConfig(ep, clientID("rpcdev"), reqTopic)); err != nil {
+		t.Fatal(err)
+	}
+	defer device.Close()
+	waitFor(t, "device", 10*time.Second, func() bool { return device.Status().Connected })
+	time.Sleep(300 * time.Millisecond)
+	msg, err := core.PublishRequest{Topic: reqTopic, Payload: []byte(`"?"`), QoS: 1}.Message()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := h.srv.PublishAndWait(context.Background(), msg, respTopic, 10*time.Second)
+	if err != nil || e == nil {
+		t.Fatalf("no response: %v", err)
+	}
+	if string(e.Payload) != `{"answer":42}` || e.Props == nil || !strings.HasPrefix(string(e.Props.CorrelationData), "mqtt-get-") {
+		t.Fatalf("response %s props %+v", e.Payload, e.Props)
 	}
 }
