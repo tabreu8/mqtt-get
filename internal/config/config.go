@@ -73,7 +73,17 @@ type Broker struct {
 	Connections      int    `json:"connections,omitempty"`
 	SharedGroup      string `json:"shared_group,omitempty"`
 	SubscriptionMode string `json:"subscription_mode,omitempty"` // "" / "auto" or "split"
+	// Client selects the MQTT 3.1/3.1.1 implementation: "lean" (default, a
+	// compact client built for ingest speed) or "paho" (eclipse
+	// paho.mqtt.golang). MQTT 5 always uses eclipse paho.golang.
+	Client string `json:"client,omitempty"`
 }
+
+// MQTT 3 client implementations.
+const (
+	ClientLean = "lean"
+	ClientPaho = "paho"
+)
 
 // Subscription modes.
 const (
@@ -159,6 +169,11 @@ func (b *Broker) Validate() error {
 	}
 	if b.Connections > 64 {
 		return errors.New("connections must be <= 64")
+	}
+	switch b.Client {
+	case "", ClientLean, ClientPaho:
+	default:
+		return errors.New(`client must be "lean" or "paho"`)
 	}
 	switch b.SubscriptionMode {
 	case "", SubscriptionAuto:
@@ -449,6 +464,7 @@ func BrokerFromEnv() (b Broker, ok bool, err error) {
 	b.Connections = envInt("MQTT_CONNECTIONS", 1)
 	b.SharedGroup = envStr("MQTT_SHARED_GROUP", "")
 	b.SubscriptionMode = envStr("MQTT_SUBSCRIPTION_MODE", "")
+	b.Client = envStr("MQTT_CLIENT", "")
 	b.SessionExpirySec = uint32(envInt("MQTT_SESSION_EXPIRY_SEC", 0))
 	if v := Env("MQTT_TOPIC_ALIAS_MAXIMUM"); v != "" {
 		n := uint16(envInt("MQTT_TOPIC_ALIAS_MAXIMUM", 0))

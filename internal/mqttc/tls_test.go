@@ -162,7 +162,10 @@ func startBroker(t *testing.T, p pki, o brokerOpts) (*mochi.Server, string) {
 		t.Fatal(err)
 	}
 	go func() { _ = b.Serve() }()
-	t.Cleanup(func() { _ = b.Close() })
+	t.Cleanup(func() {
+		defer func() { _ = recover() }() // a test may already have closed it (restart tests)
+		_ = b.Close()
+	})
 	time.Sleep(50 * time.Millisecond)
 	return b, lc.Address
 }
@@ -462,3 +465,16 @@ func TestUsernamePassword(t *testing.T) {
 func writeFileAt(path, content string) error { return os.WriteFile(path, []byte(content), 0o600) }
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// restartBroker starts a new plain broker on a previously used address.
+func restartBroker(t *testing.T, addr string) *mochi.Server {
+	t.Helper()
+	b := mochi.New(&mochi.Options{InlineClient: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	_ = b.AddHook(new(auth.AllowHook), nil)
+	if err := b.AddListener(listeners.NewTCP(listeners.Config{ID: "l2", Address: addr})); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = b.Serve() }()
+	t.Cleanup(func() { _ = b.Close() })
+	return b
+}

@@ -24,6 +24,7 @@ var (
 	addr    = flag.String("addr", "127.0.0.1:1884", "listen address")
 	nTopics = flag.Int("topics", 1000, "distinct topics per subscribed filter")
 	size    = flag.Int("size", 64, "payload bytes")
+	qos     = flag.Int("qos", 0, "QoS of the flood (0 or 1; acknowledgements are read and ignored)")
 	sent    atomic.Uint64
 )
 
@@ -158,10 +159,13 @@ func buildBlock(filters []string, v5 bool) []byte {
 			topic := base + "/t/" + strconv.Itoa(i)
 			var vh []byte
 			vh = appendStr(vh, topic)
+			if *qos > 0 {
+				vh = binary.BigEndian.AppendUint16(vh, uint16(i%65535+1))
+			}
 			if v5 {
 				vh = append(vh, 0) // no properties
 			}
-			block = appendVarint(append(block, 0x30), len(vh)+len(payload))
+			block = appendVarint(append(block, 0x30|byte(*qos)<<1), len(vh)+len(payload))
 			block = append(append(block, vh...), payload...)
 		}
 	}

@@ -51,7 +51,7 @@ MQTT is great for devices and poor for everything else. A dashboard, a spreadshe
 | **Every common broker auth method** | Anonymous, username/password or token, rotating password files, TLS, custom CA, **mutual TLS**, SNI, ALPN, WebSockets with headers, failover URLs. |
 | **Simple to run** | One ~8 MB static binary or container, no dependencies, no database. |
 | **Simple to configure** | Environment variables, REST, MCP or web UI. Changes apply live and are persisted. |
-| **Fast** | About 270 ns of work per message inside mqtt-get; 225k+ msg/s on one connection; scales out over several connections with shared subscriptions. |
+| **Fast** | A purpose-built MQTT client ingests ~3.3M msg/s on one connection and 6M+ on four (measured without a broker bottleneck); one allocation per message. |
 | **Tested for real** | 320 end-to-end checks against Mosquitto, EMQX, HiveMQ CE, NanoMQ and Coreflux over TCP, WS, TLS, WSS and mTLS. |
 
 ## Quick start
@@ -537,6 +537,7 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `MQTT_WS_HEADERS` | – | `Name: value`, comma-separated |
 | `MQTT_CONNECTIONS` | `1` | Number of broker connections (see [scaling](#performance-and-scaling)) |
 | `MQTT_SHARED_GROUP` | – | Shared-subscription group spreading ingest over the connections (broker must support `$share`) |
+| `MQTT_CLIENT` | `lean` | MQTT 3.1/3.1.1 client: `lean` (built-in, fastest) or `paho` (Eclipse paho). MQTT 5 always uses Eclipse paho.golang |
 | `MQTT_SUBSCRIPTION_MODE` | `auto` | `split` divides `MQTT_TOPICS` between the connections: scale-out without broker support (filters must not overlap) |
 
 ### Server
@@ -770,25 +771,26 @@ Suggested alerts: `mqttget_mqtt_connected == 0` for 1 minute; `rate(mqttget_webh
 
 **What makes it fast**
 
-- Messages are handled on the connection's read loop, with no goroutine per message.
-- The socket is read through a 64 KiB buffer. The underlying MQTT library reads packet headers byte by byte, which cost several syscalls per message; buffering cut CPU per message by about 30% and removed message loss under load in our tests.
+- **A purpose-built MQTT 3.1.1 client ("lean", the default).** General-purpose MQTT libraries pass every message through several goroutines and channels and allocate 4–5 objects per message; that was ~88% of the CPU per message. mqtt-get's own client parses each message straight out of a 64 KiB socket buffer and stores it on the same goroutine, with **one allocation per message** (topic and payload share one block, and the topic is a zero-copy view into it). QoS 1/2 acknowledgements are batched and flushed once per socket read instead of once per message. It supports QoS 0/1/2 in both directions (exactly-once QoS 2), keepalive with a dead-connection watchdog, reconnect with failover, and every transport and auth method. It is fuzz-tested and passes the full real-broker suite. The Eclipse paho client remains available with `MQTT_CLIENT=paho`; MQTT 5 uses Eclipse paho.golang.
 - The value store is split into 256 locks. Each topic has one small record (32 bytes plus the payload) that is **updated in place**, so storing an update for a known topic allocates nothing, and mqtt-get's own ingest step (store, webhook and watcher routing) is allocation-free. A message is only copied to the heap when a webhook or a waiting agent needs it.
 - An **adaptive garbage collector** setting (see [Memory and GC](#memory-and-gc)) cuts GC work where memory allows.
 - Webhook matching uses a topic trie that's swapped atomically, so matching takes no locks.
 
-**Measured** on a 4-vCPU VM, with the broker (Mosquitto) and the load generator on the same machine:
+**Measured** on a 4-vCPU VM. Ingest numbers use `cmd/floodbroker`, a fake broker that streams messages as fast as the socket accepts them (64-byte payloads, 1000 topics per filter), so they show mqtt-get's own capacity, not a broker's:
 
 | | |
 |---|---|
+| Ingest, MQTT 3.1.1, 1 connection | **~3.3M msg/s** at ~310 ns CPU per message (paho client: ~160k msg/s, 8.4 µs) |
+| Ingest, MQTT 3.1.1, 4 split connections | **~6.1M msg/s** (not CPU-bound: the fake broker was the limit) |
+| Ingest, QoS 1, 1 connection | **~2.8M msg/s**, acknowledgements included (paho client: 43k msg/s) |
+| Ingest, MQTT 5 (paho.golang), 1 / 4 split connections | ~250k / ~540–590k msg/s |
 | mqtt-get's own cost per message (store + webhook routing) | **~200 ns, 0 allocations** |
-| Ingest capacity (fake broker, no broker bottleneck) | ~160k msg/s on 1 connection; **~690k msg/s with 4 split connections** |
-| Same, over MQTT 5 | ~250k msg/s on 1 connection (the MQTT 5 client pipelines better); ~540–590k with 4 split connections |
-| One connection, 64-byte payloads, 10k topics | **~225k msg/s, no loss.** Mosquitto (single-threaded) was the bottleneck. |
+| Through a real broker (Mosquitto, same VM), 64-byte payloads, 10k topics | ~225k msg/s, no loss: single-threaded Mosquitto is the limit there, not mqtt-get |
 | `GET` one value (in-process benchmark) | ~1.7 µs |
 | Memory with 10k topics | ~16–30 MB RSS |
 | Memory with **1M topics** (64-byte payloads) | ~550 MB RSS |
 
-**Scaling up.** One connection is limited to roughly one CPU core. Open several connections to spread ingest over several cores. There are two ways, and you choose with `MQTT_SUBSCRIPTION_MODE`:
+**Scaling up.** One connection is handled by one CPU core: about 3M msg/s with the lean client, so a single connection is usually enough. When the broker or the network limits a single connection, or you use `MQTT_CLIENT=paho` or MQTT 5, open several connections to spread ingest over several cores. There are two ways, and you choose with `MQTT_SUBSCRIPTION_MODE`:
 
 | | **Split filters** (`split`) | **Shared subscription group** (`MQTT_SHARED_GROUP`) |
 |---|---|---|
@@ -815,7 +817,11 @@ Measured ingest on a 4-vCPU VM, fed by `cmd/floodbroker` (a fake broker that str
 | 1 connection, 4 filters | 146k msg/s | 1× |
 | 2 connections, `split` | 371k msg/s | 2.5× |
 | 4 connections, `split` | 490k msg/s | 3.4× (4 cores shared with the load generator) |
-| 4 connections, `split`, with the memory/GC work below | **694k msg/s** | 4.8× |
+| 4 connections, `split`, with the memory/GC work below | 694k msg/s | 4.8× |
+| 1 connection, **lean client** | 3.3M msg/s | 23× |
+| 4 connections, `split`, **lean client** | **6.1M msg/s** | 42× |
+
+(The first four rows used the paho client, before the lean client existed. With the lean client a single connection is usually enough; extra connections still help when the broker or the network per connection is the limit.)
 
 `/api/v1/status` shows `received_per_connection` and `filters_per_connection`, so you can check the balance. In the interop suite, 3 × 100 messages over 3 connections arrived exactly once, `[100 100 100]`, on every broker in both modes (HiveMQ's shared-subscription balancing was uneven, e.g. `[118 111 71]`). If connections deliver out of order, the store still keeps the newest value per topic (by receive time). Without either mode, the extra connections are only used for publishing.
 

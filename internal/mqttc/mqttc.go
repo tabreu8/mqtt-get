@@ -121,14 +121,17 @@ func (m *Manager) Apply(cfg config.Broker) error {
 	}
 	m.links = make([]link, cfg.Connections)
 	for i := range m.links {
-		if cfg.ProtocolVersion == 5 {
+		switch {
+		case cfg.ProtocolVersion == 5:
 			m.links[i] = newV5(m, cfg, tlsCfg, i)
-		} else {
+		case cfg.Client == config.ClientPaho:
 			m.links[i] = newV3(m, cfg, tlsCfg, i)
+		default:
+			m.links[i] = newLean(m, cfg, tlsCfg, i)
 		}
 		m.links[i].start()
 	}
-	m.log.Info("mqtt: connecting", "urls", cfg.URLs, "protocol", protocolName(cfg.ProtocolVersion),
+	m.log.Info("mqtt: connecting", "urls", cfg.URLs, "protocol", protocolName(cfg.ProtocolVersion), "client", clientName(cfg),
 		"connections", cfg.Connections, "client_id", cfg.ClientID,
 		"subscription_mode", cfg.SubscriptionMode, "shared_group", cfg.SharedGroup)
 	if cfg.SubscriptionMode == config.SubscriptionSplit && cfg.Connections > len(cfg.Subscriptions) {
@@ -136,6 +139,16 @@ func (m *Manager) Apply(cfg config.Broker) error {
 			"connections", cfg.Connections, "filters", len(cfg.Subscriptions))
 	}
 	return nil
+}
+
+func clientName(cfg config.Broker) string {
+	switch {
+	case cfg.ProtocolVersion == 5:
+		return "paho.golang"
+	case cfg.Client == config.ClientPaho:
+		return "paho"
+	}
+	return "lean"
 }
 
 func protocolName(v uint) string {

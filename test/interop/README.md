@@ -4,7 +4,7 @@ This suite runs mqtt-get end to end against real MQTT brokers, with every authen
 
 ## Last results
 
-**643 checks passed, 0 failed, 1 skipped (a known broker limitation)** across 47 endpoints on 5 brokers: every endpoint over MQTT 3.1.1, and 21 of them again over MQTT 5. Run on 2026-09-27.
+**643 checks passed, 0 failed, 1 skipped (a known broker limitation)** across 47 endpoints on 5 brokers: every endpoint over MQTT 3.1.1, and 21 of them again over MQTT 5. MQTT 3.1.1 ran on mqtt-get's built-in lean client (the default); MQTT 5 on Eclipse paho.golang. Run on 2026-09-27.
 
 | Broker | Version | TCP | Password auth | WebSocket | TLS | mTLS | WSS | `$share` |
 |---|---|---|---|---|---|---|---|---|

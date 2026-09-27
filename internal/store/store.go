@@ -7,6 +7,7 @@ package store
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -127,8 +128,11 @@ func (s *Store) Set(e *Entry) bool {
 			old.props = e.Props
 		}
 	} else {
+		// Copy the name: the caller's string may point into a larger
+		// buffer (the lean MQTT reader's topic is a view into the packet),
+		// which the map key would otherwise keep alive forever.
 		sl := newSlot(e)
-		sh.m[e.Topic] = &sl
+		sh.m[strings.Clone(e.Topic)] = &sl
 	}
 	sh.mu.Unlock()
 	return true
