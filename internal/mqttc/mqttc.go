@@ -48,6 +48,8 @@ type Status struct {
 	PublishErrors    uint64    `json:"publish_errors"`
 	// ReceivedPerConnection shows how ingest is spread over connections.
 	ReceivedPerConnection []uint64 `json:"received_per_connection,omitempty"`
+	// FiltersPerConnection lists what each connection subscribes to.
+	FiltersPerConnection [][]string `json:"filters_per_connection,omitempty"`
 }
 
 type conn struct {
@@ -120,7 +122,12 @@ func (m *Manager) Apply(cfg config.Broker) error {
 		m.conns[i] = c
 		c.client.Connect() // retries in the background (ConnectRetry)
 	}
-	m.log.Info("mqtt: connecting", "urls", cfg.URLs, "connections", cfg.Connections, "client_id", cfg.ClientID)
+	m.log.Info("mqtt: connecting", "urls", cfg.URLs, "connections", cfg.Connections, "client_id", cfg.ClientID,
+		"subscription_mode", cfg.SubscriptionMode, "shared_group", cfg.SharedGroup)
+	if cfg.SubscriptionMode == config.SubscriptionSplit && cfg.Connections > len(cfg.Subscriptions) {
+		m.log.Warn("mqtt: split mode has more connections than filters; the extra connections only publish",
+			"connections", cfg.Connections, "filters", len(cfg.Subscriptions))
+	}
 	return nil
 }
 
@@ -190,14 +197,11 @@ func (m *Manager) options(cfg config.Broker, tlsCfg *tls.Config, idx int, c *con
 		})
 	}
 
-	subscribe := idx == 0 || cfg.SharedGroup != ""
-	filters := make(map[string]byte, len(cfg.Subscriptions))
-	for _, s := range cfg.Subscriptions {
-		f := s.Filter
-		if cfg.SharedGroup != "" {
-			f = "$share/" + cfg.SharedGroup + "/" + f
-		}
-		filters[f] = s.QoS
+	subs := cfg.SubscriptionsFor(idx)
+	subscribe := len(subs) > 0
+	filters := make(map[string]byte, len(subs))
+	for _, s := range subs {
+		filters[s.Filter] = s.QoS
 	}
 
 	o.SetDefaultPublishHandler(func(_ mqtt.Client, msg mqtt.Message) {
@@ -231,7 +235,7 @@ func (m *Manager) options(cfg config.Broker, tlsCfg *tls.Config, idx int, c *con
 							msg := "subscription rejected by broker (check ACLs): " + f
 							if strings.HasPrefix(f, "$share/") {
 								msg = "shared subscription rejected by broker: " + f +
-									" (the broker may not support $share; clear shared_group / MQTT_SHARED_GROUP)"
+									" (the broker may not support $share: use subscription_mode \"split\" / MQTT_SUBSCRIPTION_MODE=split instead of shared_group)"
 							}
 							m.setErr(msg)
 						}
@@ -359,6 +363,13 @@ func (m *Manager) Status() Status {
 	}
 	if len(perConn) > 1 {
 		st.ReceivedPerConnection = perConn
+		for i := range perConn {
+			var fs []string
+			for _, sub := range cfg.SubscriptionsFor(i) {
+				fs = append(fs, sub.Filter)
+			}
+			st.FiltersPerConnection = append(st.FiltersPerConnection, fs)
+		}
 	}
 	if m.lastErr != "" {
 		st.LastErrorAt = m.lastErrAt

@@ -55,12 +55,50 @@ type Broker struct {
 	TLS               TLS               `json:"tls"`
 	WSHeaders         map[string]string `json:"ws_headers,omitempty"`
 	Subscriptions     []Subscription    `json:"subscriptions"`
-	// Connections > 1 opens several connections. With SharedGroup set, all
-	// of them subscribe using $share/<group>/<filter> so ingest is spread
-	// across connections; otherwise only the first subscribes and the rest
-	// are used for publishing.
-	Connections int    `json:"connections,omitempty"`
-	SharedGroup string `json:"shared_group,omitempty"`
+	// Connections > 1 opens several connections, spreading ingest over
+	// several CPU cores in one of two ways:
+	//   - SharedGroup set: every connection subscribes to every filter as
+	//     $share/<group>/<filter> and the broker load-balances messages
+	//     (needs broker support for shared subscriptions).
+	//   - SubscriptionMode "split": the filters are divided between the
+	//     connections, so each connection receives a different part of the
+	//     traffic. Works with any broker; filters must not overlap.
+	// Otherwise only the first connection subscribes and the others are
+	// used for publishing.
+	Connections      int    `json:"connections,omitempty"`
+	SharedGroup      string `json:"shared_group,omitempty"`
+	SubscriptionMode string `json:"subscription_mode,omitempty"` // "" / "auto" or "split"
+}
+
+// Subscription modes.
+const (
+	SubscriptionAuto  = "auto"
+	SubscriptionSplit = "split"
+)
+
+// SubscriptionsFor returns the filters connection idx must subscribe to
+// (already prefixed with $share/<group>/ when a shared group is set).
+func (b *Broker) SubscriptionsFor(idx int) []Subscription {
+	n := b.Connections
+	if n <= 0 {
+		n = 1
+	}
+	var out []Subscription
+	switch {
+	case b.SharedGroup != "":
+		for _, s := range b.Subscriptions {
+			out = append(out, Subscription{Filter: "$share/" + b.SharedGroup + "/" + s.Filter, QoS: s.QoS})
+		}
+	case b.SubscriptionMode == SubscriptionSplit:
+		for i, s := range b.Subscriptions {
+			if i%n == idx {
+				out = append(out, s)
+			}
+		}
+	case idx == 0:
+		out = append(out, b.Subscriptions...)
+	}
+	return out
 }
 
 // IsConfigured reports whether a broker URL has been set.
@@ -113,6 +151,19 @@ func (b *Broker) Validate() error {
 	}
 	if b.Connections > 64 {
 		return errors.New("connections must be <= 64")
+	}
+	switch b.SubscriptionMode {
+	case "", SubscriptionAuto:
+	case SubscriptionSplit:
+		if b.SharedGroup != "" {
+			return errors.New("subscription_mode \"split\" and shared_group are alternatives: set only one")
+		}
+		if a, c, ok := overlapping(b.Subscriptions); ok {
+			return fmt.Errorf("subscription_mode \"split\" needs non-overlapping filters, but %q and %q overlap "+
+				"(a message matching both would be received twice)", a, c)
+		}
+	default:
+		return errors.New(`subscription_mode must be "auto" or "split"`)
 	}
 	for _, s := range b.Subscriptions {
 		if err := topic.ValidateFilter(s.Filter); err != nil {
@@ -389,6 +440,7 @@ func BrokerFromEnv() (b Broker, ok bool, err error) {
 	b.ConnectTimeoutSec = envInt("MQTT_CONNECT_TIMEOUT_SEC", 10)
 	b.Connections = envInt("MQTT_CONNECTIONS", 1)
 	b.SharedGroup = envStr("MQTT_SHARED_GROUP", "")
+	b.SubscriptionMode = envStr("MQTT_SUBSCRIPTION_MODE", "")
 	b.TLS = TLS{
 		Enabled:            envBool("MQTT_TLS", false),
 		CAFile:             envStr("MQTT_TLS_CA_FILE", ""),

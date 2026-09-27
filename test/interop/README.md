@@ -4,7 +4,7 @@ This suite runs mqtt-get end to end against real MQTT brokers, with every authen
 
 ## Last results
 
-**320 checks passed, 0 failed, 1 skipped (a known broker limitation)** across 26 endpoints on 5 brokers. Run on 2026-09-27.
+**325 checks passed, 0 failed, 1 skipped (a known broker limitation)** across 26 endpoints on 5 brokers. Run on 2026-09-27.
 
 | Broker | Version | TCP | Password auth | WebSocket | TLS | mTLS | WSS | `$share` |
 |---|---|---|---|---|---|---|---|---|
@@ -17,7 +17,7 @@ This suite runs mqtt-get end to end against real MQTT brokers, with every authen
 
 ¹ HiveMQ CE only ships an allow-all authentication extension, so passwords can't be enforced. TLS and mTLS are enforced.<br>
 ² Coreflux doesn't trust a client **CA**. It pins client **certificates**: put each client certificate as a `.pem` file in `ClientCertificateSourcePath`.<br>
-³ Coreflux 2.14 rejects every `$share/...` subscription (SUBACK 0x80), even for a full-privilege user. Don't set `MQTT_SHARED_GROUP` with Coreflux. mqtt-get reports this clearly in `/api/v1/status`.
+³ Coreflux 2.14 rejects every `$share/...` subscription (SUBACK 0x80), even for a full-privilege user. Use `MQTT_SUBSCRIPTION_MODE=split` with Coreflux instead (tested ✅). mqtt-get reports a rejected `$share` clearly in `/api/v1/status`.
 
 For every endpoint the suite checks the following. Checks that don't apply to an endpoint (for example certificate checks on plain TCP) are left out.
 
@@ -35,6 +35,7 @@ For every endpoint the suite checks the following. Checks that don't apply to an
 | `no_client_cert_rejected` | An mTLS listener refuses a client with no certificate |
 | `untrusted_ca_rejected` | Without the custom CA, the server certificate is refused |
 | `shared_subscriptions` | 3 connections in a `$share` group: 300 messages ingested **exactly once** and spread over all connections |
+| `split_subscriptions` | 3 connections with `subscription_mode: split` (one filter each): 300 messages ingested exactly once, `[100 100 100]`. Works on every broker, including Coreflux, which lacks `$share` |
 
 Also verified by hand: when the broker is killed and restarted, mqtt-get reports 503 on `/healthz` with a clear error, refuses publishes with "not connected", then reconnects and resubscribes by itself about 1 s after the broker returns.
 
@@ -98,7 +99,7 @@ Endpoint fields:
 | `username`, `password` | Credentials |
 | `tls` | `""` (none), `"ca"` (verify the server with `ca_file`) or `"mtls"` (also send the client certificate) |
 | `server_name` | TLS SNI / verification name override |
-| `wrong_password_rejected`, `no_client_cert_rejected`, `shared_subscriptions` | Turn on the optional checks |
+| `wrong_password_rejected`, `no_client_cert_rejected`, `shared_subscriptions`, `split_subscriptions` | Turn on the optional checks |
 | `skip` | `{"check_name": "reason"}` to skip a check that the broker is known not to support |
 
 All test traffic stays under `mginterop/<endpoint>/<random>/...`, and the retained test message is cleared afterwards, so it's safe to run against a shared broker. It does create a few short-lived client connections.

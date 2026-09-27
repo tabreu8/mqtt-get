@@ -155,7 +155,10 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
         <textarea name="ws_headers"></textarea>
         <div class="row">
           <div><label>Connections</label><input name="connections" type="number" min="1" max="64"></div>
-          <div><label>Shared subscription group (spreads ingest over connections)</label><input name="shared_group"></div>
+          <div><label>Spread ingest over connections by</label><select name="subscription_mode">
+            <option value="auto">shared subscription group (if set)</option>
+            <option value="split">splitting the filters (any broker)</option></select></div>
+          <div><label>Shared subscription group (broker must support $share)</label><input name="shared_group"></div>
         </div>
       </details>
       <div class="err" id="brokerErr"></div>
@@ -336,7 +339,7 @@ async function loadBroker() {
   for (const k of ['enabled', 'insecure_skip_verify', 'server_name', 'ca_pem', 'cert_pem', 'key_pem', 'ca_file', 'cert_file', 'key_file']) set('tls.' + k, t[k]);
   set('tls.alpn', (t.alpn || []).join(','));
   set('ws_headers', Object.entries(c.ws_headers || {}).map(([k, v]) => k + ': ' + v).join('\n'));
-  set('connections', c.connections || 1); set('shared_group', c.shared_group);
+  set('connections', c.connections || 1); set('shared_group', c.shared_group); set('subscription_mode', c.subscription_mode || 'auto');
 }
 const lines = s => s.split('\n').map(x => x.trim()).filter(Boolean);
 const headers = s => Object.fromEntries(lines(s).map(l => { const i = l.indexOf(':'); return [l.slice(0, i).trim(), l.slice(i + 1).trim()]; }).filter(([k]) => k));
@@ -354,7 +357,7 @@ $('#brokerForm').onsubmit = async ev => {
       ca_pem: e['tls.ca_pem'].value, cert_pem: e['tls.cert_pem'].value, key_pem: e['tls.key_pem'].value,
       ca_file: v('tls.ca_file'), cert_file: v('tls.cert_file'), key_file: v('tls.key_file'),
     },
-    ws_headers: headers(e.ws_headers.value), connections: num('connections') || 1, shared_group: v('shared_group'),
+    ws_headers: headers(e.ws_headers.value), connections: num('connections') || 1, shared_group: v('shared_group'), subscription_mode: e.subscription_mode.value,
   };
   try { await api('PUT', '/api/v1/broker', body); $('#brokerErr').textContent = ''; toast('Saved — connecting…'); loadBroker(); setTimeout(loadStatus, 1500); }
   catch (err) { $('#brokerErr').textContent = err.message; }

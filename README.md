@@ -361,7 +361,7 @@ MQTT_TLS_CA_FILE=/certs/ca.crt
 MQTT_TLS_CERT_FILE=/certs/client.crt
 MQTT_TLS_KEY_FILE=/certs/client.key
 ```
-Mosquitto 2.x supports `$share` for 3.1.1 clients, so `MQTT_CONNECTIONS` + `MQTT_SHARED_GROUP` work.
+Mosquitto 2.x supports `$share` for 3.1.1 clients, so both `MQTT_SHARED_GROUP` and `MQTT_SUBSCRIPTION_MODE=split` work.
 </details>
 
 <details><summary><b>EMQX</b> (self-hosted or EMQX Cloud)</summary>
@@ -406,7 +406,7 @@ MQTT_PASSWORD=secret
 MQTT_TLS_CA_FILE=/certs/ca.crt
 ```
 - **mTLS:** Coreflux pins client certificates rather than trusting a CA. Copy mqtt-get's client certificate as a `.pem` file into the broker's `ClientCertificateSourcePath` directory.
-- **Don't set `MQTT_SHARED_GROUP`:** Coreflux 2.14 rejects `$share/...` subscriptions. mqtt-get then reports `shared subscription rejected by broker …` in its status.
+- **Scale-out:** Coreflux 2.14 rejects `$share/...` subscriptions, so use `MQTT_SUBSCRIPTION_MODE=split` (tested) instead of `MQTT_SHARED_GROUP`.
 - New Coreflux installs allow anonymous login by default.
 </details>
 
@@ -457,16 +457,16 @@ MQTT_TOPICS="factory/+/+/status:1,factory/+/+/alarm:1,energy/#"   # ":1" sets Qo
 
 ## Tested brokers
 
-mqtt-get ships with an **interoperability suite** that runs the full stack (REST, publish at every QoS, retained replay, binary payloads, wildcards, webhooks and negative auth checks) against real brokers. Last run: **320 passed, 0 failed**.
+mqtt-get ships with an **interoperability suite** that runs the full stack (REST, publish at every QoS, retained replay, binary payloads, wildcards, webhooks and negative auth checks) against real brokers. Last run: **325 passed, 0 failed**.
 
-| Broker | Version | TCP | Password | WS | TLS | mTLS | WSS | `$share` scale-out |
-|---|---|---|---|---|---|---|---|---|
-| Eclipse Mosquitto | 2.1.2 / 2.0.18 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| EMQX | 6.3.1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| HiveMQ CE | 2026.5 | ✅ | n/a | ✅ | ✅ | ✅ | ✅ | ✅ |
-| NanoMQ (`-full`) | 0.25.6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Coreflux | 2.14.3 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ not supported by broker |
-| mochi-mqtt | 2.7.9 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | – |
+| Broker | Version | TCP | Password | WS | TLS | mTLS | WSS | `split` scale-out | `$share` scale-out |
+|---|---|---|---|---|---|---|---|---|---|
+| Eclipse Mosquitto | 2.1.2 / 2.0.18 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| EMQX | 6.3.1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| HiveMQ CE | 2026.5 | ✅ | n/a | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| NanoMQ (`-full`) | 0.25.6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Coreflux | 2.14.3 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ not supported by broker |
+| mochi-mqtt | 2.7.9 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | – |
 
 Details, per-check results, broker configuration notes and instructions for running it against **your own broker** are in [`test/interop/README.md`](test/interop/README.md).
 
@@ -499,7 +499,8 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `MQTT_TLS_INSECURE` | `false` | Skip server certificate verification |
 | `MQTT_WS_HEADERS` | – | `Name: value`, comma-separated |
 | `MQTT_CONNECTIONS` | `1` | Number of broker connections (see [scaling](#performance-and-scaling)) |
-| `MQTT_SHARED_GROUP` | – | Shared-subscription group spreading ingest over the connections |
+| `MQTT_SHARED_GROUP` | – | Shared-subscription group spreading ingest over the connections (broker must support `$share`) |
+| `MQTT_SUBSCRIPTION_MODE` | `auto` | `split` divides `MQTT_TOPICS` between the connections: scale-out without broker support (filters must not overlap) |
 
 ### Server
 
@@ -741,18 +742,42 @@ Suggested alerts: `mqttget_mqtt_connected == 0` for 1 minute; `rate(mqttget_webh
 | | |
 |---|---|
 | mqtt-get's own cost per message (store + webhook routing) | **~270 ns** |
+| Ingest capacity, one connection (fake broker, no broker bottleneck) | 146k msg/s; **490k msg/s with 4 split connections** |
 | One connection, 64-byte payloads, 10k topics | **~225k msg/s, no loss.** Mosquitto (single-threaded) was the bottleneck. |
 | `GET` one value (in-process benchmark) | ~1.7 µs |
 | Memory with 10k topics | ~16 MB RSS |
 
-**Scaling up.** One connection is limited to roughly one CPU core. To spread ingest over several cores, open several connections in a **shared-subscription group**:
+**Scaling up.** One connection is limited to roughly one CPU core. Open several connections to spread ingest over several cores. There are two ways, and you choose with `MQTT_SUBSCRIPTION_MODE`:
+
+| | **Split filters** (`split`) | **Shared subscription group** (`MQTT_SHARED_GROUP`) |
+|---|---|---|
+| How | Your filters are divided between the connections (round-robin), so each connection receives a different part of the traffic | Every connection subscribes to every filter as `$share/<group>/<filter>`, and the broker load-balances messages |
+| Broker support | **None needed.** Works with any broker (tested: Mosquitto, EMQX, HiveMQ, NanoMQ, **Coreflux**) | The broker must support `$share` (Coreflux doesn't) |
+| Requirement | Several filters that don't overlap (e.g. `factory/#`, `energy/#`, `fleet/#`); overlaps are rejected at startup | Works even with a single `#` |
+| Balance | As even as your traffic per filter | Even |
 
 ```bash
+# split: works everywhere, one filter group per connection
+MQTT_TOPICS="factory/#,energy/#,fleet/#,buildings/#"
+MQTT_CONNECTIONS=4
+MQTT_SUBSCRIPTION_MODE=split
+
+# or: shared subscriptions
 MQTT_CONNECTIONS=4
 MQTT_SHARED_GROUP=mqtt-get
 ```
 
-The broker then load-balances messages across the 4 connections (`$share/mqtt-get/<filter>`). In tests, 300 messages over 3 connections arrived exactly once, split `[100 100 100]` on Mosquitto, HiveMQ and NanoMQ and `[98 99 103]` on EMQX. If connections deliver out of order, the store still keeps the newest value per topic (by receive time). Without a shared group, the extra connections are only used for publishing.
+Measured ingest on a 4-vCPU VM, fed by `cmd/floodbroker` (a fake broker that streams messages as fast as the socket allows, so the broker isn't the bottleneck):
+
+| Setup | Ingest | Speed-up |
+|---|---|---|
+| 1 connection, 4 filters | 146k msg/s | 1× |
+| 2 connections, `split` | 371k msg/s | 2.5× |
+| 4 connections, `split` | 490k msg/s | 3.4× (4 cores shared with the load generator) |
+
+`/api/v1/status` shows `received_per_connection` and `filters_per_connection`, so you can check the balance. In the interop suite, 3 × 100 messages over 3 connections arrived exactly once, `[100 100 100]`, on every broker in both modes (HiveMQ's shared-subscription balancing was uneven, e.g. `[118 111 71]`). If connections deliver out of order, the store still keeps the newest value per topic (by receive time). Without either mode, the extra connections are only used for publishing.
+
+> **EMQX note:** by default EMQX disconnects subscribers whose mailbox exceeds 1000 messages (`force_shutdown`, logged as `mailbox_overflow`). If mqtt-get can't keep up with a very high rate on one connection, add connections (above) or raise `force_shutdown.max_mailbox_size` on the broker.
 
 **Scaling out** to millions of messages per second:
 
@@ -852,7 +877,8 @@ Memory grows with the number of distinct topics and their payload sizes (roughly
 | `tls: client certificate: …` at startup | The certificate and key don't match, or aren't PEM. |
 | `connect failed: network Error : EOF` on a TLS port | You used `tcp://` against a TLS listener: use `mqtts://` or `MQTT_TLS=true`. |
 | `subscription rejected by broker (check ACLs): …` | The broker account may not subscribe to that filter (common with `#`): narrow `MQTT_TOPICS`. |
-| `shared subscription rejected by broker …` | The broker doesn't support `$share` (e.g. Coreflux): clear `MQTT_SHARED_GROUP`. |
+| `shared subscription rejected by broker …` | The broker doesn't support `$share` (e.g. Coreflux): use `MQTT_SUBSCRIPTION_MODE=split` instead of `MQTT_SHARED_GROUP`. |
+| `… needs non-overlapping filters, but "a/#" and "a/b" overlap` | In split mode a message matching two filters would be received twice. Merge or narrow the filters. |
 | Connected but no values | Check `MQTT_TOPICS`; remember `#` doesn't include `$SYS/...`; check broker ACLs. |
 | Another client gets disconnected when mqtt-get connects | Duplicate client ID: set a unique `MQTT_CLIENT_ID`. |
 | `GET` returns 404 for a topic you can see | Topic names are case-sensitive and exact. URL-encode special characters, or use `?topic=`. |
@@ -909,7 +935,8 @@ The regular tests need nothing installed. They start embedded MQTT brokers (plai
 
 ```
 cmd/mqtt-get        entry point: serve, mcp (standalone stdio / proxy), healthcheck
-cmd/loadgen         MQTT load generator
+cmd/loadgen         MQTT load generator (publishes through a real broker)
+cmd/floodbroker     fake broker that floods subscribers, to measure ingest capacity without a broker bottleneck
 internal/core       THE foundation: every operation, scopes, typed errors, watchers, topic tree
 internal/httpapi    REST interface for systems + web UI (httpapi/ui/index.html) + metrics
 internal/mcp        MCP interface for agents: tools, resources, prompts, completion; HTTP + stdio transports

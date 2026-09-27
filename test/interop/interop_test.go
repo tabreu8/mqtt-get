@@ -50,6 +50,8 @@ type Endpoint struct {
 	NoClientCertRejected  bool `json:"no_client_cert_rejected,omitempty"`
 	// SharedSubscriptions runs the $share scale-out check.
 	SharedSubscriptions bool `json:"shared_subscriptions,omitempty"`
+	// SplitSubscriptions runs the split-filters scale-out check.
+	SplitSubscriptions bool `json:"split_subscriptions,omitempty"`
 	// Skip lists sub-tests to skip for this endpoint, with a reason.
 	Skip map[string]string `json:"skip,omitempty"`
 }
@@ -472,6 +474,9 @@ func runEndpoint(t *testing.T, f File, ep Endpoint) {
 	if ep.SharedSubscriptions {
 		sub("shared_subscriptions", func(t *testing.T) { testShared(t, f, ep, h) })
 	}
+	if ep.SplitSubscriptions {
+		sub("split_subscriptions", func(t *testing.T) { testSplit(t, f, ep, h) })
+	}
 }
 
 func expectRejected(t *testing.T, cfg config.Broker) {
@@ -534,3 +539,40 @@ func testShared(t *testing.T, f File, ep Endpoint, h *harness) {
 }
 
 func srvConnected(s *core.Service) int { return s.MQTTStatus().ConnectedCount }
+
+// testSplit checks subscription_mode "split": 3 connections each subscribe
+// to one of 3 filters; every message is ingested exactly once, on the
+// connection that owns its filter. Needs no broker support.
+func testSplit(t *testing.T, f File, ep Endpoint, h *harness) {
+	ns := h.ns + "/split"
+	st, _ := state.Open("")
+	srv := core.New(config.Server{MaxTopics: 100000}, quietLog(), st)
+	cfg := f.brokerConfig(ep, clientID("mgsplit"))
+	cfg.Subscriptions = []config.Subscription{{Filter: ns + "/a/#", QoS: 1}, {Filter: ns + "/b/#", QoS: 1}, {Filter: ns + "/c/#", QoS: 1}}
+	cfg.Connections = 3
+	cfg.SubscriptionMode = config.SubscriptionSplit
+	if err := srv.Start(cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	waitFor(t, "3 split connections", 15*time.Second, func() bool { return srvConnected(srv) == 3 })
+	time.Sleep(500 * time.Millisecond)
+	const per = 100
+	for i := 0; i < per; i++ {
+		for _, part := range []string{"a", "b", "c"} {
+			h.peerPublish(fmt.Sprintf("%s/%s/%d", ns, part, i), []byte("x"), 1, false)
+		}
+	}
+	waitFor(t, "all split messages", 15*time.Second, func() bool { return srv.Store().Len() == 3*per })
+	time.Sleep(500 * time.Millisecond)
+	st2 := srv.MQTTStatus()
+	if st2.MessagesReceived != 3*per {
+		t.Fatalf("received %d messages for %d published", st2.MessagesReceived, 3*per)
+	}
+	t.Logf("messages per connection: %v", st2.ReceivedPerConnection)
+	for i, c := range st2.ReceivedPerConnection {
+		if c != per {
+			t.Fatalf("connection %d received %d, want %d: %v", i, c, per, st2.ReceivedPerConnection)
+		}
+	}
+}
