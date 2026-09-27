@@ -523,6 +523,7 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `METRICS_PUBLIC` | `false` | Serve `/metrics` without an API key |
 | `CORS_ORIGINS` | – | e.g. `*` or `https://dash.example.com,https://app.example.com` |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `GOGC` / `GOMEMLIMIT` | adaptive | Standard Go GC settings; setting either disables the automatic tuning (see [Memory and GC](#memory-and-gc)) |
 | `LOG_FORMAT` | `text` | `text` or `json` |
 | `PPROF_ADDR` | – | e.g. `127.0.0.1:6060` to enable Go profiling |
 
@@ -734,18 +735,20 @@ Suggested alerts: `mqttget_mqtt_connected == 0` for 1 minute; `rate(mqttget_webh
 
 - Messages are handled on the connection's read loop, with no goroutine per message.
 - The socket is read through a 64 KiB buffer. The underlying MQTT library reads packet headers byte by byte, which cost several syscalls per message; buffering cut CPU per message by about 30% and removed message loss under load in our tests.
-- The value store is split into 256 locks, entries are immutable, and payloads are shared with webhook queues without copying.
+- The value store is split into 256 locks. Each topic has one small record (32 bytes plus the payload) that is **updated in place**, so storing an update for a known topic allocates nothing, and mqtt-get's own ingest step (store, webhook and watcher routing) is allocation-free. A message is only copied to the heap when a webhook or a waiting agent needs it.
+- An **adaptive garbage collector** setting (see [Memory and GC](#memory-and-gc)) cuts GC work where memory allows.
 - Webhook matching uses a topic trie that's swapped atomically, so matching takes no locks.
 
 **Measured** on a 4-vCPU VM, with the broker (Mosquitto) and the load generator on the same machine:
 
 | | |
 |---|---|
-| mqtt-get's own cost per message (store + webhook routing) | **~270 ns** |
-| Ingest capacity, one connection (fake broker, no broker bottleneck) | 146k msg/s; **490k msg/s with 4 split connections** |
+| mqtt-get's own cost per message (store + webhook routing) | **~200 ns, 0 allocations** |
+| Ingest capacity (fake broker, no broker bottleneck) | ~160k msg/s on 1 connection; **~690k msg/s with 4 split connections** |
 | One connection, 64-byte payloads, 10k topics | **~225k msg/s, no loss.** Mosquitto (single-threaded) was the bottleneck. |
 | `GET` one value (in-process benchmark) | ~1.7 µs |
-| Memory with 10k topics | ~16 MB RSS |
+| Memory with 10k topics | ~16–30 MB RSS |
+| Memory with **1M topics** (64-byte payloads) | ~550 MB RSS |
 
 **Scaling up.** One connection is limited to roughly one CPU core. Open several connections to spread ingest over several cores. There are two ways, and you choose with `MQTT_SUBSCRIPTION_MODE`:
 
@@ -774,10 +777,20 @@ Measured ingest on a 4-vCPU VM, fed by `cmd/floodbroker` (a fake broker that str
 | 1 connection, 4 filters | 146k msg/s | 1× |
 | 2 connections, `split` | 371k msg/s | 2.5× |
 | 4 connections, `split` | 490k msg/s | 3.4× (4 cores shared with the load generator) |
+| 4 connections, `split`, with the memory/GC work below | **694k msg/s** | 4.8× |
 
 `/api/v1/status` shows `received_per_connection` and `filters_per_connection`, so you can check the balance. In the interop suite, 3 × 100 messages over 3 connections arrived exactly once, `[100 100 100]`, on every broker in both modes (HiveMQ's shared-subscription balancing was uneven, e.g. `[118 111 71]`). If connections deliver out of order, the store still keeps the newest value per topic (by receive time). Without either mode, the extra connections are only used for publishing.
 
 > **EMQX note:** by default EMQX disconnects subscribers whose mailbox exceeds 1000 messages (`force_shutdown`, logged as `mailbox_overflow`). If mqtt-get can't keep up with a very high rate on one connection, add connections (above) or raise `force_shutdown.max_mailbox_size` on the broker.
+
+### Memory and GC
+
+A stored topic costs about **135 bytes plus its name and payload** (measured with 1M topics; down from 175 bytes). The garbage collector is tuned automatically:
+
+- **Adaptive GC.** Go's default (`GOGC=100`) collects often. Collecting less often (`GOGC=400`) gave **+22% ingest throughput**, but lets the heap grow to 5× the live data: with 1M topics that was 1.5 GB instead of 480 MB. mqtt-get therefore adapts every few seconds, allowing `max(256 MiB, live heap)` of garbage. Small deployments run at `GOGC=400`; large ones converge to `GOGC=100`. Measured: 694k msg/s with a few thousand topics, and 550 MB RSS with 1M topics.
+- **Containers.** When a cgroup memory limit exists (Docker `--memory`, Kubernetes `limits.memory`), a soft Go memory limit is set at 90% of it, so the collector works harder instead of the container being OOM-killed.
+- **Overrides.** Setting the standard `GOGC` or `GOMEMLIMIT` environment variables disables the automatic tuning. For example, `GOGC=400 GOMEMLIMIT=400MiB` keeps a 1M-topic instance at ~390 MB while still collecting rarely. The startup log shows the active policy (`runtime: garbage collector`).
+- `MAX_TOPICS` (default 1M) remains the hard guard against unbounded topic growth.
 
 **Scaling out** to millions of messages per second:
 

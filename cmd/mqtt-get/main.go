@@ -66,6 +66,7 @@ func serve() error {
 	}
 	log := newLogger(cfg.LogLevel, cfg.LogFormat)
 	slog.SetDefault(log)
+	tuneRuntime(log)
 
 	st, err := state.Open(cfg.DataDir)
 	if err != nil {

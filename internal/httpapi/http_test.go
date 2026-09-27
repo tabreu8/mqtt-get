@@ -304,7 +304,7 @@ func BenchmarkGetValueHTTP(b *testing.B) {
 	st, _ := state.Open("")
 	st.SetEnvKeys([]string{"k"}, nil, nil)
 	svc := core.New(config.Server{MaxBodyBytes: 1 << 20}, slog.New(slog.NewTextHandler(io.Discard, nil)), st)
-	svc.Ingest(storeEntry("a/b", `{"v":1}`))
+	svc.Ingest(*storeEntry("a/b", `{"v":1}`))
 	h := New(svc, nil).Handler()
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
@@ -338,6 +338,6 @@ func BenchmarkIngest(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		svc.Ingest(&store.Entry{Topic: topics[i%len(topics)], Payload: p, Time: int64(i)})
+		svc.Ingest(store.Entry{Topic: topics[i%len(topics)], Payload: p, Time: int64(i)})
 	}
 }

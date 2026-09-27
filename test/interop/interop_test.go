@@ -160,9 +160,9 @@ func newHarness(t *testing.T, f File, ep Endpoint) *harness {
 	h.http = httptest.NewServer(httpapi.New(h.srv, nil).Handler())
 	t.Cleanup(h.http.Close)
 
-	h.peer = mqttc.New(quietLog(), func(e *store.Entry) {
+	h.peer = mqttc.New(quietLog(), func(e store.Entry) {
 		select {
-		case h.got <- e:
+		case h.got <- &e:
 		default:
 		}
 	})
@@ -481,7 +481,7 @@ func runEndpoint(t *testing.T, f File, ep Endpoint) {
 
 func expectRejected(t *testing.T, cfg config.Broker) {
 	t.Helper()
-	m := mqttc.New(quietLog(), func(*store.Entry) {})
+	m := mqttc.New(quietLog(), func(store.Entry) {})
 	defer m.Close()
 	if err := m.Apply(cfg); err != nil {
 		return // rejected at configuration time

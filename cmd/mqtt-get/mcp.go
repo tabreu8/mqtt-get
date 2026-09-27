@@ -66,6 +66,7 @@ func mcpStandalone(ctx context.Context) error {
 	// stdout carries the protocol: logs go to stderr only.
 	log := newLogger(cfg.LogLevel, cfg.LogFormat)
 	slog.SetDefault(log)
+	tuneRuntime(log)
 	st, err := state.Open(cfg.DataDir)
 	if err != nil {
 		return err

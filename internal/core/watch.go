@@ -20,6 +20,8 @@ const (
 	MaxWaitTimeout     = 5 * time.Minute
 )
 
+var watchPool = sync.Pool{New: func() any { b := make([]*watcher, 0, 8); return &b }}
+
 type watcher struct {
 	filter string
 	fn     func(*store.Entry)
@@ -39,14 +41,22 @@ func newWatchers() *watchers { return &watchers{set: map[*watcher]struct{}{}} }
 
 func (w *watchers) count() int { return int(w.n.Load()) }
 
-func (w *watchers) dispatch(e *store.Entry) {
+func (w *watchers) dispatch(e store.Entry) {
 	if w.n.Load() == 0 {
 		return
 	}
 	t := w.trie.Load()
-	var arr [8]*watcher
-	for _, x := range t.Match(e.Topic, arr[:0]) {
-		x.fn(e)
+	bp := watchPool.Get().(*[]*watcher)
+	defer watchPool.Put(bp)
+	matches := t.Match(e.Topic, (*bp)[:0])
+	*bp = matches[:0]
+	if len(matches) == 0 {
+		return
+	}
+	p := new(store.Entry)
+	*p = e
+	for _, x := range matches {
+		x.fn(p)
 	}
 }
 

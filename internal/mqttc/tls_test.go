@@ -171,9 +171,9 @@ type recorder struct{ got chan *store.Entry }
 
 func newManager(t *testing.T) (*Manager, *recorder) {
 	r := &recorder{got: make(chan *store.Entry, 16)}
-	m := New(slog.New(slog.NewTextHandler(io.Discard, nil)), func(e *store.Entry) {
+	m := New(slog.New(slog.NewTextHandler(io.Discard, nil)), func(e store.Entry) {
 		select {
-		case r.got <- e:
+		case r.got <- &e:
 		default:
 		}
 	})

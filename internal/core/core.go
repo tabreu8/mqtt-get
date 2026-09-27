@@ -59,8 +59,12 @@ func New(cfg config.Server, log *slog.Logger, st *state.State) *Service {
 
 // Ingest is the hot path for every inbound MQTT message. It is exported so
 // tests and benchmarks can inject messages without a broker.
-func (s *Service) Ingest(e *store.Entry) {
-	s.store.Set(e)
+//
+// The message is passed by value and only copied to the heap when a webhook
+// or watcher matches it, so plain ingest allocates nothing here (and the
+// store updates existing topics in place).
+func (s *Service) Ingest(e store.Entry) {
+	s.store.Set(&e)
 	s.hooks.Dispatch(e)
 	s.watch.dispatch(e)
 }

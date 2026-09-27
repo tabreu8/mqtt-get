@@ -45,8 +45,8 @@ func TestRawFormatSignatureAndRetry(t *testing.T) {
 	d := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer d.Close()
 	d.Put(config.Webhook{ID: "h", URL: srv.URL, Topics: []string{"a/+"}, Format: "raw", Secret: "k"})
-	d.Dispatch(&store.Entry{Topic: "b/x", Payload: []byte("no")})
-	d.Dispatch(&store.Entry{Topic: "a/x", Payload: []byte("hello")})
+	d.Dispatch(store.Entry{Topic: "b/x", Payload: []byte("no")})
+	d.Dispatch(store.Entry{Topic: "a/x", Payload: []byte("hello")})
 	wait(t, func() bool { s, _ := d.Stats("h"); return s.Delivered == 1 })
 
 	if gotBody.Load() != "hello" || gotTopic.Load() != "a/x" {
@@ -70,7 +70,7 @@ func TestQueueFullDrops(t *testing.T) {
 	d := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	d.Put(config.Webhook{ID: "h", URL: srv.URL, Topics: []string{"#"}, QueueSize: 5})
 	for i := 0; i < 100; i++ {
-		d.Dispatch(&store.Entry{Topic: "t", Payload: []byte("x")}) // never blocks
+		d.Dispatch(store.Entry{Topic: "t", Payload: []byte("x")}) // never blocks
 	}
 	if s, _ := d.Stats("h"); s.Dropped < 90 {
 		t.Fatalf("dropped = %d", s.Dropped)

@@ -89,7 +89,7 @@ func waitUntil(t *testing.T, what string, f func() bool) {
 }
 
 func ingest(svc *core.Service, topic, payload string) {
-	svc.Ingest(&store.Entry{Topic: topic, Payload: []byte(payload), Time: time.Now().UnixNano()})
+	svc.Ingest(store.Entry{Topic: topic, Payload: []byte(payload), Time: time.Now().UnixNano()})
 }
 
 // stdioClient drives ServeStdio through pipes, like a real local agent.

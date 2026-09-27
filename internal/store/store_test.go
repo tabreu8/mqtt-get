@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 )
 
 func TestStore(t *testing.T) {
@@ -86,5 +87,19 @@ func TestAppendJSON(t *testing.T) {
 		if err := json.Unmarshal([]byte(got), &v); err != nil {
 			t.Errorf("%q: invalid json %s: %v", in, got, err)
 		}
+	}
+}
+
+func TestPayloadRoundTrip(t *testing.T) {
+	s := New(0)
+	for _, p := range [][]byte{nil, {}, []byte("x"), []byte(strings.Repeat("y", 70000))} {
+		s.Set(&Entry{Topic: "t", Payload: p, Time: 1})
+		e, _ := s.Get("t")
+		if string(e.Payload) != string(p) || len(e.Payload) != len(p) {
+			t.Fatalf("payload of len %d came back as len %d", len(p), len(e.Payload))
+		}
+	}
+	if sz := unsafe.Sizeof(slot{}); sz > 32 {
+		t.Fatalf("slot is %d bytes, want <= 32", sz)
 	}
 }

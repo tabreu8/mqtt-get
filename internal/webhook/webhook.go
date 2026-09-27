@@ -51,6 +51,8 @@ type hook struct {
 	lastErrAt                            time.Time
 }
 
+var matchPool = sync.Pool{New: func() any { b := make([]*hook, 0, 8); return &b }}
+
 // Dispatcher routes messages to webhooks.
 type Dispatcher struct {
 	log    *slog.Logger
@@ -80,15 +82,26 @@ func New(log *slog.Logger) *Dispatcher {
 }
 
 // Dispatch enqueues e for every matching webhook. It never blocks.
-func (d *Dispatcher) Dispatch(e *store.Entry) {
+// The entry is only copied to the heap when a webhook matches.
+func (d *Dispatcher) Dispatch(e store.Entry) {
 	t := d.trie.Load()
 	if t == nil || t.Len() == 0 {
 		return
 	}
-	var arr [8]*hook
-	for _, h := range t.Match(e.Topic, arr[:0]) {
+	// Pooled match buffer: the trie's recursive matcher would otherwise
+	// force a heap allocation on every message.
+	bp := matchPool.Get().(*[]*hook)
+	defer matchPool.Put(bp)
+	matches := t.Match(e.Topic, (*bp)[:0])
+	*bp = matches[:0]
+	if len(matches) == 0 {
+		return
+	}
+	p := new(store.Entry)
+	*p = e
+	for _, h := range matches {
 		select {
-		case h.queue <- e:
+		case h.queue <- p:
 		default:
 			h.dropped.Add(1)
 		}

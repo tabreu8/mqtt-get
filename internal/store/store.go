@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/tabreu8/mqtt-get/internal/topic"
 )
@@ -24,9 +25,44 @@ type Entry struct {
 	Time     int64 // unix nanoseconds when received
 }
 
+// slot holds the latest value of one topic. It is allocated once per topic
+// and then updated in place under the shard lock, so updating an existing
+// topic allocates nothing. The topic is only kept as the map key: storing it
+// again would retain a second copy of the name for every updated topic.
+//
+// The payload is kept as pointer + length instead of a slice header, which
+// brings a slot from the 48-byte to the 32-byte allocation class.
+type slot struct {
+	payload  *byte // first byte of the payload (keeps the whole array alive)
+	n        uint32
+	qos      byte
+	retained bool
+	time     int64
+}
+
+func newSlot(e *Entry) slot {
+	return slot{payload: unsafe.SliceData(e.Payload), n: uint32(len(e.Payload)), qos: e.QoS, retained: e.Retained, time: e.Time}
+}
+
+func (sl *slot) bytes() []byte {
+	if sl.payload == nil {
+		return nil
+	}
+	return unsafe.Slice(sl.payload, sl.n)
+}
+
+func (sl *slot) value(topic string) Entry {
+	return Entry{Topic: topic, Payload: sl.bytes(), QoS: sl.qos, Retained: sl.retained, Time: sl.time}
+}
+
+func (sl *slot) entry(topic string) *Entry {
+	e := sl.value(topic)
+	return &e
+}
+
 type shard struct {
 	mu sync.RWMutex
-	m  map[string]*Entry
+	m  map[string]*slot
 	_  [32]byte // reduce false sharing between adjacent shards
 }
 
@@ -42,7 +78,7 @@ type Store struct {
 func New(maxTopics int) *Store {
 	s := &Store{maxTopics: int64(maxTopics)}
 	for i := range s.shards {
-		s.shards[i].m = make(map[string]*Entry)
+		s.shards[i].m = make(map[string]*slot)
 	}
 	return s
 }
@@ -70,13 +106,20 @@ func (s *Store) Set(e *Entry) bool {
 			return false
 		}
 		s.count.Add(1)
-	} else if old.Time > e.Time {
+	} else if old.time > e.Time {
 		// Out-of-order delivery (possible with several shared-subscription
 		// connections): keep the newer value.
 		sh.mu.Unlock()
 		return true
 	}
-	sh.m[e.Topic] = e
+	if ok {
+		// In place: no allocation, and the caller's copy of the topic name
+		// is not retained.
+		*old = newSlot(e)
+	} else {
+		sl := newSlot(e)
+		sh.m[e.Topic] = &sl
+	}
 	sh.mu.Unlock()
 	return true
 }
@@ -85,9 +128,14 @@ func (s *Store) Set(e *Entry) bool {
 func (s *Store) Get(name string) (*Entry, bool) {
 	sh := s.shard(name)
 	sh.mu.RLock()
-	e, ok := sh.m[name]
+	sl, ok := sh.m[name]
+	if !ok {
+		sh.mu.RUnlock()
+		return nil, false
+	}
+	e := sl.entry(name) // copy while holding the lock
 	sh.mu.RUnlock()
-	return e, ok
+	return e, true
 }
 
 // Delete removes a topic. It reports whether it existed.
@@ -109,7 +157,7 @@ func (s *Store) Clear() {
 		sh := &s.shards[i]
 		sh.mu.Lock()
 		s.count.Add(-int64(len(sh.m)))
-		sh.m = make(map[string]*Entry)
+		sh.m = make(map[string]*slot)
 		sh.mu.Unlock()
 	}
 }
@@ -125,21 +173,25 @@ func (s *Store) Dropped() uint64 { return s.dropped.Load() }
 // returns the total number of matches.
 func (s *Store) Query(filter string, limit int) ([]*Entry, int) {
 	all := filter == "" || filter == "#"
-	var out []*Entry
+	var vals []Entry // one backing array instead of one allocation per result
 	for i := range s.shards {
 		sh := &s.shards[i]
 		sh.mu.RLock()
-		for name, e := range sh.m {
+		for name, sl := range sh.m {
 			if all || topic.Match(filter, name) {
-				out = append(out, e)
+				vals = append(vals, sl.value(name))
 			}
 		}
 		sh.mu.RUnlock()
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Topic < out[j].Topic })
-	total := len(out)
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+	sort.Slice(vals, func(i, j int) bool { return vals[i].Topic < vals[j].Topic })
+	total := len(vals)
+	if limit > 0 && len(vals) > limit {
+		vals = vals[:limit]
+	}
+	out := make([]*Entry, len(vals))
+	for i := range vals {
+		out[i] = &vals[i]
 	}
 	return out, total
 }

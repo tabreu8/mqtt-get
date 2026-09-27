@@ -30,7 +30,7 @@ var ErrNotConnected = errors.New("not connected to MQTT broker")
 
 // Handler receives every inbound message. It runs on the connection's
 // receive goroutine and must not block.
-type Handler func(e *store.Entry)
+type Handler func(e store.Entry)
 
 // Status describes the connection state.
 type Status struct {
@@ -279,7 +279,7 @@ func (m *Manager) onMessage(msg mqtt.Message) {
 	p := msg.Payload()
 	m.received.Add(1)
 	m.bytes.Add(uint64(len(p)))
-	m.handler(&store.Entry{
+	m.handler(store.Entry{
 		Topic:    msg.Topic(),
 		Payload:  p,
 		QoS:      msg.Qos(),
