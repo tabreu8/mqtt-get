@@ -4,7 +4,7 @@ This suite runs mqtt-get end to end against real MQTT brokers, with every authen
 
 ## Last results
 
-**643 checks passed, 0 failed, 1 skipped (a known broker limitation)** across 47 endpoints on 5 brokers: every endpoint over MQTT 3.1.1, and 21 of them again over MQTT 5. Both ran on mqtt-get's built-in lean client (the default). Run on 2026-09-27.
+**705 checks passed, 0 failed, 2 skipped (known broker limitations)** across 48 endpoints on 5 brokers: every endpoint over MQTT 3.1.1, and 22 of them again over MQTT 5 (one with SCRAM enhanced authentication). Both ran on mqtt-get's built-in lean client (the default). Run on 2026-09-27.
 
 | Broker | Version | TCP | Password auth | WebSocket | TLS | mTLS | WSS | `$share` |
 |---|---|---|---|---|---|---|---|---|
@@ -45,7 +45,7 @@ The EMQX endpoint `v5-tcp-scram` authenticates with **SCRAM-SHA-256** (MQTT 5 en
 
 Also verified by hand: when the broker is killed and restarted, mqtt-get reports 503 on `/healthz` with a clear error, refuses publishes with "not connected", then reconnects and resubscribes by itself about 1 s after the broker returns.
 
-One incident during testing: NanoMQ 0.25.6 crashed once (`malloc(): unaligned fastbin chunk detected`, SIGABRT in its TLS transport) in 1 of about 11 runs. mqtt-get reported the lost connection. The same check passed in 6 targeted re-runs and 2 more full runs.
+Incidents during testing: NanoMQ 0.25.6 crashed twice (`malloc(): unaligned fastbin chunk detected`, SIGABRT in its TLS transport) in about 16 runs, the second time while `last_will` cut TLS connections. mqtt-get reported the lost connection each time. After a restart, 3 further runs of every NanoMQ check and another full run passed.
 
 ## Run it yourself
 

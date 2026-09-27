@@ -521,7 +521,7 @@ Use a fixed `MQTT_CLIENT_ID` for persistent sessions: the broker finds the sessi
 
 ## Tested brokers
 
-mqtt-get ships with an **interoperability suite** that runs the full stack (REST, publish at every QoS, retained replay, binary payloads, wildcards, webhooks and negative auth checks) against real brokers. Last run: **643 passed, 0 failed** over 47 endpoints (MQTT 3.1.1 and MQTT 5).
+mqtt-get ships with an **interoperability suite** that runs the full stack (REST, publish at every QoS, retained replay, binary payloads, wildcards, webhooks and negative auth checks) against real brokers. Last run: **705 passed, 0 failed** over 48 endpoints (MQTT 3.1.1, MQTT 5 and SCRAM), including a Last Will check that cuts the connection on every endpoint.
 
 | Broker | Version | TCP | Password | WS | TLS | mTLS | WSS | MQTT 5 | `split` scale-out | `$share` scale-out |
 |---|---|---|---|---|---|---|---|---|---|---|
