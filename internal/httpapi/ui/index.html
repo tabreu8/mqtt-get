@@ -296,6 +296,7 @@ async function loadStatus() {
     <tr><th>Config source</th><td>${esc(s.broker_source)}${s.state_file ? ` <span class="muted">(${esc(s.state_file)})</span>` : ''}</td></tr>
     ${m.connected_since ? `<tr><th>Connected since</th><td>${new Date(m.connected_since).toLocaleString()}</td></tr>` : ''}
     ${m.last_error ? `<tr><th>Last error</th><td class="err">${esc(m.last_error)} <span class="muted">${new Date(m.last_error_at).toLocaleTimeString()}</span></td></tr>` : ''}
+    ${m.last_disconnect ? `<tr><th>Last disconnect</th><td>${esc(m.last_disconnect)} <span class="muted">${new Date(m.last_disconnect_at).toLocaleString()} · ${m.disconnects} total</span></td></tr>` : ''}
   </table>`;
 }
 

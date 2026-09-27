@@ -44,6 +44,11 @@ type Status struct {
 	BytesReceived    uint64    `json:"bytes_received"`
 	MessagesSent     uint64    `json:"messages_published"`
 	PublishErrors    uint64    `json:"publish_errors"`
+	// The most recent connection loss and why (e.g. the broker's MQTT 5
+	// reason). Unlike LastError it is kept after reconnecting.
+	LastDisconnect   string    `json:"last_disconnect,omitempty"`
+	LastDisconnectAt time.Time `json:"last_disconnect_at,omitzero"`
+	Disconnects      uint64    `json:"disconnects"`
 	// ReceivedPerConnection shows how ingest is spread over connections.
 	ReceivedPerConnection []uint64 `json:"received_per_connection,omitempty"`
 	// FiltersPerConnection lists what each connection subscribes to.
@@ -82,6 +87,9 @@ type Manager struct {
 	lastErr   string
 	lastErrAt time.Time
 	since     time.Time
+	lastDown  string
+	downAt    time.Time
+	downs     uint64
 }
 
 // New creates a manager. Call Apply to connect.
@@ -221,6 +229,8 @@ func (m *Manager) linkUp(clientID string) {
 func (m *Manager) linkDown(reason string) {
 	m.errMu.Lock()
 	m.since = time.Time{}
+	m.lastDown, m.downAt = reason, time.Now()
+	m.downs++
 	m.errMu.Unlock()
 	m.setErr("connection lost: " + reason)
 }
@@ -323,6 +333,9 @@ func (m *Manager) Status() Status {
 		BytesReceived:    bytes,
 		MessagesSent:     m.sent.Load(),
 		PublishErrors:    m.pubErrors.Load(),
+		LastDisconnect:   m.lastDown,
+		LastDisconnectAt: m.downAt,
+		Disconnects:      m.downs,
 	}
 	if !cfg.IsConfigured() {
 		st.Protocol = ""

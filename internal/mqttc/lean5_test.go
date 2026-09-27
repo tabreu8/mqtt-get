@@ -205,10 +205,12 @@ func TestLeanV5ReasonCodes(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not authorized: acl says no") {
 		t.Fatalf("publish error %v", err)
 	}
-	// The client reconnects at once (clearing the status error), so check
-	// the log.
+	// The client reconnects at once (clearing the status error); the
+	// reason stays in last_disconnect and the log.
+	const want = "server disconnected: reason 0x98 administrative action: maintenance"
 	waitFor(t, "server disconnect reason", func() bool {
-		return strings.Contains(logs.String(), "server disconnected: reason 0x98 administrative action: maintenance")
+		st := m.Status()
+		return st.LastDisconnect == want && st.Disconnects >= 1 && strings.Contains(logs.String(), want)
 	})
 }
 

@@ -39,6 +39,8 @@ type v5link struct {
 	// goroutine; aliasClient detects a new connection (new paho client).
 	aliases     map[uint16]string
 	aliasClient *paho.Client
+
+	serverReason atomic.Pointer[string] // the broker's DISCONNECT reason, if any
 }
 
 // defaultTopicAliasMaximum is how many topic aliases the broker may use
@@ -125,7 +127,11 @@ func (l *v5link) start() {
 		},
 		OnConnectionDown: func() bool {
 			l.up.Store(false)
-			l.m.linkDown("disconnected")
+			reason := "disconnected"
+			if r := l.serverReason.Swap(nil); r != nil {
+				reason = *r
+			}
+			l.m.linkDown(reason)
 			return true // keep reconnecting
 		},
 		OnConnectError: func(err error) { l.m.setErr("connect failed: " + describeV5Error(err)) },
@@ -134,7 +140,9 @@ func (l *v5link) start() {
 			OnPublishReceived: []func(paho.PublishReceived) (bool, error){l.onPublish},
 			OnClientError:     func(err error) { l.m.setErr("client error: " + err.Error()) },
 			OnServerDisconnect: func(d *paho.Disconnect) {
-				l.m.setErr("server disconnected: " + reasonText(d.ReasonCode, disconnectReason(d)))
+				r := "server disconnected: " + reasonText(d.ReasonCode, disconnectReason(d))
+				l.serverReason.Store(&r)
+				l.m.setErr(r)
 			},
 		},
 	}
