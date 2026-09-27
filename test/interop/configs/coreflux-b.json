@@ -1,0 +1,6 @@
+{"Name":"coreflux-b","Port":52883,"TlsPort":52894,"WebsocketPort":52083,"WebsocketPortTls":52094,
+ "BindIPForMQTT":"0.0.0.0","BindIPForMQTTwithTls":"0.0.0.0","BindIpForWebSockets":"0.0.0.0","BindIpForWebSocketsTls":"0.0.0.0",
+ "AnonymousLogin":true,"CleanSession":true,"MaxPendingMessagesPerClient":100000,
+ "ServerCertificatePath":"/certs/server.pfx","ServerCertificatePassword":"changeit",
+ "ClientCertificationValidation":true,"CheckCertificateChainValidation":true,
+ "RootCACertificatePath":"/certs/ca.crt","ClientCertificateSourcePath":"/certs/clients/"}

@@ -29,9 +29,16 @@ func withDefaultPort(host, port string) string {
 	return net.JoinHostPort(host, port)
 }
 
-// openConn is paho's CustomOpenConnectionFn: it dials every supported
-// scheme and returns a buffered connection.
-func openConn(uri *url.URL, o mqtt.ClientOptions) (net.Conn, error) {
+// dialer returns paho's CustomOpenConnectionFn: it dials every supported
+// scheme and returns a buffered connection. With forceTLS, plain tcp:// and
+// mqtt:// URLs are upgraded to TLS (tls.enabled / MQTT_TLS=true).
+func dialer(forceTLS bool) mqtt.OpenConnectionFunc {
+	return func(uri *url.URL, o mqtt.ClientOptions) (net.Conn, error) {
+		return openConn(uri, o, forceTLS)
+	}
+}
+
+func openConn(uri *url.URL, o mqtt.ClientOptions, forceTLS bool) (net.Conn, error) {
 	d := &net.Dialer{Timeout: o.ConnectTimeout, KeepAlive: 30 * time.Second}
 	var (
 		conn net.Conn
@@ -54,6 +61,9 @@ func openConn(uri *url.URL, o mqtt.ClientOptions) (net.Conn, error) {
 		}
 		conn, err = d.Dial("unix", addr)
 	case "mqtt", "tcp":
+		if forceTLS {
+			return openConn(&url.URL{Scheme: "ssl", Host: uri.Host}, o, false)
+		}
 		conn, err = proxy.FromEnvironmentUsing(d).Dial("tcp", withDefaultPort(uri.Host, "1883"))
 	case "ssl", "tls", "mqtts", "mqtt+ssl", "tcps":
 		host := withDefaultPort(uri.Host, "8883")

@@ -46,11 +46,14 @@ type Status struct {
 	BytesReceived    uint64    `json:"bytes_received"`
 	MessagesSent     uint64    `json:"messages_published"`
 	PublishErrors    uint64    `json:"publish_errors"`
+	// ReceivedPerConnection shows how ingest is spread over connections.
+	ReceivedPerConnection []uint64 `json:"received_per_connection,omitempty"`
 }
 
 type conn struct {
 	client    mqtt.Client
 	connected atomic.Bool
+	received  atomic.Uint64
 }
 
 // Manager owns the broker connections.
@@ -161,7 +164,7 @@ func (m *Manager) options(cfg config.Broker, tlsCfg *tls.Config, idx int, c *con
 	// Deliver messages sequentially on the connection's goroutine: our
 	// handler is non-blocking, and this avoids a goroutine per message.
 	o.SetOrderMatters(true)
-	o.SetCustomOpenConnectionFn(openConn)
+	o.SetCustomOpenConnectionFn(dialer(cfg.TLS.Enabled))
 	if tlsCfg != nil {
 		o.SetTLSConfig(tlsCfg)
 	}
@@ -197,7 +200,10 @@ func (m *Manager) options(cfg config.Broker, tlsCfg *tls.Config, idx int, c *con
 		filters[f] = s.QoS
 	}
 
-	o.SetDefaultPublishHandler(func(_ mqtt.Client, msg mqtt.Message) { m.onMessage(msg) })
+	o.SetDefaultPublishHandler(func(_ mqtt.Client, msg mqtt.Message) {
+		c.received.Add(1)
+		m.onMessage(msg)
+	})
 	o.SetOnConnectHandler(func(cl mqtt.Client) {
 		c.connected.Store(true)
 		m.errMu.Lock()
@@ -222,7 +228,12 @@ func (m *Manager) options(cfg config.Broker, tlsCfg *tls.Config, idx int, c *con
 				if st, ok := tok.(*mqtt.SubscribeToken); ok {
 					for f, code := range st.Result() {
 						if code == 0x80 {
-							m.setErr("subscription rejected by broker: " + f)
+							msg := "subscription rejected by broker (check ACLs): " + f
+							if strings.HasPrefix(f, "$share/") {
+								msg = "shared subscription rejected by broker: " + f +
+									" (the broker may not support $share; clear shared_group / MQTT_SHARED_GROUP)"
+							}
+							m.setErr(msg)
 						}
 					}
 				}
@@ -319,10 +330,12 @@ func (m *Manager) Status() Status {
 	m.mu.Lock()
 	cfg := m.cfg
 	connected := 0
+	var perConn []uint64
 	for _, c := range m.conns {
 		if c.connected.Load() {
 			connected++
 		}
+		perConn = append(perConn, c.received.Load())
 	}
 	total := len(m.conns)
 	m.mu.Unlock()
@@ -343,6 +356,9 @@ func (m *Manager) Status() Status {
 		BytesReceived:    m.bytes.Load(),
 		MessagesSent:     m.sent.Load(),
 		PublishErrors:    m.pubErrors.Load(),
+	}
+	if len(perConn) > 1 {
+		st.ReceivedPerConnection = perConn
 	}
 	if m.lastErr != "" {
 		st.LastErrorAt = m.lastErrAt

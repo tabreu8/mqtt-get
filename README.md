@@ -1,187 +1,861 @@
 # mqtt-get
 
-A small, fast MQTT ↔ HTTP bridge written in Go. It is one static binary (about 8 MB, about 16 MB RSS with 10k topics) that:
+**A fast, lightweight bridge between MQTT and HTTP.** mqtt-get connects to your MQTT broker, remembers the **latest value of every topic**, and exposes it over a simple **REST API**. You can also **publish** over HTTP, forward messages to **webhooks**, and configure everything from **environment variables, the REST API, an AI agent (MCP) or a built-in web UI**.
 
-- **connects to any MQTT broker** and keeps the **latest value of every topic** in memory
-- **REST `GET`** returns the most recent value of a topic, or of every topic matching a wildcard filter
-- **REST `POST`** publishes to MQTT (one message or a batch)
-- **Webhooks** forward matching messages to HTTP endpoints, with batching, retries, HMAC signatures and per-webhook backpressure
-- **API-key auth** with scopes (`read`, `publish`, `admin`)
-- **Every common MQTT auth method**: anonymous, username/password or token, password file, TLS with a custom CA, mutual TLS (client certificates), SNI, ALPN, and WebSocket headers
-- **Several ways to configure it**: environment variables, REST API, **MCP** (for AI agents), or the built-in **web UI**
-- **Prometheus metrics**, a health check and optional pprof
+[![ci](https://github.com/tabreu8/mqtt-get/actions/workflows/ci.yml/badge.svg)](https://github.com/tabreu8/mqtt-get/actions/workflows/ci.yml)
+
+![mqtt-get dashboard](docs/images/ui-dashboard.png)
+
+```bash
+curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/values/factory/line1/press/status
+```
+```json
+{"topic":"factory/line1/press/status","payload":{"state":"running","cycle":18234,"pressure_bar":142.7},"encoding":"json","qos":0,"retained":false,"timestamp":"2026-09-27T18:22:30.178879488Z"}
+```
+
+---
+
+## Contents
+
+- [Why mqtt-get](#why-mqtt-get)
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [Reading values (GET)](#reading-values-get)
+- [Publishing (POST)](#publishing-post)
+- [Webhooks](#webhooks)
+- [Connecting to your broker](#connecting-to-your-broker) (auth methods and recipes for Mosquitto, EMQX, HiveMQ, NanoMQ, Coreflux, AWS IoT Core, Azure IoT Hub)
+- [Tested brokers](#tested-brokers)
+- [Configuration](#configuration)
+- [Security and API keys](#security-and-api-keys)
+- [Web UI](#web-ui)
+- [AI agents (MCP)](#ai-agents-mcp)
+- [Monitoring](#monitoring)
+- [Performance and scaling](#performance-and-scaling)
+- [Deployment](#deployment) (Docker, systemd, Kubernetes)
+- [Troubleshooting](#troubleshooting)
+- [API reference](#api-reference)
+- [Development](#development)
+
+---
+
+## Why mqtt-get
+
+MQTT is great for devices and poor for everything else. A dashboard, a spreadsheet, a cron job, a low-code tool or an LLM agent usually just wants to ask *"what is the current temperature in the kitchen?"* or *"turn the lamp on"* over HTTP. mqtt-get answers those questions in about a millisecond, without each consumer holding its own MQTT connection.
+
+| | |
+|---|---|
+| **Latest value, instantly** | Every message is kept in memory per topic. `GET` returns the newest one; `?filter=home/+/temp` returns many at once. |
+| **Publish over HTTP** | Raw body or JSON, single messages or batches, QoS 0/1/2, retain. |
+| **Webhooks** | Push matching messages to any URL, with batching, retries, HMAC signatures and backpressure. |
+| **Every common broker auth method** | Anonymous, username/password or token, rotating password files, TLS, custom CA, **mutual TLS**, SNI, ALPN, WebSockets with headers, failover URLs. |
+| **Simple to run** | One ~8 MB static binary or container, no dependencies, no database. |
+| **Simple to configure** | Environment variables, REST, MCP or web UI. Changes apply live and are persisted. |
+| **Fast** | About 270 ns of work per message inside mqtt-get; 225k+ msg/s on one connection; scales out over several connections with shared subscriptions. |
+| **Tested for real** | 320 end-to-end checks against Mosquitto, EMQX, HiveMQ CE, NanoMQ and Coreflux over TCP, WS, TLS, WSS and mTLS. |
 
 ## Quick start
 
-```bash
-# Docker Compose (includes a Mosquitto broker)
-docker compose up -d
-open http://localhost:8080        # API key: change-me-admin-key
+### Docker Compose (includes a Mosquitto broker to play with)
 
-# or a plain binary
-make build
+```bash
+git clone https://github.com/tabreu8/mqtt-get && cd mqtt-get
+docker compose up -d
+# UI:  http://localhost:8080   (API key: change-me-admin-key, set in docker-compose.yml)
+```
+
+### Docker, against your own broker
+
+```bash
+docker build -t mqtt-get .
+docker run -d --name mqtt-get -p 8080:8080 -v mqtt-get-data:/data \
+  -e MQTT_URL=tcp://broker.local:1883 \
+  -e MQTT_USERNAME=bridge -e MQTT_PASSWORD=secret \
+  -e API_KEYS=$(openssl rand -hex 24) \
+  mqtt-get
+```
+
+### Binary
+
+```bash
+make build        # or: CGO_ENABLED=0 go build -o bin/mqtt-get ./cmd/mqtt-get
 MQTT_URL=tcp://broker.local:1883 API_KEYS=my-secret-key ./bin/mqtt-get
 ```
 
-If you start it with no API keys, it **generates an admin key and prints it once in the log**. You can also start with no broker configured and set it up later in the web UI.
+> **No API key configured?** On first start mqtt-get generates an admin key and **prints it once** in the log:
+> `level=WARN msg="no API keys configured: generated an admin key ..." api_key=mg_3f9c…`
+>
+> **No broker configured?** Start without `MQTT_URL` and set up the connection in the web UI.
+
+Then try it:
 
 ```bash
-KEY=my-secret-key
-# latest value (JSON envelope)
-curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/home/kitchen/temperature
-# {"topic":"home/kitchen/temperature","payload":{"celsius":21.4},"encoding":"json","qos":0,"retained":false,"timestamp":"2026-09-27T17:52:30.19Z"}
-
-# raw payload only
-curl -H "Authorization: Bearer $KEY" "localhost:8080/api/v1/values/home/kitchen/temperature?format=raw"
-
-# publish
-curl -X POST -H "Authorization: Bearer $KEY" --data ON "localhost:8080/api/v1/publish/home/lamp/set?qos=1"
+export KEY=my-secret-key
+curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/status
+curl -H "Authorization: Bearer $KEY" "localhost:8080/api/v1/values?filter=%23&limit=20"   # %23 = '#'
+curl -X POST -H "Authorization: Bearer $KEY" --data ON localhost:8080/api/v1/publish/home/lamp/set
 ```
 
-## REST API
+## How it works
 
-Authenticate with `Authorization: Bearer <key>` or `X-API-Key: <key>` (plus `?api_key=` if `ALLOW_QUERY_API_KEY=true`).
+```mermaid
+flowchart LR
+    D1[Devices / PLCs / sensors] -- MQTT --> B[(MQTT broker)]
+    B -- "subscribe (e.g. #)" --> I
+    subgraph mqtt-get
+      I[MQTT client<br/>1..N connections] --> S[(Latest-value store<br/>256 shards, in memory)]
+      I --> R{Topic trie}
+      R --> Q1[Webhook queue 1] --> W1[Workers]
+      R --> Q2[Webhook queue 2] --> W2[Workers]
+      H[HTTP server<br/>REST · MCP · UI · metrics] --> S
+      H -- publish --> I
+    end
+    C[Apps, dashboards, scripts, AI agents] -- "GET / POST" --> H
+    W1 -- POST --> E1[Your webhook endpoints]
+    W2 -- POST --> E1
+```
 
-| Method & path | Scope | Description |
+1. mqtt-get subscribes to the filters you choose (default `#`, everything).
+2. Every message replaces the previous value for its topic in a sharded in-memory map. The payload is stored as-is and never copied again.
+3. The message is matched against webhook filters with a lock-free topic trie and put on each matching webhook's own bounded queue.
+4. HTTP requests read from the map, and publish requests go straight to the broker.
+
+Values live in memory. After a restart they are rebuilt as messages arrive, and **retained** messages are replayed by the broker immediately on subscribe. Configuration (broker settings, webhooks, API keys) is persisted to `DATA_DIR/state.json`.
+
+## Reading values (GET)
+
+### One topic
+
+```bash
+curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/home/kitchen/temperature
+```
+```json
+{"topic":"home/kitchen/temperature","payload":{"celsius":23.1,"humidity":51},"encoding":"json","qos":0,"retained":true,"timestamp":"2026-09-27T18:22:30.1788Z"}
+```
+
+`payload` is decoded according to `encoding`:
+
+| `encoding` | When | `payload` holds |
 |---|---|---|
-| `GET /api/v1/values/{topic...}` | read | Latest value of a topic. `?format=raw` returns only the payload. `?max_age=30s` returns 404 if the value is older than that. Metadata is also sent in `X-MQTT-*` headers. |
-| `GET /api/v1/values?topic=a/b` | read | Same, for topics that don't fit in a URL path (for example, a leading `/` or `//`). |
-| `GET /api/v1/values?filter=home/%2B/temp&limit=1000` | read | Latest values of all topics matching an MQTT filter. URL-encode `+` as `%2B` and `#` as `%23`. |
-| `GET /api/v1/topics?filter=…` | read | Topic names, payload sizes and timestamps. |
-| `DELETE /api/v1/values/{topic...}`, `DELETE /api/v1/values` | admin | Forget one topic, or all of them. |
-| `POST /api/v1/publish/{topic...}?qos=1&retain=true` | publish | The request body is the raw payload. |
-| `POST /api/v1/publish` | publish | JSON: `{"topic","payload","qos","retain","encoding"}` or an **array** of them. The messages are pipelined. A JSON string payload is sent as its text, and any other JSON value as its JSON encoding. Use `"encoding":"base64"` for binary. |
-| `GET/POST /api/v1/webhooks`, `GET/PUT/DELETE /api/v1/webhooks/{id}`, `POST /api/v1/webhooks/{id}/test` | admin | Manage webhooks. Responses include delivery stats. |
-| `GET/PUT /api/v1/broker`, `POST /api/v1/broker/reconnect` | admin | View or change the broker connection. |
-| `GET/POST /api/v1/keys`, `DELETE /api/v1/keys/{id}` | admin | Manage API keys. Only a SHA-256 hash of each key is stored. |
-| `GET /api/v1/status`, `GET /api/v1/whoami` | read / any | Status and the current key's identity. |
-| `GET /metrics` | read (or public with `METRICS_PUBLIC=true`) | Prometheus metrics. |
-| `GET /healthz` | none | Returns 200 when healthy, or 503 when a broker is configured but disconnected. |
-| `POST /mcp` | per tool | MCP endpoint (see below). |
+| `json` | The payload is valid JSON | The JSON value itself (object, number, string, …) |
+| `utf8` | Text that isn't JSON | A string |
+| `base64` | Binary | A base64 string |
 
-Secrets (passwords, private keys, webhook secrets, auth headers) come back as `********` in API responses. If you send `********` back in an update, the stored value is kept, so you can GET, edit and PUT safely.
+Options:
 
-Payload `encoding` in responses is `json` (embedded as-is), `utf8` (a string) or `base64` (binary).
+| Query | Effect |
+|---|---|
+| `?format=raw` | Return **only the payload bytes**, with a matching `Content-Type`. Ideal for shell scripts: `TEMP=$(curl -s …?format=raw)` |
+| `?max_age=30s` | Return **404** if the latest value is older than that (Go duration: `500ms`, `5m`, `1h`). Catches silent sensors. |
+| `?topic=/odd//name` | Alternative to the path, for topic names with a leading `/` or empty levels |
+
+Every response also carries `X-MQTT-Topic`, `X-MQTT-QoS`, `X-MQTT-Retained` and `X-MQTT-Timestamp` headers.
+
+### Many topics (wildcards)
+
+```bash
+# every temperature, one level of wildcard (+ must be URL-encoded as %2B, # as %23)
+curl -H "Authorization: Bearer $KEY" "localhost:8080/api/v1/values?filter=home/%2B/temperature"
+```
+```json
+{"total":3,"count":3,"values":[
+  {"topic":"home/bedroom/temperature","payload":{"celsius":19.8,"humidity":47},"encoding":"json","qos":0,"retained":true,"timestamp":"…"},
+  {"topic":"home/kitchen/temperature","payload":{"celsius":23.1,"humidity":51},"encoding":"json","qos":0,"retained":true,"timestamp":"…"},
+  {"topic":"home/livingroom/temperature","payload":{"celsius":21.4,"humidity":44},"encoding":"json","qos":0,"retained":true,"timestamp":"…"}]}
+```
+
+Results are sorted by topic. `limit` defaults to 1000 (max 100000); `total` is the number of matches before the limit. To list topic names only (with payload size and time), use `GET /api/v1/topics?filter=…`.
+
+### Recipes
+
+```bash
+# jq: the kitchen temperature as a number
+curl -s -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/home/kitchen/temperature | jq .payload.celsius
+
+# Python
+import requests
+v = requests.get("http://mqtt-get:8080/api/v1/values/home/kitchen/temperature",
+                 headers={"Authorization": "Bearer " + KEY}, timeout=2).json()
+print(v["payload"]["celsius"])
+```
+
+Grafana (Infinity data source), Home Assistant (`rest` sensor), Node-RED (`http request`), Excel or Google Sheets (`WEBSERVICE`/Apps Script) and most low-code tools can call these URLs directly. Use a **read-only key** for them.
+
+## Publishing (POST)
+
+### Raw body
+
+```bash
+curl -X POST -H "Authorization: Bearer $KEY" --data 'ON' \
+  "localhost:8080/api/v1/publish/home/lamp/set?qos=1&retain=true"
+# {"ok":true,"published":1}
+```
+
+The body is sent byte for byte, so binary data works too (`--data-binary @file.bin`).
+
+### JSON: one message or a batch
+
+```bash
+curl -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' localhost:8080/api/v1/publish -d '[
+  {"topic": "home/lamp/set",       "payload": "ON"},
+  {"topic": "home/thermostat/set", "payload": {"target": 21.5}, "qos": 1, "retain": true},
+  {"topic": "devices/42/firmware", "payload": "AAECAwQ=", "encoding": "base64", "qos": 1}
+]'
+# {"ok":true,"published":3}
+```
+
+- A **string** payload is sent as its text (`"ON"` → `ON`).
+- Any **other JSON value** is sent as its JSON text (`{"target":21.5}`).
+- `"encoding": "base64"` decodes the string into binary first.
+
+Batches are pipelined. All messages are handed to the broker first, then acknowledgements are awaited, so a batch of 1000 QoS 1 messages takes about one round trip instead of 1000. QoS 1/2 publishes return only after the broker acknowledges them (timeout `PUBLISH_TIMEOUT_MS`).
+
+If the broker is unreachable you get **503** `{"error":"not connected to MQTT broker"}`, and nothing is queued.
 
 ## Webhooks
 
+A webhook forwards every message that matches its topic filters to an HTTP endpoint.
+
+![webhooks](docs/images/ui-webhooks.png)
+
 ```bash
 curl -X POST -H "Authorization: Bearer $KEY" localhost:8080/api/v1/webhooks -d '{
-  "name": "alerts",
-  "url": "https://example.com/hook",
-  "topics": ["alarms/#", "home/+/smoke"],
-  "secret": "optional-hmac-secret",
-  "batch_size": 100, "batch_interval_ms": 200,
+  "name": "factory alarms → on-call",
+  "url": "https://example.com/hooks/alarms",
+  "topics": ["factory/+/+/alarm"],
+  "secret": "my-webhook-secret",
   "headers": {"Authorization": "Bearer downstream-token"}
 }'
 ```
 
-- `format: "json"` (default) sends the same envelope as the REST API. With `batch_size > 1` the body is `{"messages":[…]}`, flushed when the batch is full or after `batch_interval_ms`.
-- `format: "raw"` sends the payload as the body, with `X-MQTT-Topic`, `X-MQTT-QoS`, `X-MQTT-Retained` and `X-MQTT-Timestamp` headers.
-- **Signature**: when `secret` is set, requests carry `X-MQTT-Get-Timestamp: <unix>` and `X-MQTT-Get-Signature: sha256=HEX(HMAC_SHA256(secret, timestamp + "." + body))`.
-- **Retries**: network errors, 5xx, 408 and 429 are retried with exponential backoff (`max_retries`, default 3).
-- **Backpressure**: each webhook has its own bounded queue (`queue_size`, default 10000) and `concurrency` workers. A slow endpoint never slows down ingestion or other webhooks; when its queue is full, messages for that webhook are dropped and counted in `mqttget_webhook_dropped_total`.
-- Topic matching uses an immutable trie, so adding many webhooks doesn't slow down the hot path.
+### What your endpoint receives
 
-## MQTT authentication and connection options
+**`format: "json"` (default), one message per request:**
 
-| Method | How |
+```http
+POST /hooks/alarms
+Content-Type: application/json
+X-MQTT-Get-Webhook: 5a7c1f76200611bc
+X-MQTT-Get-Timestamp: 1790532483
+X-MQTT-Get-Signature: sha256=8d1c…
+
+{"topic":"factory/line1/press/alarm","payload":{"level":"warning","code":"OIL_TEMP_HIGH"},"encoding":"json","qos":0,"retained":false,"timestamp":"2026-09-27T18:22:30.1788Z"}
+```
+
+**With `batch_size > 1`**, up to that many messages go in each request. A request is sent when the batch is full or `batch_interval_ms` has passed:
+
+```json
+{"messages":[{"topic":"sensors/1/temp","payload":20.1,…},{"topic":"sensors/2/temp","payload":19.7,…}]}
+```
+
+**`format: "raw"`** sends the payload bytes as the body, with the metadata in headers (`X-MQTT-Topic`, `X-MQTT-QoS`, `X-MQTT-Retained`, `X-MQTT-Timestamp`). Handy for endpoints that expect exactly what the device sent.
+
+### Verifying signatures
+
+If `secret` is set, every request is signed as `HMAC-SHA256(secret, timestamp + "." + raw_body)`, hex-encoded. Both snippets below were tested against real deliveries.
+
+<details><summary>Python</summary>
+
+```python
+import hashlib, hmac, time
+
+SECRET = b"my-webhook-secret"
+
+def verify(headers, body: bytes) -> bool:
+    ts = headers.get("X-MQTT-Get-Timestamp", "")
+    sig = headers.get("X-MQTT-Get-Signature", "")
+    expected = "sha256=" + hmac.new(SECRET, ts.encode() + b"." + body, hashlib.sha256).hexdigest()
+    fresh = ts.isdigit() and abs(time.time() - int(ts)) < 300   # reject replays
+    return fresh and hmac.compare_digest(sig, expected)
+```
+</details>
+
+<details><summary>Node.js</summary>
+
+```js
+const crypto = require('crypto');
+const SECRET = 'my-webhook-secret';
+
+function verify(headers, rawBody /* Buffer */) {
+  const ts = headers['x-mqtt-get-timestamp'] || '';
+  const sig = headers['x-mqtt-get-signature'] || '';
+  const expected = 'sha256=' + crypto.createHmac('sha256', SECRET).update(ts + '.').update(rawBody).digest('hex');
+  const fresh = Math.abs(Date.now() / 1000 - Number(ts)) < 300; // reject replays
+  return fresh && sig.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+```
+</details>
+
+### Delivery guarantees
+
+| | |
 |---|---|
-| Anonymous | Just `MQTT_URL` |
-| Username / password, API tokens, JWT-as-password (for example, Azure SAS, or Google/AWS custom auth) | `MQTT_USERNAME`, `MQTT_PASSWORD` |
-| Rotating tokens or Docker secrets | `MQTT_PASSWORD_FILE`. The file is re-read on every reconnect. |
-| TLS (server verification) | `ssl://`, `mqtts://` or `wss://` URL, or `MQTT_TLS=true`. Custom CA via `MQTT_TLS_CA_FILE` or `MQTT_TLS_CA_PEM`. |
-| Mutual TLS / client certificates (for example, AWS IoT Core) | `MQTT_TLS_CERT_FILE` + `MQTT_TLS_KEY_FILE` (or `_PEM`) |
-| SNI / ALPN (for example, AWS IoT on port 443) | `MQTT_TLS_SERVER_NAME`, `MQTT_TLS_ALPN=x-amzn-mqtt-ca` |
-| Self-signed certificates (testing only) | `MQTT_TLS_INSECURE=true` |
-| MQTT over WebSockets, including auth headers | `ws://` or `wss://` URL + `MQTT_WS_HEADERS="Authorization: Bearer x"` |
-| Unix socket | `unix:///path/to/sock` |
-| Failover | Several URLs, comma-separated |
+| **Retries** | Network errors, HTTP 5xx, 408 and 429 are retried with exponential backoff (250 ms, 500 ms, 1 s, … up to 10 s), `max_retries` times (default 3). Other 4xx responses aren't retried. |
+| **Isolation** | Each webhook has its own queue (`queue_size`, default 10000) and `concurrency` workers (default 1). A slow or dead endpoint **never** slows down ingestion or other webhooks. |
+| **Backpressure** | When a webhook's queue is full, new messages for **that webhook** are dropped and counted (`dropped` in the UI and API, `mqttget_webhook_dropped_total`). Increase `batch_size`, `concurrency` or `queue_size` for high-volume topics. |
+| **Ordering** | With `concurrency: 1`, messages are delivered in the order received. |
+| **Durability** | Queues are in memory; messages still queued at shutdown are lost. mqtt-get is a bridge, not a message store. For guaranteed delivery, consume the broker directly with a persistent session. |
 
-Supported protocols are MQTT 3.1.1 (default) and 3.1. Default ports are 1883 and 8883. MQTT 5-only features such as enhanced (SASL-style) AUTH are not supported.
+**Test a webhook** without waiting for traffic: `POST /api/v1/webhooks/{id}/test` sends a sample message (or `{"topic": "...", "payload": ...}` if given) and returns the endpoint's result.
 
-## Configuration (environment variables)
+<details><summary>All webhook fields</summary>
 
-| Variable | Default | |
+| Field | Default | |
 |---|---|---|
-| `MQTT_URL` | – | Broker URL(s), comma-separated |
-| `MQTT_TOPICS` | `#` | Filters to subscribe to, comma-separated, each with an optional `:qos` suffix, e.g. `home/#:1,sensors/+` |
-| `MQTT_QOS` | `0` | Default subscription QoS |
-| `MQTT_CLIENT_ID` | `mqtt-get-<hostname>` | |
-| `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_PASSWORD_FILE` | | |
-| `MQTT_TLS`, `MQTT_TLS_CA_FILE`/`_PEM`, `MQTT_TLS_CERT_FILE`/`_PEM`, `MQTT_TLS_KEY_FILE`/`_PEM`, `MQTT_TLS_SERVER_NAME`, `MQTT_TLS_INSECURE`, `MQTT_TLS_ALPN` | | TLS options |
-| `MQTT_WS_HEADERS` | | `Name: value`, comma-separated |
-| `MQTT_PROTOCOL_VERSION` | `4` | `4` = 3.1.1, `3` = 3.1 |
-| `MQTT_CLEAN_SESSION` | `true` | |
-| `MQTT_KEEPALIVE_SEC`, `MQTT_CONNECT_TIMEOUT_SEC` | `30`, `10` | |
-| `MQTT_CONNECTIONS`, `MQTT_SHARED_GROUP` | `1`, – | Scale-out (see below) |
-| `API_KEYS` | – | Admin keys, comma-separated |
-| `API_KEYS_READ`, `API_KEYS_PUBLISH` | – | Read-only keys; read + publish keys |
-| `AUTH_DISABLED` | `false` | Turns off auth (only on trusted networks) |
-| `HTTP_ADDR` | `:8080` | |
-| `HTTP_TLS_CERT_FILE`, `HTTP_TLS_KEY_FILE` | – | Serve HTTPS |
-| `DATA_DIR` | `./data` | Where `state.json` (broker settings, webhooks, API key hashes) is saved |
-| `MAX_TOPICS` | `1000000` | Cap on stored topics, to protect memory |
-| `MAX_BODY_BYTES` | `1048576` | |
-| `PUBLISH_TIMEOUT_MS` | `5000` | |
-| `UI_ENABLED`, `MCP_ENABLED`, `METRICS_PUBLIC` | `true`, `true`, `false` | |
-| `CORS_ORIGINS` | – | e.g. `*` or `https://app.example.com` |
-| `ALLOW_QUERY_API_KEY` | `false` | |
-| `LOG_LEVEL`, `LOG_FORMAT` | `info`, `text` | `json` is also available for the format |
-| `PPROF_ADDR` | – | e.g. `127.0.0.1:6060` |
+| `url` | required | `http://` or `https://` |
+| `topics` | required | MQTT filters, e.g. `["alarms/#", "+/status"]` |
+| `name` | | Label shown in the UI |
+| `id` | generated | Set your own id if you like |
+| `method` | `POST` | `POST`, `PUT` or `PATCH` |
+| `format` | `json` | `json` or `raw` |
+| `headers` | | Extra request headers (values with auth-like names are redacted in responses) |
+| `secret` | | Turns on HMAC signatures |
+| `batch_size` | `1` | JSON format only |
+| `batch_interval_ms` | `200` | Maximum wait for a batch to fill |
+| `timeout_ms` | `5000` | Per request |
+| `max_retries` | `3` | |
+| `queue_size` | `10000` | |
+| `concurrency` | `1` | Parallel requests (ordering is only guaranteed at 1) |
+| `enabled` | `true` | Disable without deleting |
+</details>
 
-**Precedence:** broker settings saved through the UI, API or MCP are stored in `DATA_DIR/state.json` and take precedence over `MQTT_*` variables. Delete that `broker` entry (or the file) to go back to the environment. The dashboard shows which source is active.
+## Connecting to your broker
 
-## MCP (AI agents)
+### Supported authentication and transports
 
-`POST /mcp` implements the Model Context Protocol (Streamable HTTP, JSON responses). The tools are `get_latest_value`, `query_values`, `list_topics`, `publish`, `get_status`, `get_broker_config`, `configure_broker`, `list_webhooks`, `create_webhook`, `update_webhook`, `delete_webhook`, `test_webhook` and `create_api_key`. Each key only sees the tools its scopes allow.
+| Method | Configure with | Notes |
+|---|---|---|
+| Anonymous | `MQTT_URL` | |
+| Username + password | `MQTT_USERNAME`, `MQTT_PASSWORD` | Also used for **tokens** (JWT, SAS, API keys) sent as the password |
+| Rotating token / Docker secret | `MQTT_PASSWORD_FILE` | The file is **re-read on every reconnect**, so update the file and the next reconnect uses the new token |
+| TLS, public CA | `mqtts://host:8883` | Uses the system trust store |
+| TLS, private CA | `+ MQTT_TLS_CA_FILE` or `MQTT_TLS_CA_PEM` | Added to the system roots |
+| **Mutual TLS** | `+ MQTT_TLS_CERT_FILE` and `MQTT_TLS_KEY_FILE` (or `_PEM`) | RSA and ECDSA keys, PEM |
+| TLS name override (SNI) | `MQTT_TLS_SERVER_NAME` | When connecting by IP, or through a tunnel |
+| ALPN | `MQTT_TLS_ALPN` | e.g. `x-amzn-mqtt-ca` for AWS IoT on port 443 |
+| Self-signed, no verification | `MQTT_TLS_INSECURE=true` | Testing only |
+| TLS on a `tcp://` URL | `MQTT_TLS=true` | Upgrades `tcp://` / `mqtt://` URLs to TLS (default port 8883) |
+| MQTT over WebSocket | `ws://host/mqtt`, `wss://host/mqtt` | Include the broker's path (often `/mqtt`) |
+| WebSocket auth headers | `MQTT_WS_HEADERS="Authorization: Bearer x"` | For gateways and proxies |
+| Unix socket | `unix:///run/mosquitto.sock` | |
+| Failover | `MQTT_URL=ssl://a:8883,ssl://b:8883` | Tried in order |
+
+URL schemes: `tcp`, `mqtt`, `ssl`, `tls`, `mqtts`, `mqtt+ssl`, `tcps`, `ws`, `wss`, `unix`. Default ports are 1883 (plain) and 8883 (TLS). Protocols: MQTT **3.1.1** (default) and 3.1. MQTT 5-only features such as enhanced AUTH aren't supported; MQTT 5 brokers accept 3.1.1 clients.
+
+TLS settings can be given as **file paths** (good for mounted secrets) or **inline PEM** (good for the UI and API). If you set both, the PEM wins. TLS 1.2+ is enforced.
+
+### Recipes
+
+<details open><summary><b>Mosquitto</b></summary>
 
 ```bash
-# Claude Code
+MQTT_URL=mqtts://mosquitto.local:8883
+MQTT_USERNAME=bridge
+MQTT_PASSWORD=secret
+MQTT_TLS_CA_FILE=/certs/ca.crt
+# mTLS instead of / in addition to a password (listener with require_certificate true):
+MQTT_TLS_CERT_FILE=/certs/client.crt
+MQTT_TLS_KEY_FILE=/certs/client.key
+```
+Mosquitto 2.x supports `$share` for 3.1.1 clients, so `MQTT_CONNECTIONS` + `MQTT_SHARED_GROUP` work.
+</details>
+
+<details><summary><b>EMQX</b> (self-hosted or EMQX Cloud)</summary>
+
+```bash
+MQTT_URL=mqtts://xxxxxxxx.ala.eu-central-1.emqxsl.com:8883   # or ssl://emqx.local:8883
+MQTT_USERNAME=bridge
+MQTT_PASSWORD=secret
+# WebSocket alternative:  MQTT_URL=wss://…:8084/mqtt
+```
+Shared subscriptions are supported.
+</details>
+
+<details><summary><b>HiveMQ</b> (HiveMQ Cloud or self-hosted)</summary>
+
+```bash
+MQTT_URL=mqtts://xxxxxxxx.s1.eu.hivemq.cloud:8883
+MQTT_USERNAME=bridge
+MQTT_PASSWORD=secret
+# WebSocket alternative:  MQTT_URL=wss://xxxxxxxx.s1.eu.hivemq.cloud:8884/mqtt
+```
+HiveMQ Community Edition enforces TLS/mTLS on its listeners, but ships only an allow-all auth extension, so passwords aren't checked unless you add an auth extension.
+</details>
+
+<details><summary><b>NanoMQ</b></summary>
+
+```bash
+MQTT_URL=tls://nanomq.local:8883
+MQTT_USERNAME=bridge
+MQTT_PASSWORD=secret
+MQTT_TLS_CA_FILE=/certs/ca.crt
+```
+TLS requires NanoMQ's `-full` build (the default image has no TLS).
+</details>
+
+<details><summary><b>Coreflux</b></summary>
+
+```bash
+MQTT_URL=mqtts://coreflux.local:8883
+MQTT_USERNAME=bridge
+MQTT_PASSWORD=secret
+MQTT_TLS_CA_FILE=/certs/ca.crt
+```
+- **mTLS:** Coreflux pins client certificates rather than trusting a CA. Copy mqtt-get's client certificate as a `.pem` file into the broker's `ClientCertificateSourcePath` directory.
+- **Don't set `MQTT_SHARED_GROUP`:** Coreflux 2.14 rejects `$share/...` subscriptions. mqtt-get then reports `shared subscription rejected by broker …` in its status.
+- New Coreflux installs allow anonymous login by default.
+</details>
+
+<details><summary><b>AWS IoT Core</b> (mutual TLS)</summary>
+
+```bash
+MQTT_URL=mqtts://xxxxxxxxxxxxxx-ats.iot.eu-west-1.amazonaws.com:8883
+MQTT_CLIENT_ID=mqtt-get-bridge                 # must be allowed by your IoT policy
+MQTT_TLS_CERT_FILE=/certs/device.pem.crt
+MQTT_TLS_KEY_FILE=/certs/private.pem.key
+MQTT_TOPICS=factory/#                          # the policy must allow iot:Subscribe/Receive on these
+# Firewall only allows 443?  Use ALPN:
+# MQTT_URL=mqtts://xxxxxxxxxxxxxx-ats.iot.eu-west-1.amazonaws.com:443
+# MQTT_TLS_ALPN=x-amzn-mqtt-ca
+```
+Amazon's root CA is in standard system trust stores (including the Docker image), so `MQTT_TLS_CA_FILE` is usually unnecessary. If `MQTT_CONNECTIONS` > 1, each connection uses `<client_id>-<n>` as its client ID, so allow that pattern in the policy.
+</details>
+
+<details><summary><b>Azure IoT Hub</b> (SAS token)</summary>
+
+```bash
+MQTT_URL=mqtts://my-hub.azure-devices.net:8883
+MQTT_CLIENT_ID=my-device
+MQTT_USERNAME=my-hub.azure-devices.net/my-device/?api-version=2021-04-12
+MQTT_PASSWORD_FILE=/run/secrets/sas-token     # "SharedAccessSignature sr=…&sig=…&se=…"
+MQTT_TOPICS=devices/my-device/messages/devicebound/#
+```
+SAS tokens expire. Refresh the file (e.g. with a sidecar or cron job) and mqtt-get picks up the new token on the next reconnect. IoT Hub only lets a device subscribe to its own topics, so `#` isn't allowed.
+</details>
+
+<details><summary><b>Behind a WebSocket gateway</b> (e.g. an API gateway or Cloudflare Access)</summary>
+
+```bash
+MQTT_URL=wss://gateway.example.com/mqtt
+MQTT_WS_HEADERS="Authorization: Bearer eyJ…,X-Tenant: acme"
+```
+</details>
+
+### Choosing what to subscribe to
+
+`MQTT_TOPICS` defaults to `#` (everything). On busy brokers, narrow it to what you actually need. That reduces traffic and memory, and matters for brokers that restrict wildcard subscriptions:
+
+```bash
+MQTT_TOPICS="factory/+/+/status:1,factory/+/+/alarm:1,energy/#"   # ":1" sets QoS 1 for that filter
+```
+
+`$SYS/...` topics are only received if you subscribe to them explicitly (`$SYS/#`), because `#` never matches them.
+
+## Tested brokers
+
+mqtt-get ships with an **interoperability suite** that runs the full stack (REST, publish at every QoS, retained replay, binary payloads, wildcards, webhooks and negative auth checks) against real brokers. Last run: **320 passed, 0 failed**.
+
+| Broker | Version | TCP | Password | WS | TLS | mTLS | WSS | `$share` scale-out |
+|---|---|---|---|---|---|---|---|---|
+| Eclipse Mosquitto | 2.1.2 / 2.0.18 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| EMQX | 6.3.1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| HiveMQ CE | 2026.5 | ✅ | n/a | ✅ | ✅ | ✅ | ✅ | ✅ |
+| NanoMQ (`-full`) | 0.25.6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Coreflux | 2.14.3 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ not supported by broker |
+| mochi-mqtt | 2.7.9 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | – |
+
+Details, per-check results, broker configuration notes and instructions for running it against **your own broker** are in [`test/interop/README.md`](test/interop/README.md).
+
+## Configuration
+
+mqtt-get reads **environment variables** at startup. Broker settings can also be changed at runtime from the **web UI, REST API or MCP**. Those changes take effect immediately and are saved to `DATA_DIR/state.json`.
+
+> **Precedence:** once broker settings are saved from the UI, API or MCP, they **override** the `MQTT_*` variables on later restarts. The dashboard shows the active source (`env` or `saved`). To go back to environment-only configuration, delete the `broker` entry (or the whole file) from `state.json`.
+
+### MQTT connection
+
+| Variable | Default | Description |
+|---|---|---|
+| `MQTT_URL` | – | Broker URL(s), comma-separated for failover |
+| `MQTT_TOPICS` | `#` | Filters to subscribe to, comma-separated; each can end in `:0`, `:1` or `:2` |
+| `MQTT_QOS` | `0` | Default subscription QoS |
+| `MQTT_CLIENT_ID` | `mqtt-get-<hostname>` | Must be unique on the broker |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | – | |
+| `MQTT_PASSWORD_FILE` | – | Read on every (re)connect; trailing newline stripped |
+| `MQTT_PROTOCOL_VERSION` | `4` | `4` = MQTT 3.1.1, `3` = MQTT 3.1 |
+| `MQTT_CLEAN_SESSION` | `true` | |
+| `MQTT_KEEPALIVE_SEC` | `30` | |
+| `MQTT_CONNECT_TIMEOUT_SEC` | `10` | |
+| `MQTT_TLS` | `false` | Force TLS for `tcp://` / `mqtt://` URLs |
+| `MQTT_TLS_CA_FILE` / `MQTT_TLS_CA_PEM` | – | Extra trusted CA |
+| `MQTT_TLS_CERT_FILE` / `MQTT_TLS_CERT_PEM` | – | Client certificate (mTLS) |
+| `MQTT_TLS_KEY_FILE` / `MQTT_TLS_KEY_PEM` | – | Client private key (mTLS) |
+| `MQTT_TLS_SERVER_NAME` | – | SNI / verification name |
+| `MQTT_TLS_ALPN` | – | Comma-separated ALPN protocols |
+| `MQTT_TLS_INSECURE` | `false` | Skip server certificate verification |
+| `MQTT_WS_HEADERS` | – | `Name: value`, comma-separated |
+| `MQTT_CONNECTIONS` | `1` | Number of broker connections (see [scaling](#performance-and-scaling)) |
+| `MQTT_SHARED_GROUP` | – | Shared-subscription group spreading ingest over the connections |
+
+### Server
+
+| Variable | Default | Description |
+|---|---|---|
+| `HTTP_ADDR` | `:8080` | Listen address |
+| `HTTP_TLS_CERT_FILE` / `HTTP_TLS_KEY_FILE` | – | Serve HTTPS directly |
+| `API_KEYS` | – | Admin keys, comma-separated |
+| `API_KEYS_READ` | – | Read-only keys |
+| `API_KEYS_PUBLISH` | – | Read + publish keys |
+| `AUTH_DISABLED` | `false` | Turn off API authentication (trusted networks only) |
+| `ALLOW_QUERY_API_KEY` | `false` | Also accept `?api_key=` (for clients that can't set headers) |
+| `DATA_DIR` | `./data` | Where `state.json` is kept (`/data` in the Docker image) |
+| `MAX_TOPICS` | `1000000` | Memory guard: new topics beyond this are not stored (counted in metrics) |
+| `MAX_BODY_BYTES` | `1048576` | Maximum request body |
+| `PUBLISH_TIMEOUT_MS` | `5000` | Maximum wait for broker acknowledgement |
+| `UI_ENABLED` | `true` | Serve the web UI at `/` |
+| `MCP_ENABLED` | `true` | Serve MCP at `/mcp` |
+| `METRICS_PUBLIC` | `false` | Serve `/metrics` without an API key |
+| `CORS_ORIGINS` | – | e.g. `*` or `https://dash.example.com,https://app.example.com` |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `LOG_FORMAT` | `text` | `text` or `json` |
+| `PPROF_ADDR` | – | e.g. `127.0.0.1:6060` to enable Go profiling |
+
+### Configuring over the API
+
+`GET /api/v1/broker` returns the current settings, with secrets shown as `********`. Send the same document back with your changes to `PUT /api/v1/broker`. Any field still holding `********` keeps its stored value, so you never need to re-enter a password to change something else.
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" localhost:8080/api/v1/broker | jq .config > broker.json
+# edit broker.json …
+curl -X PUT -H "Authorization: Bearer $KEY" localhost:8080/api/v1/broker --data @broker.json
+```
+
+The broker document:
+
+```json
+{
+  "urls": ["mqtts://broker.example.com:8883"],
+  "client_id": "mqtt-get-prod",
+  "username": "bridge",
+  "password": "********",
+  "password_file": "",
+  "protocol_version": 4,
+  "clean_session": true,
+  "keepalive_sec": 30,
+  "connect_timeout_sec": 10,
+  "tls": {
+    "enabled": false, "ca_file": "", "ca_pem": "", "cert_file": "", "cert_pem": "",
+    "key_file": "", "key_pem": "", "server_name": "", "insecure_skip_verify": false, "alpn": []
+  },
+  "ws_headers": {},
+  "subscriptions": [{"filter": "#", "qos": 0}],
+  "connections": 1,
+  "shared_group": ""
+}
+```
+
+## Security and API keys
+
+Every API call needs a key, sent as `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+
+| Scope | Allows |
+|---|---|
+| `read` | Latest values, topic lists, status, metrics |
+| `publish` | Publishing (give it `read` too if the client also reads) |
+| `admin` | Everything, including broker settings, webhooks and API keys |
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_KEY" localhost:8080/api/v1/keys \
+  -d '{"name": "grafana", "scopes": ["read"]}'
+# {"key":"mg_7c1e…","info":{"id":"…","name":"grafana","prefix":"mg_7c1e4a…","scopes":["read"],…},"note":"store this key now; it cannot be retrieved again"}
+```
+
+- Only the **SHA-256 hash** of each key is stored; a key is shown once, when it's created.
+- Keys from environment variables are never written to disk and can't be deleted through the API.
+- A key can't delete itself, so you can't lock yourself out by accident.
+- Secrets (MQTT password, private key, webhook secrets, auth headers) are **never returned** by the API. They appear as `********`.
+
+**Production checklist**
+
+- [ ] Put mqtt-get behind HTTPS (reverse proxy, or `HTTP_TLS_CERT_FILE`/`HTTP_TLS_KEY_FILE`).
+- [ ] Use a **read-only** key for dashboards and a **publish** key for controllers; keep `admin` for people.
+- [ ] Give mqtt-get a broker account with ACLs limited to the topics it needs.
+- [ ] Use TLS (ideally mTLS) to the broker, and keep `MQTT_TLS_INSECURE` off.
+- [ ] Protect `DATA_DIR` (it holds broker credentials; the file is written with mode `0600`).
+- [ ] Set `UI_ENABLED=false` or `MCP_ENABLED=false` if you don't use them.
+- [ ] Sign webhooks (`secret`) and verify signatures on the receiving side.
+
+## Web UI
+
+Open `http://<host>:8080/` and sign in with an API key. The UI uses the same REST API, and what you can do depends on the key's scopes.
+
+| Dashboard | Explorer |
+|---|---|
+| ![dashboard](docs/images/ui-dashboard.png) | ![explorer](docs/images/ui-explorer.png) |
+
+- **Dashboard**: connection state, live message rate, counters, last error.
+- **Explorer**: browse latest values by filter (with auto-refresh), inspect a topic, copy its GET URL, publish messages.
+- **Broker**: every connection option, including pasting PEM certificates, with *Save & connect*.
+- **Webhooks**: create, edit, test and delete, with live delivered/failed/dropped counters and the last error.
+- **API keys**: create (shown once) and revoke.
+- **Help**: ready-to-paste `curl` and MCP snippets for this server.
+
+<details><summary>Broker settings screen</summary>
+
+![broker](docs/images/ui-broker.png)
+</details>
+
+## AI agents (MCP)
+
+mqtt-get is also a **Model Context Protocol** server, so an AI assistant can read sensor values, publish commands, and even set up the broker connection and webhooks, all limited by its API key's scopes.
+
+**Claude Code** (or any client that supports remote HTTP MCP servers):
+
+```bash
 claude mcp add --transport http mqtt http://localhost:8080/mcp --header "Authorization: Bearer $KEY"
 ```
 
-For stdio-only clients such as Claude Desktop, use the built-in bridge:
+**Claude Desktop** and other stdio-only clients use the built-in bridge (`mqtt-get mcp`):
 
 ```json
-{"mcpServers": {"mqtt": {"command": "mqtt-get", "args": ["mcp", "--url", "http://localhost:8080"],
-                         "env": {"MQTT_GET_API_KEY": "…"}}}}
+{
+  "mcpServers": {
+    "mqtt": {
+      "command": "/usr/local/bin/mqtt-get",
+      "args": ["mcp", "--url", "http://localhost:8080"],
+      "env": {"MQTT_GET_API_KEY": "mg_…"}
+    }
+  }
+}
 ```
+
+| Tool | Scope | |
+|---|---|---|
+| `get_latest_value` | read | Latest message on a topic |
+| `query_values` | read | Latest values matching a filter |
+| `list_topics` | read | Known topic names |
+| `get_status` | read | Connection and counters |
+| `publish` | publish | Send a message |
+| `get_broker_config` / `configure_broker` | admin | View or change the connection (partial updates) |
+| `list_webhooks` / `create_webhook` / `update_webhook` / `delete_webhook` / `test_webhook` | admin | Manage webhooks |
+| `create_api_key` | admin | Create a scoped key |
+
+An agent only sees the tools its key is allowed to use. Give assistants a **read-only** key unless you want them to act on your devices.
+
+## Monitoring
+
+| Endpoint | |
+|---|---|
+| `GET /healthz` | No auth. **200** when healthy; **503** when a broker is configured but no connection is up. Use it for readiness checks. |
+| `GET /metrics` | Prometheus text format (needs a `read` key unless `METRICS_PUBLIC=true`) |
+| `GET /api/v1/status` | JSON: connection state, last error, counters, `received_per_connection` |
+| `mqtt-get healthcheck` | CLI health check for images without curl (used by the Dockerfile `HEALTHCHECK`) |
+
+Metrics:
+
+| Metric | Type | |
+|---|---|---|
+| `mqttget_mqtt_connected` | gauge | 1 if at least one broker connection is up |
+| `mqttget_mqtt_connections_up` | gauge | |
+| `mqttget_messages_received_total` / `mqttget_bytes_received_total` | counter | Ingest |
+| `mqttget_messages_published_total` / `mqttget_publish_errors_total` | counter | Publishing via the API |
+| `mqttget_topics` | gauge | Topics held in memory |
+| `mqttget_topics_dropped_total` | counter | Messages not stored because `MAX_TOPICS` was reached |
+| `mqttget_webhook_{delivered,failed,dropped,requests}_total{webhook="id"}` | counter | Per webhook |
+| `mqttget_webhook_queue_length{webhook="id"}` | gauge | Rising steadily means the endpoint can't keep up |
+| `mqttget_heap_bytes`, `mqttget_goroutines` | gauge | |
+
+Suggested alerts: `mqttget_mqtt_connected == 0` for 1 minute; `rate(mqttget_webhook_dropped_total[5m]) > 0`; `rate(mqttget_topics_dropped_total[5m]) > 0`.
 
 ## Performance and scaling
 
-Design choices for the hot path:
+**What makes it fast**
 
-- Messages are handled on the connection's receive goroutine, with no goroutine per message.
-- The socket reads are buffered. The MQTT client library reads packet headers byte by byte; a 64 KiB read buffer saves about 30% CPU per message.
-- The latest-value store is sharded across 256 locks. Entries are immutable and shared with webhook queues without copying.
-- Webhook routing uses a lock-free trie that is swapped atomically when webhooks change.
+- Messages are handled on the connection's read loop, with no goroutine per message.
+- The socket is read through a 64 KiB buffer. The underlying MQTT library reads packet headers byte by byte, which cost several syscalls per message; buffering cut CPU per message by about 30% and removed message loss under load in our tests.
+- The value store is split into 256 locks, entries are immutable, and payloads are shared with webhook queues without copying.
+- Webhook matching uses a topic trie that's swapped atomically, so matching takes no locks.
 
-Measured on a 4-vCPU VM with Mosquitto, the load generator and mqtt-get all on the same machine:
+**Measured** on a 4-vCPU VM, with the broker (Mosquitto) and the load generator on the same machine:
 
-| | Result |
+| | |
 |---|---|
-| Ingest cost inside mqtt-get (store + webhook routing) | ~270 ns/message |
-| End-to-end, one connection, 64-byte payloads, 10k topics | ~225k msg/s with no loss. Mosquitto was the bottleneck; mqtt-get used ~4.3 µs of CPU per message, mostly in the MQTT client library. |
-| Memory | ~16 MB RSS with 10k topics |
+| mqtt-get's own cost per message (store + webhook routing) | **~270 ns** |
+| One connection, 64-byte payloads, 10k topics | **~225k msg/s, no loss.** Mosquitto (single-threaded) was the bottleneck. |
+| `GET` one value (in-process benchmark) | ~1.7 µs |
+| Memory with 10k topics | ~16 MB RSS |
 
-To go past one connection, set `MQTT_CONNECTIONS=N` and `MQTT_SHARED_GROUP=name`. mqtt-get then opens N connections that subscribe with `$share/name/<filter>`, and the broker load-balances messages across them, so ingest uses N cores. The store keeps the newest value per topic even if the connections deliver out of order. Without a shared group, the extra connections are only used to spread publish load.
-
-For millions of messages per second, run several instances, each subscribed to a slice of the topic tree (`MQTT_TOPICS`), and route HTTP by topic prefix. Or run one instance per shared-subscription group member when you only need webhooks.
-
-Benchmark your own setup:
+**Scaling up.** One connection is limited to roughly one CPU core. To spread ingest over several cores, open several connections in a **shared-subscription group**:
 
 ```bash
-go run ./cmd/loadgen -url tcp://broker:1883 -clients 4 -n 2000000 -topics 10000
-curl -s -H "Authorization: Bearer $KEY" localhost:8080/metrics | grep mqttget_messages_received_total
+MQTT_CONNECTIONS=4
+MQTT_SHARED_GROUP=mqtt-get
+```
+
+The broker then load-balances messages across the 4 connections (`$share/mqtt-get/<filter>`). In tests, 300 messages over 3 connections arrived exactly once, split `[100 100 100]` on Mosquitto, HiveMQ and NanoMQ and `[98 99 103]` on EMQX. If connections deliver out of order, the store still keeps the newest value per topic (by receive time). Without a shared group, the extra connections are only used for publishing.
+
+**Scaling out** to millions of messages per second:
+
+- **Partition by topic:** run several instances, each with a different `MQTT_TOPICS` slice (e.g. `site-a/#`, `site-b/#`), and route HTTP requests by path prefix at your reverse proxy.
+- **Webhook-only workers:** instances in the same `MQTT_SHARED_GROUP` split the stream between them. Each sees only part of the topics, so this suits webhook fan-out, not `GET`.
+- **Replicas for read availability:** several identical instances, each subscribed to everything, behind a load balancer. Each holds a full copy of the latest values. Configure webhooks on only **one** of them, or every replica will deliver each message.
+
+**Benchmark your own setup**
+
+```bash
+go run ./cmd/loadgen -url tcp://broker:1883 -clients 4 -n 2000000 -topics 10000 -size 64
+watch -n1 'curl -s -H "Authorization: Bearer $KEY" localhost:8080/metrics | grep messages_received'
 make bench   # micro-benchmarks
 ```
+
+## Deployment
+
+### Docker
+
+The image is built on `distroless/static:nonroot` (~10 MB), runs as a non-root user, stores state in the `/data` volume and has a built-in `HEALTHCHECK`.
+
+```bash
+docker build --build-arg VERSION=$(git describe --tags --always) -t mqtt-get .
+```
+
+Mount certificates read-only and point the `*_FILE` variables at them:
+
+```bash
+docker run -d -p 8080:8080 -v mqtt-get-data:/data -v $PWD/certs:/certs:ro \
+  -e MQTT_URL=mqtts://broker:8883 -e MQTT_TLS_CA_FILE=/certs/ca.crt \
+  -e MQTT_TLS_CERT_FILE=/certs/client.crt -e MQTT_TLS_KEY_FILE=/certs/client.key \
+  -e API_KEYS=… mqtt-get
+```
+
+### systemd
+
+```ini
+# /etc/systemd/system/mqtt-get.service
+[Unit]
+Description=mqtt-get MQTT to HTTP bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mqtt-get
+EnvironmentFile=/etc/mqtt-get.env
+Environment=DATA_DIR=/var/lib/mqtt-get
+StateDirectory=mqtt-get
+DynamicUser=yes
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: mqtt-get}
+spec:
+  replicas: 1                       # see "Scaling out" before adding replicas with webhooks
+  selector: {matchLabels: {app: mqtt-get}}
+  template:
+    metadata: {labels: {app: mqtt-get}}
+    spec:
+      containers:
+      - name: mqtt-get
+        image: registry.example.com/mqtt-get:1.0.0
+        ports: [{containerPort: 8080}]
+        envFrom: [{secretRef: {name: mqtt-get}}]      # MQTT_URL, MQTT_PASSWORD, API_KEYS, …
+        volumeMounts: [{name: data, mountPath: /data}]
+        readinessProbe: {httpGet: {path: /healthz, port: 8080}, periodSeconds: 5}
+        livenessProbe:  {tcpSocket: {port: 8080}, periodSeconds: 10}   # don't restart just because the broker is down
+        resources:
+          requests: {cpu: 100m, memory: 64Mi}
+          limits:   {memory: 512Mi}
+      volumes:
+      - name: data
+        persistentVolumeClaim: {claimName: mqtt-get-data}
+```
+
+Memory grows with the number of distinct topics and their payload sizes (roughly *topics × (topic length + payload + ~150 bytes)*). Size the limit accordingly and use `MAX_TOPICS` as a safety net.
+
+## Troubleshooting
+
+| Symptom (status or log) | Likely cause and fix |
+|---|---|
+| `connect failed: not Authorized` / `bad user name or password` | Wrong credentials, or the broker requires a client certificate. |
+| `x509: certificate signed by unknown authority` | The broker uses a private CA: set `MQTT_TLS_CA_FILE`. |
+| `x509: certificate is valid for X, not Y` | You connect by a different name or IP than the certificate: set `MQTT_TLS_SERVER_NAME=X`. |
+| `remote error: tls: certificate required` / connection reset right after connecting | The listener requires mTLS: set `MQTT_TLS_CERT_FILE` and `MQTT_TLS_KEY_FILE`. |
+| `tls: client certificate: …` at startup | The certificate and key don't match, or aren't PEM. |
+| `connect failed: network Error : EOF` on a TLS port | You used `tcp://` against a TLS listener: use `mqtts://` or `MQTT_TLS=true`. |
+| `subscription rejected by broker (check ACLs): …` | The broker account may not subscribe to that filter (common with `#`): narrow `MQTT_TOPICS`. |
+| `shared subscription rejected by broker …` | The broker doesn't support `$share` (e.g. Coreflux): clear `MQTT_SHARED_GROUP`. |
+| Connected but no values | Check `MQTT_TOPICS`; remember `#` doesn't include `$SYS/...`; check broker ACLs. |
+| Another client gets disconnected when mqtt-get connects | Duplicate client ID: set a unique `MQTT_CLIENT_ID`. |
+| `GET` returns 404 for a topic you can see | Topic names are case-sensitive and exact. URL-encode special characters, or use `?topic=`. |
+| Webhook `dropped` increasing | The endpoint is too slow: raise `batch_size`, `concurrency` or `queue_size`. |
+| Changes to `MQTT_*` variables are ignored | Settings were saved from the UI or API and take precedence (see [Configuration](#configuration)). |
+| `503 not connected to MQTT broker` on publish | The broker is unreachable. mqtt-get reconnects automatically (retry every 2 s, backoff up to 30 s). |
+
+Set `LOG_LEVEL=debug` for connection-attempt and webhook-delivery details.
+
+## API reference
+
+All endpoints are under `/api/v1` and take and return JSON unless noted. Errors look like `{"error": "message"}`.
+
+| Method | Path | Scope | Description |
+|---|---|---|---|
+| GET | `/values/{topic...}` | read | Latest value (`?format=raw`, `?max_age=`) |
+| GET | `/values?topic=…` | read | Same, topic as a query parameter |
+| GET | `/values?filter=…&limit=…` | read | Latest values matching a filter |
+| GET | `/topics?filter=…&limit=…` | read | Topic names, sizes, timestamps |
+| DELETE | `/values/{topic...}` | admin | Forget one topic |
+| DELETE | `/values` | admin | Forget all topics |
+| POST | `/publish/{topic...}?qos=&retain=` | publish | Publish the raw body |
+| POST | `/publish` | publish | Publish JSON (object or array) |
+| GET | `/webhooks` | admin | List (with stats) |
+| POST | `/webhooks` | admin | Create |
+| GET · PUT · DELETE | `/webhooks/{id}` | admin | Read, replace, delete |
+| POST | `/webhooks/{id}/test` | admin | Send a test delivery |
+| GET · PUT | `/broker` | admin | Broker settings and status |
+| POST | `/broker/reconnect` | admin | Force a reconnect |
+| GET · POST | `/keys` | admin | List or create API keys |
+| DELETE | `/keys/{id}` | admin | Revoke |
+| GET | `/status` | read | Service status |
+| GET | `/whoami` | any | The calling key's name and scopes |
+| GET | `/healthz` | none | Health (outside `/api/v1`) |
+| GET | `/metrics` | read | Prometheus (outside `/api/v1`) |
+| POST | `/mcp` | per tool | MCP endpoint (outside `/api/v1`) |
+
+Status codes: `200`/`201`/`204` success · `400` invalid input · `401` missing or invalid key · `403` key lacks the scope · `404` unknown topic or id · `409` duplicate webhook id · `413` body too large · `502` broker or webhook error · `503` not connected to the broker.
+
+CLI: `mqtt-get [serve]` (default) · `mqtt-get mcp --url … --key …` · `mqtt-get healthcheck` · `mqtt-get version`.
 
 ## Development
 
 ```bash
-make test    # go vet + race-enabled tests; the integration tests use an embedded broker
-make build   # bin/mqtt-get
+make test        # go vet + unit and integration tests with the race detector
+make build       # bin/mqtt-get
+make bench       # micro-benchmarks
+make interop-up && make interop && make interop-down   # real-broker suite (Docker)
 ```
 
-Layout: `cmd/mqtt-get` (entry point, stdio MCP bridge, healthcheck), `cmd/loadgen`, and under `internal/`: `mqttc` (broker connections and auth), `store` (latest values), `topic` (matching and trie), `webhook`, `state` (persistence and API keys), `config`, `api` (REST, MCP, metrics, embedded UI).
+The regular tests need nothing installed. They start embedded MQTT brokers (plain, TLS, mTLS, WS and WSS, with generated certificates) and cover auth, TLS verification, SNI, password-file rotation, the REST API, webhooks and MCP.
+
+```
+cmd/mqtt-get        entry point, stdio MCP bridge, healthcheck
+cmd/loadgen         MQTT load generator
+internal/mqttc      broker connections: auth, TLS, dialing, publish, reconnect
+internal/store      sharded latest-value store + JSON encoding
+internal/topic      MQTT topic validation, matching, filter trie
+internal/webhook    webhook queues, batching, retries, signatures
+internal/state      persisted settings, webhooks and API keys
+internal/config     configuration model and environment parsing
+internal/api        REST, MCP, metrics and the embedded web UI (api/ui/index.html)
+test/interop        real-broker interoperability suite + docker-compose
+```
+
+**Limitations** (by design, for now): MQTT 5-only features (enhanced AUTH, user properties, topic aliases) aren't used; values and webhook queues live in memory; there is no history, only the latest value per topic.

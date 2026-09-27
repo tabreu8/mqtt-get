@@ -1,0 +1,49 @@
+# Brokers for the mqtt-get interoperability suite. See README.md.
+#   ./gen-certs.sh && docker compose up -d
+#   MQTT_INTEROP_CONFIG=$PWD/brokers.json go test ./... (from this directory)
+# Every container listens on the same port inside and outside so a single
+# brokers.json works for both Docker and bare-metal brokers.
+x-certs: &certs ./certs:/certs:ro
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    volumes: [*certs, ./configs/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro]
+    ports: ["11883:11883", "11884:11884", "11083:11083", "11893:11893", "11894:11894", "11094:11094"]
+
+  emqx:
+    image: emqx/emqx:latest
+    env_file: ./configs/emqx.env
+    volumes: [*certs]
+    ports: ["21883:21883", "21083:21083", "21893:21893", "21894:21894", "21094:21094", "21081:21081"]
+
+  hivemq:
+    image: hivemq/hivemq-ce:latest
+    volumes: [*certs, ./configs/hivemq.xml:/opt/hivemq/conf/config.xml:ro]
+    ports: ["31883:31883", "31083:31083", "31893:31893", "31894:31894", "31094:31094"]
+
+  nanomq-a:
+    image: emqx/nanomq:latest-full
+    entrypoint: ["nanomq", "start", "--conf", "/configs/nanomq-a.conf"]
+    volumes: [*certs, ./configs:/configs:ro]
+    ports: ["41883:41883", "41083:41083", "41893:41893", "41094:41094"]
+
+  nanomq-b:
+    image: emqx/nanomq:latest-full
+    entrypoint: ["nanomq", "start", "--conf", "/configs/nanomq-b.conf"]
+    volumes: [*certs, ./configs:/configs:ro]
+    ports: ["42883:42883", "42894:42894"]
+
+  coreflux-a:
+    image: coreflux/coreflux-mqtt-broker:latest
+    command: ["--config", "/configs/coreflux-a.json", "--config-force", "--users", "/certs/users.json", "--users-force"]
+    environment: {COREFLUX_DISABLE_PYTHON: "true"}
+    volumes: [*certs, ./configs:/configs:ro]
+    ports: ["51883:51883", "51083:51083", "51893:51893", "51094:51094"]
+
+  coreflux-b:
+    image: coreflux/coreflux-mqtt-broker:latest
+    command: ["--config", "/configs/coreflux-b.json", "--config-force"]
+    environment: {COREFLUX_DISABLE_PYTHON: "true"}
+    volumes: [*certs, ./configs:/configs:ro]
+    ports: ["52883:52883", "52894:52894"]

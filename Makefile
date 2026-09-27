@@ -12,3 +12,12 @@ docker:
 	docker build --build-arg VERSION=$(VERSION) -t mqtt-get:$(VERSION) .
 run: build
 	./bin/mqtt-get
+
+# --- broker interoperability suite (needs Docker) ---
+.PHONY: interop-up interop interop-down
+interop-up:
+	cd test/interop && ./gen-certs.sh && docker compose up -d && sleep 20
+interop:
+	cd test/interop && MQTT_INTEROP_CONFIG=$$PWD/brokers.json go test -v -count=1 .
+interop-down:
+	cd test/interop && docker compose down

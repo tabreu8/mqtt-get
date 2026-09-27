@@ -58,6 +58,9 @@ func (s *Server) ingest(e *store.Entry) {
 	s.hooks.Dispatch(e)
 }
 
+// MQTTStatus returns the broker connection status.
+func (s *Server) MQTTStatus() mqttc.Status { return s.mqtt.Status() }
+
 // Store exposes the value store (tests).
 func (s *Server) Store() *store.Store { return s.store }
 

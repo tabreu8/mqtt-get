@@ -1,0 +1,44 @@
+{
+  "ca_file": "certs/ca.crt",
+  "client_cert_file": "certs/client.crt",
+  "client_key_file": "certs/client.key",
+  "brokers": [
+    {"name": "mosquitto", "endpoints": [
+      {"name": "tcp-anonymous", "url": "tcp://127.0.0.1:11883", "shared_subscriptions": true},
+      {"name": "tcp-password", "url": "mqtt://127.0.0.1:11884", "username": "mg", "password": "mg-pass", "wrong_password_rejected": true},
+      {"name": "ws", "url": "ws://127.0.0.1:11083"},
+      {"name": "tls", "url": "mqtts://127.0.0.1:11893", "tls": "ca"},
+      {"name": "mtls", "url": "mqtts://127.0.0.1:11894", "tls": "mtls", "no_client_cert_rejected": true},
+      {"name": "wss", "url": "wss://127.0.0.1:11094", "tls": "ca"}
+    ]},
+    {"name": "emqx", "endpoints": [
+      {"name": "tcp-password", "url": "tcp://127.0.0.1:21883", "username": "mg", "password": "mg-pass", "wrong_password_rejected": true, "shared_subscriptions": true},
+      {"name": "ws-password", "url": "ws://127.0.0.1:21083/mqtt", "username": "mg", "password": "mg-pass"},
+      {"name": "tls-password", "url": "ssl://127.0.0.1:21893", "tls": "ca", "username": "mg", "password": "mg-pass"},
+      {"name": "mtls-password", "url": "mqtts://127.0.0.1:21894", "tls": "mtls", "username": "mg", "password": "mg-pass", "no_client_cert_rejected": true},
+      {"name": "wss-password", "url": "wss://127.0.0.1:21094/mqtt", "tls": "ca", "username": "mg", "password": "mg-pass"}
+    ]},
+    {"name": "hivemq-ce", "endpoints": [
+      {"name": "tcp", "url": "tcp://127.0.0.1:31883", "shared_subscriptions": true},
+      {"name": "ws", "url": "ws://127.0.0.1:31083/mqtt"},
+      {"name": "tls", "url": "mqtts://127.0.0.1:31893", "tls": "ca"},
+      {"name": "mtls", "url": "mqtts://127.0.0.1:31894", "tls": "mtls", "no_client_cert_rejected": true},
+      {"name": "wss-mtls", "url": "wss://127.0.0.1:31094/mqtt", "tls": "mtls"}
+    ]},
+    {"name": "nanomq", "endpoints": [
+      {"name": "tcp-password", "url": "tcp://127.0.0.1:41883", "username": "mg", "password": "mg-pass", "wrong_password_rejected": true, "shared_subscriptions": true},
+      {"name": "ws-password", "url": "ws://127.0.0.1:41083/mqtt", "username": "mg", "password": "mg-pass"},
+      {"name": "tls-password", "url": "tls://127.0.0.1:41893", "tls": "ca", "username": "mg", "password": "mg-pass"},
+      {"name": "wss-password", "url": "wss://127.0.0.1:41094/mqtt", "tls": "ca", "username": "mg", "password": "mg-pass"},
+      {"name": "mtls", "url": "mqtts://127.0.0.1:42894", "tls": "mtls", "no_client_cert_rejected": true}
+    ]},
+    {"name": "coreflux", "endpoints": [
+      {"name": "tcp-password", "url": "tcp://127.0.0.1:51883", "username": "mg", "password": "mg-pass", "wrong_password_rejected": true,
+       "shared_subscriptions": true, "skip": {"shared_subscriptions": "Coreflux 2.14 rejects $share/ subscriptions (SUBACK 0x80) for every user"}},
+      {"name": "ws-password", "url": "ws://127.0.0.1:51083/mqtt", "username": "mg", "password": "mg-pass"},
+      {"name": "tls-password", "url": "mqtts://127.0.0.1:51893", "tls": "ca", "username": "mg", "password": "mg-pass"},
+      {"name": "wss-password", "url": "wss://127.0.0.1:51094/mqtt", "tls": "ca", "username": "mg", "password": "mg-pass"},
+      {"name": "mtls", "url": "mqtts://127.0.0.1:52894", "tls": "mtls", "no_client_cert_rejected": true}
+    ]}
+  ]
+}

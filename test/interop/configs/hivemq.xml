@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!-- HiveMQ Community Edition. CE only ships the allow-all auth extension,
+     so username/password is not enforced; TLS and mTLS are. -->
+<hivemq>
+  <listeners>
+    <tcp-listener><port>31883</port><bind-address>0.0.0.0</bind-address></tcp-listener>
+    <websocket-listener><port>31083</port><bind-address>0.0.0.0</bind-address><path>/mqtt</path><subprotocols><subprotocol>mqttv3.1</subprotocol><subprotocol>mqtt</subprotocol></subprotocols><allow-extensions>true</allow-extensions></websocket-listener>
+    <tls-tcp-listener><port>31893</port><bind-address>0.0.0.0</bind-address>
+      <tls><keystore><path>/certs/server.pfx</path><password>changeit</password><private-key-password>changeit</private-key-password></keystore><client-authentication-mode>NONE</client-authentication-mode></tls></tls-tcp-listener>
+    <tls-tcp-listener><port>31894</port><bind-address>0.0.0.0</bind-address>
+      <tls><keystore><path>/certs/server.pfx</path><password>changeit</password><private-key-password>changeit</private-key-password></keystore><truststore><path>/certs/trust.p12</path><password>changeit</password></truststore><client-authentication-mode>REQUIRED</client-authentication-mode></tls></tls-tcp-listener>
+    <tls-websocket-listener><port>31094</port><bind-address>0.0.0.0</bind-address><path>/mqtt</path><subprotocols><subprotocol>mqttv3.1</subprotocol><subprotocol>mqtt</subprotocol></subprotocols><allow-extensions>true</allow-extensions>
+      <tls><keystore><path>/certs/server.pfx</path><password>changeit</password><private-key-password>changeit</private-key-password></keystore><truststore><path>/certs/trust.p12</path><password>changeit</password></truststore><client-authentication-mode>REQUIRED</client-authentication-mode></tls></tls-websocket-listener>
+  </listeners>
+  <anonymous-usage-statistics><enabled>false</enabled></anonymous-usage-statistics>
+</hivemq>
