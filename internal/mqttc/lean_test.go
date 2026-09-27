@@ -28,6 +28,9 @@ type fakeBroker struct {
 	script func(c net.Conn, r *bufio.Reader)
 	// connack return code (0 = accepted).
 	rc byte
+	// v5 speaks MQTT 5: CONNACK carries connackProps, SUBACK has properties.
+	v5           bool
+	connackProps []byte
 }
 
 func newFakeBroker(t *testing.T, script func(c net.Conn, r *bufio.Reader)) *fakeBroker {
@@ -67,7 +70,11 @@ func (f *fakeBroker) serve() {
 			if h, _, err := readPacket(r, nil); err != nil || h>>4 != pConnect {
 				return
 			}
-			_, _ = c.Write([]byte{pConnack << 4, 2, 0, f.rc})
+			if f.v5 {
+				_, _ = c.Write(packet(pConnack<<4, append(appendVarint([]byte{0, f.rc}, len(f.connackProps)), f.connackProps...)))
+			} else {
+				_, _ = c.Write([]byte{pConnack << 4, 2, 0, f.rc})
+			}
 			if f.rc != 0 {
 				return
 			}
@@ -75,7 +82,11 @@ func (f *fakeBroker) serve() {
 			if err != nil || h>>4 != pSubscribe {
 				return
 			}
-			_, _ = c.Write([]byte{pSuback << 4, 3, body[0], body[1], 1})
+			if f.v5 {
+				_, _ = c.Write([]byte{pSuback << 4, 4, body[0], body[1], 0, 1})
+			} else {
+				_, _ = c.Write([]byte{pSuback << 4, 3, body[0], body[1], 1})
+			}
 			if f.script != nil {
 				f.script(c, r)
 			}

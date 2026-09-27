@@ -50,8 +50,9 @@ type Status struct {
 	FiltersPerConnection [][]string `json:"filters_per_connection,omitempty"`
 }
 
-// link is one broker connection. Implementations: v3link (MQTT 3.1/3.1.1)
-// and v5link (MQTT 5).
+// link is one broker connection. Implementations: leanlink (the default,
+// MQTT 3.1/3.1.1/5), and with client "paho" v3link (MQTT 3.1/3.1.1) and
+// v5link (MQTT 5).
 type link interface {
 	start()
 	stop()
@@ -122,7 +123,7 @@ func (m *Manager) Apply(cfg config.Broker) error {
 	m.links = make([]link, cfg.Connections)
 	for i := range m.links {
 		switch {
-		case cfg.ProtocolVersion == 5:
+		case cfg.Client == config.ClientPaho && cfg.ProtocolVersion == 5:
 			m.links[i] = newV5(m, cfg, tlsCfg, i)
 		case cfg.Client == config.ClientPaho:
 			m.links[i] = newV3(m, cfg, tlsCfg, i)
@@ -143,12 +144,12 @@ func (m *Manager) Apply(cfg config.Broker) error {
 
 func clientName(cfg config.Broker) string {
 	switch {
+	case cfg.Client != config.ClientPaho:
+		return "lean"
 	case cfg.ProtocolVersion == 5:
 		return "paho.golang"
-	case cfg.Client == config.ClientPaho:
-		return "paho"
 	}
-	return "lean"
+	return "paho"
 }
 
 func protocolName(v uint) string {

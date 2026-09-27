@@ -11,16 +11,16 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
 	"github.com/tabreu8/mqtt-get/internal/store"
 )
 
-// leanlink is a compact MQTT 3.1 / 3.1.1 client built for ingest speed.
+// leanlink is a compact MQTT 3.1 / 3.1.1 / 5 client built for ingest speed.
 //
 // The general-purpose client passes every message through several
 // goroutines and channels and allocates 4-5 objects per message. Here the
@@ -34,8 +34,12 @@ import (
 // tracking), keepalive with a dead-connection watchdog, automatic reconnect
 // with backoff and failover across URLs, resubscribe on reconnect, and every
 // transport and auth method of the shared dialer (TLS, mTLS, websockets,
-// password files). Not supported: persisting in-flight messages across
-// restarts (like the default in-memory store of the paho client) and wills.
+// password files). MQTT 5 adds message properties (see lean5.go), inbound
+// topic aliases, reason codes, server-side limits (Receive Maximum, Maximum
+// QoS, Retain Available, Maximum Packet Size, Server Keep Alive) and session
+// expiry. Not supported: persisting in-flight messages across restarts (like
+// the default in-memory store of the paho client), wills and MQTT 5
+// enhanced authentication (AUTH).
 type leanlink struct {
 	m        *Manager
 	cfg      config.Broker
@@ -43,6 +47,12 @@ type leanlink struct {
 	headers  http.Header
 	clientID string
 	subs     []config.Subscription
+	v5       bool
+	aliasMax uint16 // topic aliases the broker may use towards us (v5)
+
+	// aliases maps inbound topic aliases (v5) for the current connection.
+	// Only touched by the read loop; reset on every connection.
+	aliases map[uint16]string
 
 	ctr  counters
 	up   atomic.Bool
@@ -58,11 +68,18 @@ type leanlink struct {
 	pending  map[uint16]*pending
 	nextID   uint16
 	inflight map[uint16]bool // inbound QoS 2 ids between PUBLISH and PUBREL
+	// Broker limits from the v5 CONNACK (permissive defaults for v3).
+	quota     chan struct{} // one slot per unacknowledged QoS 1/2 publish (v5 Receive Maximum)
+	maxQoS    byte
+	retainOK  bool
+	maxPacket int // 0 = unlimited
 }
 
 type pending struct {
-	done  chan error
-	codes chan []byte // SUBACK return codes
+	done   chan error
+	codes  chan []byte   // SUBACK return codes
+	reason string        // SUBACK reason string (v5), set before codes is sent
+	quota  chan struct{} // slot to release when acknowledged (v5)
 }
 
 // Packet types.
@@ -88,7 +105,10 @@ var connackErrors = map[byte]string{
 
 func newLean(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *leanlink {
 	l := &leanlink{m: m, cfg: cfg, tlsCfg: tlsCfg, clientID: clientIDFor(cfg, idx), subs: cfg.SubscriptionsFor(idx),
-		quit: make(chan struct{}), done: make(chan struct{})}
+		quit: make(chan struct{}), done: make(chan struct{}), v5: cfg.ProtocolVersion == 5, aliasMax: defaultTopicAliasMaximum}
+	if cfg.TopicAliasMaximum != nil {
+		l.aliasMax = *cfg.TopicAliasMaximum
+	}
 	if len(cfg.WSHeaders) > 0 {
 		l.headers = http.Header{}
 		for k, v := range cfg.WSHeaders {
@@ -194,7 +214,21 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 		conn.Close()
 		return false, fmt.Errorf("expected CONNACK, got packet type %d", h>>4)
 	}
-	if rc := body[1]; rc != 0 {
+	ca := connack{serverKeepAlive: -1, receiveMaximum: 65535, maximumQoS: 2, retainAvailable: true}
+	if l.v5 {
+		props, _, perr := splitProps(body[2:])
+		if perr == nil {
+			ca, perr = parseConnack(props)
+		}
+		if rc := body[1]; rc != 0 {
+			conn.Close()
+			return false, errors.New(reasonText(rc, ca.reason))
+		}
+		if perr != nil {
+			conn.Close()
+			return false, fmt.Errorf("CONNACK: %w", perr)
+		}
+	} else if rc := body[1]; rc != 0 {
 		conn.Close()
 		if s, ok := connackErrors[rc]; ok {
 			return false, errors.New(s)
@@ -202,11 +236,24 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 		return false, fmt.Errorf("connection refused (code %d)", rc)
 	}
 	_ = conn.SetDeadline(time.Time{})
+	ka := time.Duration(l.cfg.KeepAliveSec) * time.Second
+	if ca.serverKeepAlive >= 0 { // the broker overrides our keepalive
+		ka = time.Duration(ca.serverKeepAlive) * time.Second
+	}
+	if ca.assignedClientID != "" {
+		l.m.log.Info("mqtt: broker assigned client id", "client_id", ca.assignedClientID)
+	}
 
 	l.mu.Lock()
 	l.conn, l.w = conn, w
 	l.pending = map[uint16]*pending{}
 	l.inflight = map[uint16]bool{}
+	l.quota = nil
+	if l.v5 {
+		l.quota = make(chan struct{}, ca.receiveMaximum)
+	}
+	l.maxQoS, l.retainOK, l.maxPacket = ca.maximumQoS, ca.retainAvailable, ca.maximumPacket
+	l.aliases = nil
 	l.mu.Unlock()
 	l.lastRecv.Store(time.Now().UnixNano())
 	l.up.Store(true)
@@ -219,11 +266,10 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 		l.mu.Lock()
 		conn.Close()
 		l.conn, l.w = nil, nil
-		for id, p := range l.pending {
-			if p.done != nil {
+		for id := range l.pending {
+			if p := l.takeLocked(id); p.done != nil {
 				p.done <- ErrNotConnected
 			}
-			delete(l.pending, id)
 		}
 		l.mu.Unlock()
 	}()
@@ -232,7 +278,7 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 			return true, err
 		}
 	}
-	if ka := time.Duration(l.cfg.KeepAliveSec) * time.Second; ka > 0 {
+	if ka > 0 {
 		go l.keepalive(conn, ka, sessionDone)
 	}
 	return true, l.readLoop(r)
@@ -240,8 +286,11 @@ func (l *leanlink) session(u *url.URL) (wasUp bool, err error) {
 
 func (l *leanlink) connectPacket() []byte {
 	name, level := "MQTT", byte(4)
-	if l.cfg.ProtocolVersion == 3 {
+	switch l.cfg.ProtocolVersion {
+	case 3:
 		name, level = "MQIsdp", 3
+	case 5:
+		level = 5
 	}
 	var flags byte
 	if l.cfg.UseCleanSession() {
@@ -261,6 +310,16 @@ func (l *leanlink) connectPacket() []byte {
 	b = appendStr(b, name)
 	b = append(b, level, flags)
 	b = binary.BigEndian.AppendUint16(b, uint16(l.cfg.KeepAliveSec))
+	if l.v5 {
+		// Receive Maximum is left at its default (65535): messages are
+		// handled as they are read, so there is no queue to protect.
+		var pb []byte
+		if l.cfg.SessionExpirySec > 0 {
+			pb = binary.BigEndian.AppendUint32(append(pb, propSessionExpiry), l.cfg.SessionExpirySec)
+		}
+		pb = binary.BigEndian.AppendUint16(append(pb, propTopicAliasMaximum), l.aliasMax)
+		b = append(appendVarint(b, len(pb)), pb...)
+	}
 	b = appendStr(b, l.clientID)
 	if user != "" {
 		b = appendStr(b, user)
@@ -278,6 +337,9 @@ func (l *leanlink) subscribe() error {
 	p := &pending{codes: make(chan []byte, 1)}
 	l.pending[id] = p
 	b = binary.BigEndian.AppendUint16(b, id)
+	if l.v5 {
+		b = append(b, 0) // no properties
+	}
 	for _, s := range l.subs {
 		b = appendStr(b, s.Filter)
 		b = append(b, s.QoS)
@@ -295,7 +357,11 @@ func (l *leanlink) subscribe() error {
 		case codes := <-p.codes:
 			for i, c := range codes {
 				if c >= 0x80 && i < len(l.subs) {
-					l.m.subscriptionRejected(l.subs[i].Filter, "")
+					reason := ""
+					if l.v5 {
+						reason = reasonText(c, p.reason)
+					}
+					l.m.subscriptionRejected(l.subs[i].Filter, reason)
 				}
 			}
 		case <-time.After(30 * time.Second):
@@ -359,7 +425,9 @@ func (l *leanlink) readLoop(r *bufio.Reader) error {
 			if _, err := io.ReadFull(r, body); err != nil {
 				return err
 			}
-			l.control(h, body)
+			if err := l.control(h, body); err != nil {
+				return err
+			}
 			continue
 		}
 		// PUBLISH: one allocation holds topic and payload.
@@ -376,13 +444,37 @@ func (l *leanlink) readLoop(r *bufio.Reader) error {
 		if qos > 0 {
 			p += 2
 		}
-		if tl == 0 || p > n {
+		if (tl == 0 && !l.v5) || p > n {
 			return errors.New("malformed PUBLISH")
 		}
-		topic := unsafe.String(&buf[2], tl) // buf is never modified again
+		topic := view(buf[2 : 2+tl]) // buf is never modified again
 		var id uint16
 		if qos > 0 {
 			id = binary.BigEndian.Uint16(buf[2+tl:])
+		}
+		var props *store.Props
+		if l.v5 {
+			if p < n && buf[p] == 0 { // no properties: the common case
+				p++
+			} else {
+				pb, rest, err := splitProps(buf[p:n])
+				if err != nil {
+					return l.protocolError(0x81, "malformed PUBLISH properties")
+				}
+				p = n - len(rest)
+				var alias uint16
+				if props, alias, err = publishProps(pb); err != nil {
+					return l.protocolError(0x81, "malformed PUBLISH properties")
+				}
+				if alias != 0 {
+					if topic, err = l.resolveAlias(alias, topic); err != nil {
+						return err
+					}
+				}
+			}
+			if topic == "" {
+				return l.protocolError(0x82, "PUBLISH without topic or topic alias")
+			}
 		}
 		if qos == 2 {
 			l.mu.Lock()
@@ -394,7 +486,7 @@ func (l *leanlink) readLoop(r *bufio.Reader) error {
 				continue
 			}
 		}
-		l.m.deliver(&l.ctr, store.Entry{Topic: topic, Payload: buf[p:n:n], QoS: qos, Retained: h&1 == 1, Time: now})
+		l.m.deliver(&l.ctr, store.Entry{Topic: topic, Payload: buf[p:n:n], QoS: qos, Retained: h&1 == 1, Time: now, Props: props})
 		switch qos {
 		case 1:
 			l.ack(pPuback<<4, id)
@@ -404,44 +496,120 @@ func (l *leanlink) readLoop(r *bufio.Reader) error {
 	}
 }
 
-// control handles non-PUBLISH packets.
-func (l *leanlink) control(h byte, body []byte) {
-	if len(body) < 2 && h>>4 != pPingresp {
-		return
+// resolveAlias maps an inbound topic alias (MQTT 5) to its topic: a PUBLISH
+// with a topic sets the alias, one without uses it.
+func (l *leanlink) resolveAlias(alias uint16, topic string) (string, error) {
+	if alias > l.aliasMax {
+		return "", l.protocolError(0x94, fmt.Sprintf("topic alias %d exceeds our maximum of %d", alias, l.aliasMax))
 	}
-	switch h >> 4 {
+	if topic != "" {
+		if l.aliases == nil {
+			l.aliases = map[uint16]string{}
+		}
+		l.aliases[alias] = strings.Clone(topic) // don't pin the packet buffer
+		return topic, nil
+	}
+	if t, ok := l.aliases[alias]; ok {
+		return t, nil
+	}
+	return "", l.protocolError(0x82, fmt.Sprintf("unknown topic alias %d", alias))
+}
+
+// protocolError tells an MQTT 5 broker why we are closing the connection
+// and returns the error that ends the session.
+func (l *leanlink) protocolError(code byte, msg string) error {
+	if l.v5 {
+		l.writePacket([]byte{pDisconnect << 4, 1, code}, true)
+	}
+	return errors.New(reasonText(code, msg))
+}
+
+// control handles non-PUBLISH packets. An error ends the session.
+func (l *leanlink) control(h byte, body []byte) error {
+	t := h >> 4
+	switch t {
 	case pPingresp:
+		return nil
+	case pDisconnect: // MQTT 5: the broker says why it is closing
+		code, reason := byte(0), ""
+		if len(body) > 0 {
+			code = body[0]
+			if props, _, err := splitProps(body[1:]); err == nil {
+				reason = reasonString(props)
+			}
+		}
+		return errors.New("server disconnected: " + reasonText(code, reason))
+	case pAuth:
+		return l.protocolError(0x8C, "enhanced authentication (AUTH) is not supported")
+	}
+	if len(body) < 2 {
+		return nil
+	}
+	id := binary.BigEndian.Uint16(body)
+	var code byte
+	var reason string
+	if l.v5 && t != pSuback {
+		code, reason = ackReason(body[2:])
+	}
+	switch t {
 	case pPubrel: // inbound QoS 2 step 2
-		id := binary.BigEndian.Uint16(body)
 		l.mu.Lock()
 		delete(l.inflight, id)
 		l.mu.Unlock()
 		l.ack(pPubcomp<<4, id)
 	case pPuback, pPubcomp: // outbound QoS 1 done / QoS 2 done
-		l.complete(binary.BigEndian.Uint16(body), nil)
+		var err error
+		if code >= 0x80 {
+			err = errors.New("publish rejected by broker: " + reasonText(code, reason))
+		}
+		l.complete(id, err)
 	case pPubrec: // outbound QoS 2 step 1
-		id := binary.BigEndian.Uint16(body)
+		if code >= 0x80 { // the flow ends here: no PUBREL
+			l.complete(id, errors.New("publish rejected by broker: "+reasonText(code, reason)))
+			return nil
+		}
 		l.writePacket([]byte{pPubrel<<4 | 0x02, 2, byte(id >> 8), byte(id)}, true)
 	case pSuback:
-		id := binary.BigEndian.Uint16(body)
+		rest := body[2:]
+		if l.v5 {
+			props, r, err := splitProps(rest)
+			if err != nil {
+				return l.protocolError(0x81, "malformed SUBACK")
+			}
+			reason, rest = reasonString(props), r
+		}
 		l.mu.Lock()
-		p := l.pending[id]
-		delete(l.pending, id)
+		p := l.takeLocked(id)
 		l.mu.Unlock()
 		if p != nil && p.codes != nil {
-			p.codes <- append([]byte(nil), body[2:]...)
+			p.reason = reason
+			p.codes <- append([]byte(nil), rest...)
 		}
 	}
+	return nil
 }
 
 func (l *leanlink) complete(id uint16, err error) {
 	l.mu.Lock()
-	p := l.pending[id]
-	delete(l.pending, id)
+	p := l.takeLocked(id)
 	l.mu.Unlock()
 	if p != nil && p.done != nil {
 		p.done <- err
 	}
+}
+
+// takeLocked removes a pending operation and releases its Receive Maximum
+// slot.
+func (l *leanlink) takeLocked(id uint16) *pending {
+	p := l.pending[id]
+	if p == nil {
+		return nil
+	}
+	delete(l.pending, id)
+	if p.quota != nil {
+		<-p.quota
+	}
+	return p
 }
 
 // ack queues a 2-byte-id acknowledgement; it is flushed with the next
@@ -491,9 +659,28 @@ func (l *leanlink) allocIDLocked() uint16 {
 }
 
 func (l *leanlink) send(ctx context.Context, msg Message) func() error {
-	if !msg.Props.Empty() {
-		return func() error { return ErrPropertiesNeedV5 }
+	fail := func(err error) func() error { return func() error { return err } }
+	if !l.v5 && !msg.Props.Empty() {
+		return fail(ErrPropertiesNeedV5)
 	}
+	l.mu.Lock()
+	quota := l.quota
+	l.mu.Unlock()
+	if quota != nil && msg.QoS > 0 {
+		// MQTT 5 flow control: at most Receive Maximum unacknowledged
+		// QoS 1/2 publishes. The slot is released by takeLocked.
+		select {
+		case quota <- struct{}{}:
+		case <-ctx.Done():
+			return fail(fmt.Errorf("publish: %w", ctx.Err()))
+		}
+	}
+	release := func() {
+		if quota != nil && msg.QoS > 0 {
+			<-quota
+		}
+	}
+
 	var b []byte
 	b = appendStr(b, msg.Topic)
 	h := byte(pPublish<<4) | msg.QoS<<1
@@ -501,30 +688,46 @@ func (l *leanlink) send(ctx context.Context, msg Message) func() error {
 		h |= 1
 	}
 	l.mu.Lock()
-	if l.w == nil {
+	switch {
+	case l.w == nil || l.quota != quota:
 		l.mu.Unlock()
-		return func() error { return ErrNotConnected }
+		release()
+		return fail(ErrNotConnected)
+	case msg.QoS > l.maxQoS:
+		l.mu.Unlock()
+		release()
+		return fail(fmt.Errorf("the broker supports QoS up to %d", l.maxQoS))
+	case msg.Retain && !l.retainOK:
+		l.mu.Unlock()
+		release()
+		return fail(errors.New("the broker does not support retained messages"))
 	}
 	var p *pending
 	var id uint16
 	if msg.QoS > 0 {
 		id = l.allocIDLocked()
-		p = &pending{done: make(chan error, 1)}
+		p = &pending{done: make(chan error, 1), quota: quota}
 		l.pending[id] = p
 		b = binary.BigEndian.AppendUint16(b, id)
 	}
+	if l.v5 {
+		b = appendPublishProps(b, msg.Props)
+	}
 	b = append(b, msg.Payload...)
-	_, err := l.w.Write(packet(h, b))
-	if err == nil {
+	pkt := packet(h, b)
+	var err error
+	if l.maxPacket > 0 && len(pkt) > l.maxPacket {
+		err = fmt.Errorf("message is %d bytes, over the broker's maximum packet size of %d", len(pkt), l.maxPacket)
+	} else if _, err = l.w.Write(pkt); err == nil {
 		_ = l.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		err = l.w.Flush()
 	}
 	if err != nil && p != nil {
-		delete(l.pending, id)
+		l.takeLocked(id)
 	}
 	l.mu.Unlock()
 	if err != nil {
-		return func() error { return err }
+		return fail(err)
 	}
 	if p == nil {
 		return func() error { return nil }
@@ -534,9 +737,8 @@ func (l *leanlink) send(ctx context.Context, msg Message) func() error {
 		case err := <-p.done:
 			return err
 		case <-ctx.Done():
-			l.mu.Lock()
-			delete(l.pending, id)
-			l.mu.Unlock()
+			// The publish stays pending until the broker acknowledges it or
+			// the connection drops, so its packet id is not reused early.
 			return fmt.Errorf("publish: %w", ctx.Err())
 		}
 	}

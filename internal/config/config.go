@@ -73,13 +73,13 @@ type Broker struct {
 	Connections      int    `json:"connections,omitempty"`
 	SharedGroup      string `json:"shared_group,omitempty"`
 	SubscriptionMode string `json:"subscription_mode,omitempty"` // "" / "auto" or "split"
-	// Client selects the MQTT 3.1/3.1.1 implementation: "lean" (default, a
-	// compact client built for ingest speed) or "paho" (eclipse
-	// paho.mqtt.golang). MQTT 5 always uses eclipse paho.golang.
+	// Client selects the MQTT implementation: "lean" (default, a compact
+	// client built for ingest speed) or "paho" (eclipse paho.mqtt.golang for
+	// MQTT 3.1/3.1.1, eclipse paho.golang for MQTT 5).
 	Client string `json:"client,omitempty"`
 }
 
-// MQTT 3 client implementations.
+// MQTT client implementations.
 const (
 	ClientLean = "lean"
 	ClientPaho = "paho"
