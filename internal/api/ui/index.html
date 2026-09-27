@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mqtt-get</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--text:#1d2330;--muted:#6b7385;--border:#e2e5eb;--accent:#2f6fed;--ok:#1a9c5b;--bad:#d64545;--warn:#c98a0b;--code:#f0f2f5}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--panel:#1a1e26;--text:#e6e9ef;--muted:#99a1b3;--border:#2b313d;--accent:#5b8ffa;--code:#232834}}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:16px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+header h1{font-size:16px;margin:0}
+nav{display:flex;gap:4px;flex-wrap:wrap}
+nav button{background:none;border:0;padding:6px 10px;border-radius:6px;color:var(--muted);cursor:pointer;font:inherit}
+nav button.active{background:var(--code);color:var(--text);font-weight:600}
+.spacer{flex:1}
+main{max-width:1100px;margin:0 auto;padding:20px 16px}
+section{display:none}section.active{display:block}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
+.card h2{font-size:15px;margin:0 0 12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.stat{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px}
+.stat .v{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
+.stat .l{color:var(--muted);font-size:12px}
+label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+input,select,textarea{width:100%;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font:inherit}
+textarea{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;min-height:70px}
+input[type=checkbox]{width:auto;margin-right:6px}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 14px}
+button.btn{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:7px 14px;cursor:pointer;font:inherit}
+button.btn.secondary{background:var(--code);color:var(--text)}
+button.btn.danger{background:var(--bad)}
+button.btn.small{padding:3px 9px;font-size:12px}
+.actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+th{font-size:12px;color:var(--muted);font-weight:500}
+td.mono,.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;background:var(--code)}
+.pill.ok{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+.pill.bad{background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)}
+.muted{color:var(--muted)}
+.err{color:var(--bad);white-space:pre-wrap}
+pre{background:var(--code);padding:10px;border-radius:6px;overflow:auto;font-size:12px;margin:6px 0}
+details summary{cursor:pointer;color:var(--muted);margin:10px 0}
+#toast{position:fixed;bottom:16px;right:16px;background:var(--text);color:var(--bg);padding:9px 14px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw}
+#toast.show{opacity:1}
+#login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:10;padding:16px}
+#login[hidden],[hidden]{display:none}
+#login .card{width:100%;max-width:380px}
+.payload{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
+</style>
+</head>
+<body>
+<div id="login" hidden>
+  <div class="card">
+    <h2>mqtt-get</h2>
+    <p class="muted">Enter an API key. On first start an admin key is printed in the server log.</p>
+    <label for="loginKey">API key</label>
+    <input id="loginKey" type="password" autocomplete="current-password">
+    <div class="err" id="loginErr"></div>
+    <div class="actions"><button class="btn" id="loginBtn">Sign in</button></div>
+  </div>
+</div>
+
+<header>
+  <h1>mqtt-get</h1>
+  <nav id="nav">
+    <button data-tab="dash" class="active">Dashboard</button>
+    <button data-tab="explorer">Explorer</button>
+    <button data-tab="broker">Broker</button>
+    <button data-tab="webhooks">Webhooks</button>
+    <button data-tab="keys">API keys</button>
+    <button data-tab="help">Help</button>
+  </nav>
+  <span class="spacer"></span>
+  <span id="connPill" class="pill">…</span>
+  <button class="btn small secondary" id="logout">Sign out</button>
+</header>
+
+<main>
+<section id="dash" class="active">
+  <div class="grid" id="stats"></div>
+  <div class="card" style="margin-top:16px"><h2>Connection</h2><div id="connInfo"></div></div>
+</section>
+
+<section id="explorer">
+  <div class="card">
+    <h2>Latest values</h2>
+    <div class="row">
+      <div><label>Topic filter</label><input id="filter" value="#" placeholder="e.g. home/+/temperature"></div>
+      <div><label>Limit</label><input id="limit" type="number" value="200"></div>
+    </div>
+    <div class="actions">
+      <button class="btn" id="refresh">Refresh</button>
+      <label style="margin:0;display:flex;align-items:center"><input type="checkbox" id="auto">Auto-refresh (2s)</label>
+      <span class="muted" id="count"></span>
+    </div>
+    <div style="overflow:auto;margin-top:10px"><table><thead><tr><th>Topic</th><th>Payload</th><th>Age</th></tr></thead><tbody id="values"></tbody></table></div>
+  </div>
+  <div class="card" id="detailCard" hidden><h2>Topic detail</h2><pre id="detail"></pre><div class="muted">GET <span class="mono" id="detailUrl"></span></div></div>
+  <div class="card">
+    <h2>Publish</h2>
+    <div class="row">
+      <div><label>Topic</label><input id="pubTopic" placeholder="devices/lamp/set"></div>
+      <div class="row" style="grid-template-columns:1fr 1fr">
+        <div><label>QoS</label><select id="pubQos"><option>0</option><option>1</option><option>2</option></select></div>
+        <div><label>&nbsp;</label><label style="margin:6px 0"><input type="checkbox" id="pubRetain">Retain</label></div>
+      </div>
+    </div>
+    <label>Payload</label><textarea id="pubPayload" placeholder='{"state":"ON"}'></textarea>
+    <div class="actions"><button class="btn" id="pubBtn">Publish</button></div>
+  </div>
+</section>
+
+<section id="broker">
+  <div class="card">
+    <h2>Broker connection</h2>
+    <p class="muted" id="brokerSource"></p>
+    <form id="brokerForm" autocomplete="off">
+      <label>Broker URL(s), one per line — tcp://, mqtt://, ssl://, mqtts://, ws://, wss://</label>
+      <textarea name="urls" style="min-height:48px" placeholder="tcp://broker.local:1883"></textarea>
+      <div class="row">
+        <div><label>Client ID</label><input name="client_id"></div>
+        <div><label>Protocol</label><select name="protocol_version"><option value="4">MQTT 3.1.1</option><option value="3">MQTT 3.1</option></select></div>
+        <div><label>Username</label><input name="username" autocomplete="off"></div>
+        <div><label>Password / token</label><input name="password" type="password" autocomplete="new-password"></div>
+        <div><label>Password file (optional, re-read on reconnect)</label><input name="password_file"></div>
+        <div><label>Keep-alive (s)</label><input name="keepalive_sec" type="number"></div>
+      </div>
+      <label><input type="checkbox" name="clean_session">Clean session</label>
+      <label>Subscriptions — one per line: <span class="mono">filter [qos]</span></label>
+      <textarea name="subscriptions" placeholder="#&#10;home/+/state 1"></textarea>
+      <details><summary>TLS / mutual TLS</summary>
+        <label><input type="checkbox" name="tls.enabled">Enable TLS (automatic for ssl://, mqtts://, wss://)</label>
+        <label><input type="checkbox" name="tls.insecure_skip_verify">Skip certificate verification (insecure)</label>
+        <div class="row">
+          <div><label>Server name (SNI)</label><input name="tls.server_name"></div>
+          <div><label>ALPN protocols (comma-separated)</label><input name="tls.alpn" placeholder="x-amzn-mqtt-ca"></div>
+        </div>
+        <label>CA certificate (PEM)</label><textarea name="tls.ca_pem"></textarea>
+        <label>Client certificate (PEM)</label><textarea name="tls.cert_pem"></textarea>
+        <label>Client private key (PEM)</label><textarea name="tls.key_pem"></textarea>
+        <div class="row">
+          <div><label>CA file path</label><input name="tls.ca_file"></div>
+          <div><label>Client cert file path</label><input name="tls.cert_file"></div>
+          <div><label>Client key file path</label><input name="tls.key_file"></div>
+        </div>
+      </details>
+      <details><summary>WebSocket headers &amp; scaling</summary>
+        <label>WebSocket headers — one per line: <span class="mono">Name: value</span></label>
+        <textarea name="ws_headers"></textarea>
+        <div class="row">
+          <div><label>Connections</label><input name="connections" type="number" min="1" max="64"></div>
+          <div><label>Shared subscription group (spreads ingest over connections)</label><input name="shared_group"></div>
+        </div>
+      </details>
+      <div class="err" id="brokerErr"></div>
+      <div class="actions">
+        <button class="btn" type="submit">Save &amp; connect</button>
+        <button class="btn secondary" type="button" id="reconnect">Reconnect</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<section id="webhooks">
+  <div class="card">
+    <h2>Webhooks</h2>
+    <div style="overflow:auto"><table><thead><tr><th>Name / URL</th><th>Topics</th><th>Delivered</th><th>Failed</th><th>Dropped</th><th></th></tr></thead><tbody id="hookList"></tbody></table></div>
+  </div>
+  <div class="card">
+    <h2 id="hookFormTitle">New webhook</h2>
+    <form id="hookForm" autocomplete="off">
+      <input type="hidden" name="id">
+      <div class="row">
+        <div><label>Name</label><input name="name"></div>
+        <div><label>URL</label><input name="url" placeholder="https://example.com/hook" required></div>
+      </div>
+      <label>Topic filters (one per line)</label><textarea name="topics" style="min-height:48px" required></textarea>
+      <div class="row">
+        <div><label>Format</label><select name="format"><option value="json">JSON envelope</option><option value="raw">Raw payload</option></select></div>
+        <div><label>Method</label><select name="method"><option>POST</option><option>PUT</option><option>PATCH</option></select></div>
+        <div><label>Batch size (JSON only)</label><input name="batch_size" type="number" min="1" value="1"></div>
+        <div><label>Batch interval (ms)</label><input name="batch_interval_ms" type="number" value="200"></div>
+        <div><label>Signing secret (HMAC-SHA256)</label><input name="secret" type="password" autocomplete="new-password"></div>
+        <div><label>Timeout (ms)</label><input name="timeout_ms" type="number" value="5000"></div>
+        <div><label>Max retries</label><input name="max_retries" type="number" value="3"></div>
+        <div><label>Queue size</label><input name="queue_size" type="number" value="10000"></div>
+        <div><label>Concurrency</label><input name="concurrency" type="number" value="1"></div>
+      </div>
+      <label>Extra headers — one per line: <span class="mono">Name: value</span></label><textarea name="headers" style="min-height:48px"></textarea>
+      <label><input type="checkbox" name="enabled" checked>Enabled</label>
+      <div class="err" id="hookErr"></div>
+      <div class="actions"><button class="btn" type="submit">Save webhook</button><button class="btn secondary" type="button" id="hookReset">Clear</button></div>
+    </form>
+  </div>
+</section>
+
+<section id="keys">
+  <div class="card">
+    <h2>API keys</h2>
+    <table><thead><tr><th>Name</th><th>Prefix</th><th>Scopes</th><th>Created</th><th></th></tr></thead><tbody id="keyList"></tbody></table>
+  </div>
+  <div class="card">
+    <h2>Create key</h2>
+    <div class="row"><div><label>Name</label><input id="keyName" placeholder="grafana"></div></div>
+    <label>Scopes</label>
+    <label style="display:inline-flex;margin-right:14px"><input type="checkbox" value="read" class="scope" checked>read</label>
+    <label style="display:inline-flex;margin-right:14px"><input type="checkbox" value="publish" class="scope">publish</label>
+    <label style="display:inline-flex"><input type="checkbox" value="admin" class="scope">admin</label>
+    <div class="actions"><button class="btn" id="keyCreate">Create</button></div>
+    <div id="newKey" hidden><p>Copy this key now — it won't be shown again:</p><pre id="newKeyVal"></pre></div>
+  </div>
+</section>
+
+<section id="help">
+  <div class="card"><h2>REST API</h2><pre id="helpText"></pre></div>
+  <div class="card"><h2>MCP</h2><pre id="mcpText"></pre></div>
+</section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const store = { get(k) { try { return localStorage.getItem(k) } catch { return null } }, set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v) } catch {} } };
+let apiKey = store.get('mqttget.key') || '';
+let timers = [];
+let lastStat = null;
+
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2500); }
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmtN = n => n >= 1e9 ? (n / 1e9).toFixed(2) + 'G' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'k' : String(n);
+function age(ts) { const s = (Date.now() - new Date(ts)) / 1000; return s < 60 ? s.toFixed(1) + 's' : s < 3600 ? Math.floor(s / 60) + 'm' : s < 86400 ? Math.floor(s / 3600) + 'h' : Math.floor(s / 86400) + 'd'; }
+function dur(s) { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + 'd ' : '') + (h ? h + 'h ' : '') + m + 'm'; }
+
+async function api(method, path, body, raw) {
+  const opt = { method, headers: {} };
+  if (apiKey) opt.headers.Authorization = 'Bearer ' + apiKey;
+  if (body !== undefined) { if (raw) opt.body = body; else { opt.body = JSON.stringify(body); opt.headers['Content-Type'] = 'application/json'; } }
+  const r = await fetch(path, opt);
+  if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  if (r.status === 204) return null;
+  const text = await r.text();
+  let data; try { data = JSON.parse(text) } catch { data = text }
+  if (!r.ok) throw new Error((data && data.error) || ('HTTP ' + r.status));
+  return data;
+}
+
+function showLogin() { $('#login').hidden = false; $('#loginKey').focus(); }
+$('#loginBtn').onclick = async () => {
+  apiKey = $('#loginKey').value.trim();
+  try { await api('GET', '/api/v1/whoami'); store.set('mqttget.key', apiKey); $('#login').hidden = true; $('#loginErr').textContent = ''; start(); }
+  catch (e) { $('#loginErr').textContent = e.message; }
+};
+$('#loginKey').onkeydown = e => { if (e.key === 'Enter') $('#loginBtn').click(); };
+$('#logout').onclick = () => { store.set('mqttget.key', null); apiKey = ''; location.reload(); };
+
+$$('#nav button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+function showTab(t) {
+  $$('#nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
+  $$('main section').forEach(s => s.classList.toggle('active', s.id === t));
+  store.set('mqttget.tab', t);
+  ({ explorer: loadValues, broker: loadBroker, webhooks: loadHooks, keys: loadKeys, help: loadHelp })[t]?.();
+}
+
+// ---- dashboard ----
+async function loadStatus() {
+  const s = await api('GET', '/api/v1/status');
+  const m = s.mqtt, now = Date.now();
+  let rate = '–';
+  if (lastStat) { const dt = (now - lastStat.t) / 1000; rate = fmtN(Math.max(0, Math.round((m.messages_received - lastStat.n) / dt))) + '/s'; }
+  lastStat = { t: now, n: m.messages_received };
+  const pill = $('#connPill');
+  pill.className = 'pill ' + (m.connected ? 'ok' : 'bad');
+  pill.textContent = !m.configured ? 'broker not configured' : m.connected ? 'connected' : 'disconnected';
+  $('#stats').innerHTML = [
+    ['Messages / s', rate], ['Messages received', fmtN(m.messages_received)], ['Bytes received', fmtN(m.bytes_received)],
+    ['Topics', fmtN(s.topics) + (s.topics_dropped ? ` <span class="muted" title="dropped: MAX_TOPICS reached">(${fmtN(s.topics_dropped)} dropped)</span>` : '')],
+    ['Published via API', fmtN(m.messages_published)], ['Webhooks', s.webhooks], ['Uptime', dur(s.uptime_sec)], ['Version', esc(s.version)],
+  ].map(([l, v]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
+  $('#connInfo').innerHTML = `<table>
+    <tr><th>Broker</th><td class="mono">${esc((m.urls || []).join(', ') || '—')}</td></tr>
+    <tr><th>Connections</th><td>${m.connected_count} / ${m.connections}</td></tr>
+    <tr><th>Config source</th><td>${esc(s.broker_source)}${s.state_file ? ` <span class="muted">(${esc(s.state_file)})</span>` : ''}</td></tr>
+    ${m.connected_since ? `<tr><th>Connected since</th><td>${new Date(m.connected_since).toLocaleString()}</td></tr>` : ''}
+    ${m.last_error ? `<tr><th>Last error</th><td class="err">${esc(m.last_error)} <span class="muted">${new Date(m.last_error_at).toLocaleTimeString()}</span></td></tr>` : ''}
+  </table>`;
+}
+
+// ---- explorer ----
+function preview(v) { return v.encoding === 'json' ? JSON.stringify(v.payload) : v.encoding === 'base64' ? '[binary] ' + v.payload : v.payload; }
+async function loadValues() {
+  const f = $('#filter').value.trim() || '#', lim = $('#limit').value || 200;
+  try {
+    const r = await api('GET', `/api/v1/values?filter=${encodeURIComponent(f)}&limit=${lim}`);
+    $('#count').textContent = `${r.count} of ${r.total} topics`;
+    $('#values').innerHTML = r.values.map(v => `<tr class="click" data-t="${esc(v.topic)}"><td class="mono">${esc(v.topic)}</td><td class="mono payload">${esc(preview(v))}</td><td>${age(v.timestamp)}</td></tr>`).join('') || '<tr><td colspan=3 class="muted">No values yet</td></tr>';
+    $$('#values tr.click').forEach(tr => tr.onclick = () => showDetail(tr.dataset.t));
+  } catch (e) { toast(e.message) }
+}
+async function showDetail(t) {
+  const v = await api('GET', '/api/v1/values?topic=' + encodeURIComponent(t));
+  $('#detailCard').hidden = false;
+  $('#detail').textContent = JSON.stringify(v, null, 2);
+  $('#detailUrl').textContent = location.origin + '/api/v1/values/' + t.split('/').map(encodeURIComponent).join('/');
+  $('#pubTopic').value = t;
+}
+$('#refresh').onclick = loadValues;
+$('#filter').onkeydown = e => { if (e.key === 'Enter') loadValues(); };
+let autoT; $('#auto').onchange = e => { clearInterval(autoT); if (e.target.checked) autoT = setInterval(loadValues, 2000); };
+$('#pubBtn').onclick = async () => {
+  const t = $('#pubTopic').value.trim();
+  if (!t) return toast('Topic required');
+  try {
+    await api('POST', `/api/v1/publish/${t.split('/').map(encodeURIComponent).join('/')}?qos=${$('#pubQos').value}&retain=${$('#pubRetain').checked}`, $('#pubPayload').value, true);
+    toast('Published'); setTimeout(loadValues, 300);
+  } catch (e) { toast(e.message) }
+};
+
+// ---- broker ----
+async function loadBroker() {
+  const r = await api('GET', '/api/v1/broker');
+  const c = r.config, f = $('#brokerForm');
+  $('#brokerSource').textContent = { saved: 'Using settings saved from the UI/API (they override MQTT_* environment variables).', env: 'Using MQTT_* environment variables. Saving here stores settings that take precedence from now on.', none: 'No broker configured yet.' }[r.source] || '';
+  const set = (n, v) => { const el = f.elements[n]; if (!el) return; if (el.type === 'checkbox') el.checked = !!v; else el.value = v ?? ''; };
+  set('urls', (c.urls || []).join('\n')); set('client_id', c.client_id); set('protocol_version', c.protocol_version || 4);
+  set('username', c.username); set('password', c.password); set('password_file', c.password_file); set('keepalive_sec', c.keepalive_sec);
+  set('clean_session', c.clean_session !== false);
+  set('subscriptions', (c.subscriptions || []).map(s => s.filter + (s.qos ? ' ' + s.qos : '')).join('\n'));
+  const t = c.tls || {};
+  for (const k of ['enabled', 'insecure_skip_verify', 'server_name', 'ca_pem', 'cert_pem', 'key_pem', 'ca_file', 'cert_file', 'key_file']) set('tls.' + k, t[k]);
+  set('tls.alpn', (t.alpn || []).join(','));
+  set('ws_headers', Object.entries(c.ws_headers || {}).map(([k, v]) => k + ': ' + v).join('\n'));
+  set('connections', c.connections || 1); set('shared_group', c.shared_group);
+}
+const lines = s => s.split('\n').map(x => x.trim()).filter(Boolean);
+const headers = s => Object.fromEntries(lines(s).map(l => { const i = l.indexOf(':'); return [l.slice(0, i).trim(), l.slice(i + 1).trim()]; }).filter(([k]) => k));
+$('#brokerForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const e = ev.target.elements, v = n => e[n].value.trim(), num = n => parseInt(v(n)) || 0;
+  const body = {
+    urls: lines(e.urls.value), client_id: v('client_id'), protocol_version: num('protocol_version'),
+    username: v('username'), password: e.password.value, password_file: v('password_file'), keepalive_sec: num('keepalive_sec'),
+    clean_session: e.clean_session.checked,
+    subscriptions: lines(e.subscriptions.value).map(l => { const [f, q] = l.split(/\s+/); return { filter: f, qos: parseInt(q) || 0 }; }),
+    tls: {
+      enabled: e['tls.enabled'].checked, insecure_skip_verify: e['tls.insecure_skip_verify'].checked, server_name: v('tls.server_name'),
+      alpn: v('tls.alpn') ? v('tls.alpn').split(',').map(s => s.trim()).filter(Boolean) : [],
+      ca_pem: e['tls.ca_pem'].value, cert_pem: e['tls.cert_pem'].value, key_pem: e['tls.key_pem'].value,
+      ca_file: v('tls.ca_file'), cert_file: v('tls.cert_file'), key_file: v('tls.key_file'),
+    },
+    ws_headers: headers(e.ws_headers.value), connections: num('connections') || 1, shared_group: v('shared_group'),
+  };
+  try { await api('PUT', '/api/v1/broker', body); $('#brokerErr').textContent = ''; toast('Saved — connecting…'); loadBroker(); setTimeout(loadStatus, 1500); }
+  catch (err) { $('#brokerErr').textContent = err.message; }
+};
+$('#reconnect').onclick = async () => { try { await api('POST', '/api/v1/broker/reconnect'); toast('Reconnecting…'); setTimeout(loadStatus, 1500); } catch (e) { toast(e.message) } };
+
+// ---- webhooks ----
+let hooks = [];
+async function loadHooks() {
+  const r = await api('GET', '/api/v1/webhooks'); hooks = r.webhooks || [];
+  $('#hookList').innerHTML = hooks.map(h => `<tr>
+    <td><b>${esc(h.name || h.id)}</b>${h.enabled === false ? ' <span class="pill">disabled</span>' : ''}<div class="mono muted">${esc(h.method)} ${esc(h.url)}</div>${h.stats.last_error ? `<div class="err">${esc(h.stats.last_error)}</div>` : ''}</td>
+    <td class="mono">${h.topics.map(esc).join('<br>')}</td><td>${fmtN(h.stats.delivered)}</td><td>${fmtN(h.stats.failed)}</td><td>${fmtN(h.stats.dropped)}</td>
+    <td style="white-space:nowrap"><button class="btn small secondary" data-act="test" data-id="${esc(h.id)}">Test</button> <button class="btn small secondary" data-act="edit" data-id="${esc(h.id)}">Edit</button> <button class="btn small danger" data-act="del" data-id="${esc(h.id)}">Delete</button></td></tr>`).join('') || '<tr><td colspan=6 class="muted">No webhooks</td></tr>';
+  $$('#hookList button').forEach(b => b.onclick = () => hookAction(b.dataset.act, b.dataset.id));
+}
+async function hookAction(act, id) {
+  try {
+    if (act === 'test') { await api('POST', `/api/v1/webhooks/${id}/test`); toast('Test delivered'); }
+    if (act === 'del' && confirm('Delete webhook?')) { await api('DELETE', `/api/v1/webhooks/${id}`); loadHooks(); }
+    if (act === 'edit') {
+      const h = hooks.find(x => x.id === id), e = $('#hookForm').elements;
+      $('#hookFormTitle').textContent = 'Edit webhook';
+      for (const k of ['id', 'name', 'url', 'format', 'method', 'batch_size', 'batch_interval_ms', 'secret', 'timeout_ms', 'max_retries', 'queue_size', 'concurrency']) e[k].value = h[k] ?? '';
+      e.topics.value = h.topics.join('\n'); e.headers.value = Object.entries(h.headers || {}).map(([k, v]) => k + ': ' + v).join('\n');
+      e.enabled.checked = h.enabled !== false; $('#hookForm').scrollIntoView({ behavior: 'smooth' });
+    }
+  } catch (e) { toast(e.message) }
+}
+$('#hookReset').onclick = () => { $('#hookForm').reset(); $('#hookForm').elements.id.value = ''; $('#hookFormTitle').textContent = 'New webhook'; };
+$('#hookForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const e = ev.target.elements, n = k => parseInt(e[k].value);
+  const body = {
+    name: e.name.value.trim(), url: e.url.value.trim(), topics: lines(e.topics.value), format: e.format.value, method: e.method.value,
+    batch_size: n('batch_size') || 1, batch_interval_ms: n('batch_interval_ms') || 0, secret: e.secret.value, timeout_ms: n('timeout_ms') || 0,
+    max_retries: isNaN(n('max_retries')) ? 3 : n('max_retries'), queue_size: n('queue_size') || 0, concurrency: n('concurrency') || 0,
+    headers: headers(e.headers.value), enabled: e.enabled.checked,
+  };
+  try {
+    const id = e.id.value;
+    await api(id ? 'PUT' : 'POST', id ? `/api/v1/webhooks/${id}` : '/api/v1/webhooks', body);
+    $('#hookErr').textContent = ''; toast('Webhook saved'); $('#hookReset').click(); loadHooks();
+  } catch (err) { $('#hookErr').textContent = err.message; }
+};
+
+// ---- keys ----
+async function loadKeys() {
+  const r = await api('GET', '/api/v1/keys');
+  $('#keyList').innerHTML = r.keys.map(k => `<tr><td>${esc(k.name)}${k.env ? ' <span class="pill">env</span>' : ''}</td><td class="mono">${esc(k.prefix)}</td><td>${k.scopes.map(esc).join(', ')}</td>
+    <td>${k.env ? '—' : new Date(k.created_at).toLocaleString()}</td><td>${k.env ? '' : `<button class="btn small danger" data-id="${esc(k.id)}">Revoke</button>`}</td></tr>`).join('');
+  $$('#keyList button').forEach(b => b.onclick = async () => { if (!confirm('Revoke key?')) return; try { await api('DELETE', '/api/v1/keys/' + b.dataset.id); loadKeys(); } catch (e) { toast(e.message) } });
+}
+$('#keyCreate').onclick = async () => {
+  const scopes = $$('.scope').filter(c => c.checked).map(c => c.value);
+  try { const r = await api('POST', '/api/v1/keys', { name: $('#keyName').value.trim() || 'key', scopes }); $('#newKey').hidden = false; $('#newKeyVal').textContent = r.key; loadKeys(); }
+  catch (e) { toast(e.message) }
+};
+
+// ---- help ----
+function loadHelp() {
+  const o = location.origin, k = 'YOUR_API_KEY';
+  $('#helpText').textContent = `# Latest value of a topic (JSON envelope)
+curl -H "Authorization: Bearer ${k}" ${o}/api/v1/values/home/kitchen/temperature
+
+# Raw payload only
+curl -H "Authorization: Bearer ${k}" "${o}/api/v1/values/home/kitchen/temperature?format=raw"
+
+# All latest values matching a filter (+ must be URL-encoded as %2B, # as %23)
+curl -H "Authorization: Bearer ${k}" "${o}/api/v1/values?filter=home/%2B/temperature"
+
+# Publish (raw body)
+curl -X POST -H "Authorization: Bearer ${k}" --data 'ON' "${o}/api/v1/publish/home/lamp/set?qos=1&retain=false"
+
+# Publish one or many messages (JSON)
+curl -X POST -H "Authorization: Bearer ${k}" -H 'Content-Type: application/json' \\
+  -d '[{"topic":"a/b","payload":{"x":1},"qos":1},{"topic":"a/c","payload":"text"}]' ${o}/api/v1/publish
+
+# Create a webhook
+curl -X POST -H "Authorization: Bearer ${k}" -H 'Content-Type: application/json' \\
+  -d '{"url":"https://example.com/hook","topics":["alerts/#"],"batch_size":100}' ${o}/api/v1/webhooks
+
+# Prometheus metrics
+curl -H "Authorization: Bearer ${k}" ${o}/metrics`;
+  $('#mcpText').textContent = `Streamable HTTP endpoint: ${o}/mcp  (header  Authorization: Bearer ${k})
+
+# Claude Code
+claude mcp add --transport http mqtt ${o}/mcp --header "Authorization: Bearer ${k}"
+
+# stdio clients (e.g. Claude Desktop) via the built-in bridge
+{"mcpServers":{"mqtt":{"command":"mqtt-get","args":["mcp","--url","${o}"],"env":{"MQTT_GET_API_KEY":"${k}"}}}}`;
+}
+
+async function start() {
+  timers.forEach(clearInterval); timers = [];
+  await loadStatus().catch(() => {});
+  timers.push(setInterval(() => loadStatus().catch(() => {}), 2000));
+  showTab(store.get('mqttget.tab') || 'dash');
+}
+(async () => {
+  try { await api('GET', '/api/v1/whoami'); start(); } catch { showLogin(); }
+})();
+</script>
+</body>
+</html>
