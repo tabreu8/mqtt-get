@@ -89,7 +89,14 @@ func serve() error {
 		return fmt.Errorf("MQTT configuration: %w", err)
 	}
 
+	envHistory, historyOK, err := config.HistoryFromEnv()
+	if err != nil {
+		return fmt.Errorf("HISTORY_TOPICS: %w", err)
+	}
 	svc := core.New(cfg, log, st)
+	if historyOK {
+		svc.SetEnvHistoryRule(envHistory)
+	}
 	if err := svc.Start(envBroker, envOK); err != nil {
 		log.Error("broker configuration error", "err", err)
 	}

@@ -1,5 +1,5 @@
-// Package state persists runtime configuration (broker settings, webhooks
-// and API keys) to a JSON file so changes made through the REST API, MCP or
+// Package state persists runtime configuration (broker settings, webhooks,
+// history rules and API keys) to a JSON file so changes made through the REST API, MCP or
 // web UI survive restarts.
 package state
 
@@ -24,9 +24,10 @@ import (
 var ErrNotFound = errors.New("not found")
 
 type fileData struct {
-	Broker   *config.Broker   `json:"broker,omitempty"`
-	Webhooks []config.Webhook `json:"webhooks"`
-	APIKeys  []config.APIKey  `json:"api_keys"`
+	Broker   *config.Broker       `json:"broker,omitempty"`
+	Webhooks []config.Webhook     `json:"webhooks"`
+	History  []config.HistoryRule `json:"history_rules,omitempty"`
+	APIKeys  []config.APIKey      `json:"api_keys"`
 }
 
 // State is the persisted configuration. All methods are safe for concurrent use.
@@ -156,6 +157,55 @@ func (s *State) DeleteWebhook(id string) error {
 	for i := range s.data.Webhooks {
 		if s.data.Webhooks[i].ID == id {
 			s.data.Webhooks = slices.Delete(s.data.Webhooks, i, i+1)
+			return s.saveLocked()
+		}
+	}
+	return ErrNotFound
+}
+
+// --- history rules ---
+
+// HistoryRules returns all persisted history rules, in order.
+func (s *State) HistoryRules() []config.HistoryRule {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.data.History)
+}
+
+// HistoryRule returns one history rule.
+func (s *State) HistoryRule(id string) (config.HistoryRule, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.data.History {
+		if r.ID == id {
+			return r, nil
+		}
+	}
+	return config.HistoryRule{}, ErrNotFound
+}
+
+// PutHistoryRule creates or replaces a history rule (by ID).
+func (s *State) PutHistoryRule(r config.HistoryRule) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r.Topics = slices.Clone(r.Topics)
+	for i := range s.data.History {
+		if s.data.History[i].ID == r.ID {
+			s.data.History[i] = r
+			return s.saveLocked()
+		}
+	}
+	s.data.History = append(s.data.History, r)
+	return s.saveLocked()
+}
+
+// DeleteHistoryRule removes a history rule.
+func (s *State) DeleteHistoryRule(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.History {
+		if s.data.History[i].ID == id {
+			s.data.History = slices.Delete(s.data.History, i, i+1)
 			return s.saveLocked()
 		}
 	}

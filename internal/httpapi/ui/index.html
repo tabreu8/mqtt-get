@@ -52,6 +52,12 @@ details summary{cursor:pointer;color:var(--muted);margin:10px 0}
 #login .card{width:100%;max-width:380px}
 .payload{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
+.chart{width:100%;height:auto;display:block;margin-top:10px}
+.chart .band{fill:color-mix(in srgb,var(--accent) 16%,transparent)}
+.chart .line{fill:none;stroke:var(--accent);stroke-width:2}
+.chart .dot{fill:var(--accent)}
+.chart .axis{stroke:var(--border)}
+.chart text{fill:var(--muted);font-size:11px}
 </style>
 </head>
 <body>
@@ -72,6 +78,7 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
     <button data-tab="dash" class="active">Dashboard</button>
     <button data-tab="explorer">Explorer</button>
     <button data-tab="broker">Broker</button>
+    <button data-tab="history">History</button>
     <button data-tab="webhooks">Webhooks</button>
     <button data-tab="keys">API keys</button>
     <button data-tab="help">Help</button>
@@ -101,7 +108,8 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
     </div>
     <div style="overflow:auto;margin-top:10px"><table><thead><tr><th>Topic</th><th>Payload</th><th>Age</th></tr></thead><tbody id="values"></tbody></table></div>
   </div>
-  <div class="card" id="detailCard" hidden><h2>Topic detail</h2><pre id="detail"></pre><div class="muted">GET <span class="mono" id="detailUrl"></span></div></div>
+  <div class="card" id="detailCard" hidden><h2>Topic detail</h2><pre id="detail"></pre><div class="muted">GET <span class="mono" id="detailUrl"></span></div>
+    <div class="actions"><button class="btn small secondary" id="detailHist">View history</button></div></div>
   <div class="card">
     <h2>Publish</h2>
     <div class="row">
@@ -186,6 +194,50 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
   </div>
 </section>
 
+<section id="history">
+  <div class="card">
+    <h2>Recorded topics</h2>
+    <p class="muted" id="histStats"></p>
+    <div class="row">
+      <div><label>Topic filter</label><input id="histFilter" value="#"></div>
+    </div>
+    <div class="actions"><button class="btn" id="histRefresh">Refresh</button><span class="muted" id="histCount"></span></div>
+    <div style="overflow:auto;margin-top:10px"><table><thead><tr><th>Topic</th><th>Points</th><th>Covers</th><th>Rule</th><th>Memory</th></tr></thead><tbody id="histTopics"></tbody></table></div>
+  </div>
+  <div class="card" id="histCard" hidden>
+    <h2 id="histTitle"></h2>
+    <div class="row">
+      <div><label>Range</label><select id="histRange"><option value="15m">Last 15 minutes</option><option value="1h" selected>Last hour</option><option value="6h">Last 6 hours</option><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option><option value="">Everything recorded</option></select></div>
+      <div><label>JSON field (optional)</label><input id="histField" placeholder="e.g. celsius or data.temp"></div>
+    </div>
+    <div id="histBody"></div>
+    <div class="muted" style="margin-top:8px">GET <span class="mono" id="histUrl"></span></div>
+  </div>
+  <div class="card" id="ruleCard">
+    <h2>History rules</h2>
+    <p class="muted">Topics matching a rule keep a bounded history in memory (the first matching rule applies). History starts when a rule is created.</p>
+    <div style="overflow:auto"><table><thead><tr><th>Name / topics</th><th>Limits</th><th>Topics</th><th>Points</th><th>Memory</th><th>Dropped</th><th></th></tr></thead><tbody id="ruleList"></tbody></table></div>
+  </div>
+  <div class="card" id="ruleFormCard">
+    <h2 id="ruleFormTitle">New history rule</h2>
+    <form id="ruleForm" autocomplete="off">
+      <input type="hidden" name="id">
+      <div class="row"><div><label>Name</label><input name="name"></div></div>
+      <label>Topic filters (one per line)</label><textarea name="topics" style="min-height:48px" required placeholder="factory/+/temperature"></textarea>
+      <div class="row">
+        <div><label>Max points per topic</label><input name="max_points" type="number" min="1" value="1000"></div>
+        <div><label>Max age (seconds, 0 = none)</label><input name="max_age_sec" type="number" min="0" value="0"></div>
+        <div><label>Min interval (ms, 0 = every message)</label><input name="min_interval_ms" type="number" min="0" value="0"></div>
+        <div><label>Memory budget (bytes, 0 = global only)</label><input name="max_bytes" type="number" min="0" value="0"></div>
+      </div>
+      <label><input type="checkbox" name="on_change">Only record changes (skip repeated payloads)</label>
+      <label><input type="checkbox" name="enabled" checked>Enabled</label>
+      <div class="err" id="ruleErr"></div>
+      <div class="actions"><button class="btn" type="submit">Save rule</button><button class="btn secondary" type="button" id="ruleReset">Clear</button></div>
+    </form>
+  </div>
+</section>
+
 <section id="webhooks">
   <div class="card">
     <h2>Webhooks</h2>
@@ -255,6 +307,8 @@ function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.ad
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtN = n => n >= 1e9 ? (n / 1e9).toFixed(2) + 'G' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'k' : String(n);
 function age(ts) { const s = (Date.now() - new Date(ts)) / 1000; return s < 60 ? s.toFixed(1) + 's' : s < 3600 ? Math.floor(s / 60) + 'm' : s < 86400 ? Math.floor(s / 3600) + 'h' : Math.floor(s / 86400) + 'd'; }
+const fmtBytes = b => b >= 1 << 30 ? (b / (1 << 30)).toFixed(1) + ' GiB' : b >= 1 << 20 ? (b / (1 << 20)).toFixed(1) + ' MiB' : b >= 1024 ? (b / 1024).toFixed(1) + ' KiB' : b + ' B';
+const topicPath = t => t.split('/').map(encodeURIComponent).join('/');
 function dur(s) { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + 'd ' : '') + (h ? h + 'h ' : '') + m + 'm'; }
 
 async function api(method, path, body, raw) {
@@ -284,7 +338,7 @@ function showTab(t) {
   $$('#nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
   $$('main section').forEach(s => s.classList.toggle('active', s.id === t));
   store.set('mqttget.tab', t);
-  ({ explorer: loadValues, broker: loadBroker, webhooks: loadHooks, keys: loadKeys, help: loadHelp })[t]?.();
+  ({ explorer: loadValues, history: loadHistory, broker: loadBroker, webhooks: loadHooks, keys: loadKeys, help: loadHelp })[t]?.();
 }
 
 // ---- dashboard ----
@@ -300,7 +354,8 @@ async function loadStatus() {
   $('#stats').innerHTML = [
     ['Messages / s', rate], ['Messages received', fmtN(m.messages_received)], ['Bytes received', fmtN(m.bytes_received)],
     ['Topics', fmtN(s.topics) + (s.topics_dropped ? ` <span class="muted" title="dropped: MAX_TOPICS reached">(${fmtN(s.topics_dropped)} dropped)</span>` : '')],
-    ['Published via API', fmtN(m.messages_published)], ['Webhooks', s.webhooks], ['Uptime', dur(s.uptime_sec)], ['Version', esc(s.version)],
+    ['Published via API', fmtN(m.messages_published)], ['Webhooks', s.webhooks],
+    ['History points', fmtN(s.history.points) + ` <span class="muted">${fmtBytes(s.history.bytes)}</span>`], ['Uptime', dur(s.uptime_sec)], ['Version', esc(s.version)],
   ].map(([l, v]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
   $('#connInfo').innerHTML = `<table>
     <tr><th>Broker</th><td class="mono">${esc((m.urls || []).join(', ') || '—')}</td></tr>
@@ -330,6 +385,7 @@ async function showDetail(t) {
   $('#detailUrl').textContent = location.origin + '/api/v1/values/' + t.split('/').map(encodeURIComponent).join('/');
   $('#pubTopic').value = t;
 }
+$('#detailHist').onclick = () => { showTab('history'); showHistory($('#pubTopic').value); };
 $('#refresh').onclick = loadValues;
 $('#filter').onkeydown = e => { if (e.key === 'Enter') loadValues(); };
 let autoT; $('#auto').onchange = e => { clearInterval(autoT); if (e.target.checked) autoT = setInterval(loadValues, 2000); };
@@ -345,6 +401,108 @@ $('#pubBtn').onclick = async () => {
     await api('POST', `/api/v1/publish/${t.split('/').map(encodeURIComponent).join('/')}?qos=${$('#pubQos').value}&retain=${$('#pubRetain').checked}`, $('#pubPayload').value, true);
     toast('Published'); setTimeout(loadValues, 300);
   } catch (e) { toast(e.message) }
+};
+
+// ---- history ----
+async function loadHistory() {
+  try {
+    const r = await api('GET', `/api/v1/history?filter=${encodeURIComponent($('#histFilter').value.trim() || '#')}&limit=500`), st = r.stats;
+    $('#histStats').textContent = `${st.rules} rule(s), ${fmtN(st.topics)} topics, ${fmtN(st.points)} points, ${fmtBytes(st.bytes)}${st.max_bytes ? ' of ' + fmtBytes(st.max_bytes) : ''}${st.dropped ? `, ${fmtN(st.dropped)} dropped (memory budget)` : ''}`;
+    $('#histCount').textContent = `${r.count} of ${r.total} topics`;
+    $('#histTopics').innerHTML = r.topics.map(t => `<tr class="click" data-t="${esc(t.topic)}"><td class="mono">${esc(t.topic)}</td><td>${fmtN(t.points)}</td>
+      <td>${age(t.oldest)} ago → ${age(t.newest)} ago</td><td class="mono">${esc(t.rule)}</td><td>${fmtBytes(t.bytes)}</td></tr>`).join('') ||
+      `<tr><td colspan=5 class="muted">${st.rules ? 'Nothing recorded yet' : 'No history rules: add one below'}</td></tr>`;
+    $$('#histTopics tr.click').forEach(tr => tr.onclick = () => showHistory(tr.dataset.t));
+  } catch (e) { toast(e.message) }
+  loadRules();
+}
+let histTopic = '';
+async function showHistory(t) {
+  histTopic = t || histTopic;
+  if (!histTopic) return;
+  const q = new URLSearchParams({ bucket: 'auto' });
+  if ($('#histRange').value) q.set('since', $('#histRange').value);
+  if ($('#histField').value.trim()) q.set('field', $('#histField').value.trim());
+  const path = `/api/v1/history/${topicPath(histTopic)}?${q}`;
+  $('#histCard').hidden = false; $('#histTitle').textContent = histTopic; $('#histUrl').textContent = location.origin + path;
+  try { renderSummary(await api('GET', path)); } catch (e) { $('#histBody').innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  $('#histCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+$('#histRange').onchange = () => showHistory();
+$('#histField').onkeydown = e => { if (e.key === 'Enter') showHistory(); };
+$('#histRefresh').onclick = loadHistory;
+$('#histFilter').onkeydown = e => { if (e.key === 'Enter') loadHistory(); };
+const num = v => +v.toPrecision(6);
+function renderSummary(s) {
+  if (!s.count) { $('#histBody').innerHTML = '<p class="muted">No points in this range.</p>'; return; }
+  const n = s.numeric, when = t => new Date(t).toLocaleString();
+  let html = `<p class="muted">${fmtN(s.count)} points, ${when(s.first_timestamp)} → ${when(s.last_timestamp)}${s.missing_field ? `, ${s.missing_field} without the field` : ''}${s.non_numeric ? `, ${s.non_numeric} not numeric` : ''}</p>`;
+  if (n) {
+    html += `<div class="grid">${[['Min', num(n.min), n.min_at], ['Max', num(n.max), n.max_at], ['Average', num(n.avg)], ['Last', num(n.last)], ['Change', (n.change > 0 ? '+' : '') + num(n.change)]]
+      .map(([l, v, at]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}${at ? ' · ' + new Date(at).toLocaleTimeString() : ''}</div></div>`).join('')}</div>`;
+    html += chart(s.buckets || [], s.bucket_seconds);
+  } else {
+    html += `<div class="row"><div><h2 style="margin-top:12px">Values</h2><table>${(s.distinct || []).map(d => `<tr><td class="mono">${esc(d.value)}</td><td>${fmtN(d.count)}</td></tr>`).join('')}</table></div>
+      <div><h2 style="margin-top:12px">Recent changes</h2><table>${(s.changes || []).slice().reverse().map(c => `<tr><td>${when(c.timestamp)}</td><td class="mono">${esc(c.value)}</td></tr>`).join('')}</table></div></div>`;
+  }
+  $('#histBody').innerHTML = html;
+}
+function chart(b, bucketSec) {
+  if (!b.length) return '';
+  const W = 800, H = 220, L = 56, R = 10, T = 10, B = 24;
+  const t0 = +new Date(b[0].start), t1 = +new Date(b[b.length - 1].start) + bucketSec * 1000;
+  let lo = Math.min(...b.map(x => x.min)), hi = Math.max(...b.map(x => x.max));
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const x = t => L + (t - t0) / (t1 - t0) * (W - L - R), y = v => T + (hi - v) / (hi - lo) * (H - T - B);
+  const mid = d => +new Date(d.start) + bucketSec * 500;
+  const band = b.map(d => `${x(mid(d))},${y(d.max)}`).concat(b.slice().reverse().map(d => `${x(mid(d))},${y(d.min)}`)).join(' ');
+  const line = b.map(d => `${x(mid(d))},${y(d.avg)}`).join(' ');
+  const tl = t => new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="average per ${bucketSec}s with min-max band">
+    <line class="axis" x1="${L}" y1="${H - B}" x2="${W - R}" y2="${H - B}"/><line class="axis" x1="${L}" y1="${T}" x2="${L}" y2="${H - B}"/>
+    <text x="${L - 6}" y="${T + 8}" text-anchor="end">${num(hi)}</text><text x="${L - 6}" y="${H - B}" text-anchor="end">${num(lo)}</text>
+    <text x="${L}" y="${H - 6}">${tl(t0)}</text><text x="${W - R}" y="${H - 6}" text-anchor="end">${tl(t1)}</text>
+    <polygon class="band" points="${band}"/><polyline class="line" points="${line}"/>
+    ${b.length < 3 ? b.map(d => `<circle class="dot" r="3" cx="${x(mid(d))}" cy="${y(d.avg)}"/>`).join('') : ''}
+    <text x="${W - R}" y="${T + 8}" text-anchor="end">avg per ${dur2(bucketSec)} · band = min–max</text></svg>`;
+}
+const dur2 = s => s >= 86400 ? s / 86400 + 'd' : s >= 3600 ? s / 3600 + 'h' : s >= 60 ? s / 60 + 'm' : s + 's';
+let rules = [];
+async function loadRules() {
+  try {
+    const r = await api('GET', '/api/v1/history-rules'); rules = r.rules || [];
+    $('#ruleCard').hidden = $('#ruleFormCard').hidden = false;
+  } catch (e) { $('#ruleCard').hidden = $('#ruleFormCard').hidden = true; return; } // needs an admin key
+  const limits = r => [`${fmtN(r.max_points)} pts`, r.max_age_sec && `≤ ${dur2(r.max_age_sec)} old`, r.min_interval_ms && `≥ ${r.min_interval_ms} ms apart`, r.on_change && 'on change', r.max_bytes && `≤ ${fmtBytes(r.max_bytes)}`].filter(Boolean).join(', ');
+  $('#ruleList').innerHTML = rules.map(r => `<tr><td><b>${esc(r.name || r.id)}</b>${r.env ? ' <span class="pill">env</span>' : ''}${r.enabled === false ? ' <span class="pill">disabled</span>' : ''}<div class="mono muted">${r.topics.map(esc).join('<br>')}</div></td>
+    <td>${limits(r)}</td><td>${fmtN(r.stats.topics)}</td><td>${fmtN(r.stats.points)}</td><td>${fmtBytes(r.stats.bytes)}</td><td>${fmtN(r.stats.dropped)}</td>
+    <td style="white-space:nowrap">${r.env ? '' : `<button class="btn small secondary" data-act="edit" data-id="${esc(r.id)}">Edit</button> <button class="btn small danger" data-act="del" data-id="${esc(r.id)}">Delete</button>`}</td></tr>`).join('') ||
+    '<tr><td colspan=7 class="muted">No history rules</td></tr>';
+  $$('#ruleList button').forEach(b => b.onclick = () => ruleAction(b.dataset.act, b.dataset.id));
+}
+async function ruleAction(act, id) {
+  try {
+    if (act === 'del' && confirm('Delete this rule? Its recorded history is deleted too.')) { await api('DELETE', `/api/v1/history-rules/${id}`); loadHistory(); }
+    if (act === 'edit') {
+      const r = rules.find(x => x.id === id), e = $('#ruleForm').elements;
+      $('#ruleFormTitle').textContent = 'Edit history rule';
+      for (const k of ['id', 'name', 'max_points', 'max_age_sec', 'min_interval_ms', 'max_bytes']) e[k].value = r[k] ?? '';
+      e.topics.value = r.topics.join('\n'); e.on_change.checked = !!r.on_change; e.enabled.checked = r.enabled !== false;
+      $('#ruleForm').scrollIntoView({ behavior: 'smooth' });
+    }
+  } catch (e) { toast(e.message) }
+}
+$('#ruleReset').onclick = () => { $('#ruleForm').reset(); $('#ruleForm').elements.id.value = ''; $('#ruleFormTitle').textContent = 'New history rule'; };
+$('#ruleForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const e = ev.target.elements, n = k => parseInt(e[k].value) || 0;
+  const body = { name: e.name.value.trim(), topics: lines(e.topics.value), max_points: n('max_points'), max_age_sec: n('max_age_sec'),
+    min_interval_ms: n('min_interval_ms'), max_bytes: n('max_bytes'), on_change: e.on_change.checked, enabled: e.enabled.checked };
+  try {
+    const id = e.id.value;
+    await api(id ? 'PUT' : 'POST', id ? `/api/v1/history-rules/${id}` : '/api/v1/history-rules', body);
+    $('#ruleErr').textContent = ''; toast('History rule saved'); $('#ruleReset').click(); loadHistory();
+  } catch (err) { $('#ruleErr').textContent = err.message; }
 };
 
 // ---- broker ----
@@ -468,6 +626,14 @@ curl -X POST -H "Authorization: Bearer ${k}" -H 'Content-Type: application/json'
 # Create a webhook
 curl -X POST -H "Authorization: Bearer ${k}" -H 'Content-Type: application/json' \\
   -d '{"url":"https://example.com/hook","topics":["alerts/#"],"batch_size":100}' ${o}/api/v1/webhooks
+
+# History of a topic: raw points, or a summary with time buckets (needs a history rule)
+curl -H "Authorization: Bearer ${k}" "${o}/api/v1/history/home/kitchen/temperature?since=1h"
+curl -H "Authorization: Bearer ${k}" "${o}/api/v1/history/home/kitchen/temperature?since=24h&field=celsius&bucket=1h"
+
+# Keep the last 1000 points (at most one per minute) of every temperature topic
+curl -X POST -H "Authorization: Bearer ${k}" -H 'Content-Type: application/json' \\
+  -d '{"topics":["home/+/temperature"],"max_points":1000,"min_interval_ms":60000}' ${o}/api/v1/history-rules
 
 # Prometheus metrics
 curl -H "Authorization: Bearer ${k}" ${o}/metrics`;

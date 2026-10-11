@@ -126,3 +126,40 @@ func TestSplitValidation(t *testing.T) {
 		t.Fatal("unknown mode must be rejected")
 	}
 }
+
+func TestHistoryFromEnv(t *testing.T) {
+	env := map[string]string{}
+	Env = func(k string) string { return env[k] }
+	defer func() { Env = os.Getenv }()
+	if _, ok, err := HistoryFromEnv(); ok || err != nil {
+		t.Fatal("rule without HISTORY_TOPICS")
+	}
+	env["HISTORY_TOPICS"] = "home/+/temp, plant/#"
+	env["HISTORY_MAX_AGE_SEC"] = "3600"
+	env["HISTORY_ON_CHANGE"] = "true"
+	r, ok, err := HistoryFromEnv()
+	if !ok || err != nil || r.ID != "env" || !r.Env || len(r.Topics) != 2 || r.MaxPoints != DefaultHistoryPoints || r.MaxAgeSec != 3600 || !r.OnChange {
+		t.Fatalf("%+v %v", r, err)
+	}
+	env["HISTORY_TOPICS"] = "bad/#/x"
+	if _, _, err := HistoryFromEnv(); err == nil {
+		t.Fatal("invalid filter accepted")
+	}
+}
+
+func TestHistoryRuleValidate(t *testing.T) {
+	for _, r := range []HistoryRule{
+		{},
+		{Topics: []string{"a"}, MaxPoints: MaxHistoryPoints + 1},
+		{Topics: []string{"a"}, MaxAgeSec: -1},
+	} {
+		if r.Validate() == nil {
+			t.Errorf("%+v accepted", r)
+		}
+	}
+	r := HistoryRule{Topics: []string{"a/#"}}
+	r.Normalize()
+	if r.Validate() != nil || r.MaxPoints != DefaultHistoryPoints || !r.IsEnabled() {
+		t.Fatalf("%+v", r)
+	}
+}

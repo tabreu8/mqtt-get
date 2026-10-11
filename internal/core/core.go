@@ -12,12 +12,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
+	"github.com/tabreu8/mqtt-get/internal/history"
 	"github.com/tabreu8/mqtt-get/internal/mqttc"
 	"github.com/tabreu8/mqtt-get/internal/state"
 	"github.com/tabreu8/mqtt-get/internal/store"
@@ -36,8 +40,15 @@ type Service struct {
 	store   *store.Store
 	mqtt    *mqttc.Manager
 	hooks   *webhook.Dispatcher
+	hist    *history.History
 	watch   *watchers
 	started time.Time
+	// envHistory is the history rule from HISTORY_* variables, if any.
+	envHistory *config.HistoryRule
+	histMu     sync.Mutex // serializes history rule changes
+	histSaved  bool       // a snapshot file exists (owned by historyLoop after Start)
+	stop       chan struct{}
+	bg         sync.WaitGroup
 	// brokerSource tells where the active broker config came from
 	// ("saved", "env" or "none").
 	brokerSource atomic.Value
@@ -51,8 +62,10 @@ func New(cfg config.Server, log *slog.Logger, st *state.State) *Service {
 		state:   st,
 		store:   store.New(cfg.MaxTopics),
 		hooks:   webhook.New(log),
+		hist:    history.New(history.Options{MaxBytes: cfg.HistoryMaxBytes}),
 		watch:   newWatchers(),
 		started: time.Now(),
+		stop:    make(chan struct{}),
 	}
 	s.mqtt = mqttc.New(log, s.Ingest)
 	return s
@@ -63,17 +76,43 @@ func New(cfg config.Server, log *slog.Logger, st *state.State) *Service {
 //
 // The message is passed by value and only copied to the heap when a webhook
 // or watcher matches it, so plain ingest allocates nothing here (and the
-// store updates existing topics in place).
+// store updates existing topics in place; history rings reuse their slots).
 func (s *Service) Ingest(e store.Entry) {
 	s.store.Set(&e)
+	s.hist.Add(&e)
 	s.hooks.Dispatch(e)
 	s.watch.dispatch(e)
 }
 
-// Start loads webhooks and connects to the broker. Broker configuration
-// saved through the API takes precedence over MQTT_* environment variables.
+// SetEnvHistoryRule registers the history rule built from HISTORY_*
+// environment variables. Call it before Start.
+func (s *Service) SetEnvHistoryRule(r config.HistoryRule) { s.envHistory = &r }
+
+// historyPath is where history snapshots are saved ("" = not persisted).
+func (s *Service) historyPath() string {
+	if !s.cfg.HistoryPersist || s.cfg.DataDir == "" || s.state.Path() == "" {
+		return ""
+	}
+	return filepath.Join(s.cfg.DataDir, "history.bin")
+}
+
+// Start loads webhooks and history, and connects to the broker. Broker
+// configuration saved through the API takes precedence over MQTT_*
+// environment variables.
 func (s *Service) Start(envBroker config.Broker, envOK bool) error {
 	s.hooks.Set(s.state.Webhooks())
+	s.applyHistoryRules()
+	if p := s.historyPath(); p != "" {
+		_, err := os.Stat(p)
+		s.histSaved = err == nil
+		if err := s.hist.Load(p); err != nil {
+			s.log.Error("history: could not restore the snapshot", "file", p, "err", err)
+		} else if st := s.hist.Stats(); st.Points > 0 {
+			s.log.Info("history: restored", "file", p, "topics", st.Topics, "points", st.Points)
+		}
+	}
+	s.bg.Add(1)
+	go s.historyLoop()
 	b, ok := s.state.Broker()
 	switch {
 	case ok:
@@ -89,10 +128,59 @@ func (s *Service) Start(envBroker config.Broker, envOK bool) error {
 	return s.mqtt.Apply(b)
 }
 
-// Close shuts everything down.
+// Close shuts everything down (saving the history snapshot).
 func (s *Service) Close() {
 	s.mqtt.Close()
 	s.hooks.Close()
+	select {
+	case <-s.stop:
+	default:
+		close(s.stop)
+	}
+	s.bg.Wait()
+}
+
+// historyLoop expires old history points and saves snapshots periodically,
+// and once more on shutdown.
+func (s *Service) historyLoop() {
+	defer s.bg.Done()
+	sweep := time.NewTicker(10 * time.Second)
+	defer sweep.Stop()
+	snapEvery := time.Duration(s.cfg.HistorySnapshotSec) * time.Second
+	var snap <-chan time.Time
+	if s.historyPath() != "" && snapEvery > 0 {
+		t := time.NewTicker(snapEvery)
+		defer t.Stop()
+		snap = t.C
+	}
+	for {
+		select {
+		case <-sweep.C:
+			s.hist.Sweep()
+		case <-snap:
+			s.saveHistory()
+		case <-s.stop:
+			s.saveHistory()
+			return
+		}
+	}
+}
+
+func (s *Service) saveHistory() {
+	p := s.historyPath()
+	if p == "" {
+		return
+	}
+	if s.hist.Stats().Topics == 0 && !s.histSaved {
+		return // nothing recorded and no previous snapshot to overwrite
+	}
+	start := time.Now()
+	if err := s.hist.Save(p); err != nil {
+		s.log.Error("history: snapshot failed", "file", p, "err", err)
+		return
+	}
+	s.histSaved = true
+	s.log.Debug("history: snapshot saved", "file", p, "ms", time.Since(start).Milliseconds())
 }
 
 // Config returns the process settings.
@@ -526,16 +614,17 @@ func (s *Service) DeleteKey(caller *Principal, id string) error {
 
 // StatusView summarizes the service.
 type StatusView struct {
-	Version       string       `json:"version"`
-	UptimeSec     int64        `json:"uptime_sec"`
-	MQTT          mqttc.Status `json:"mqtt"`
-	Topics        int          `json:"topics"`
-	TopicsDropped uint64       `json:"topics_dropped"`
-	MaxTopics     int          `json:"max_topics"`
-	Webhooks      int          `json:"webhooks"`
-	Watchers      int          `json:"active_watchers"`
-	BrokerSource  string       `json:"broker_source"`
-	StateFile     string       `json:"state_file,omitempty"`
+	Version       string        `json:"version"`
+	UptimeSec     int64         `json:"uptime_sec"`
+	MQTT          mqttc.Status  `json:"mqtt"`
+	Topics        int           `json:"topics"`
+	TopicsDropped uint64        `json:"topics_dropped"`
+	MaxTopics     int           `json:"max_topics"`
+	Webhooks      int           `json:"webhooks"`
+	History       history.Stats `json:"history"`
+	Watchers      int           `json:"active_watchers"`
+	BrokerSource  string        `json:"broker_source"`
+	StateFile     string        `json:"state_file,omitempty"`
 }
 
 // Status returns the service status.
@@ -548,6 +637,7 @@ func (s *Service) Status() StatusView {
 		TopicsDropped: s.store.Dropped(),
 		MaxTopics:     s.cfg.MaxTopics,
 		Webhooks:      len(s.state.Webhooks()),
+		History:       s.hist.Stats(),
 		Watchers:      s.watch.count(),
 		BrokerSource:  s.source(),
 		StateFile:     s.state.Path(),

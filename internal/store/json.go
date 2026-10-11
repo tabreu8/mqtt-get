@@ -33,20 +33,8 @@ func AppendJSON(buf []byte, e *Entry) []byte {
 	buf = append(buf, `{"topic":`...)
 	buf = AppendString(buf, e.Topic)
 	buf = append(buf, `,"payload":`...)
-	enc := Encoding(e.Payload)
-	switch enc {
-	case EncJSON:
-		buf = append(buf, e.Payload...)
-	case EncUTF8:
-		buf = AppendString(buf, string(e.Payload))
-	default:
-		buf = append(buf, '"')
-		buf = base64.StdEncoding.AppendEncode(buf, e.Payload)
-		buf = append(buf, '"')
-	}
-	buf = append(buf, `,"encoding":"`...)
-	buf = append(buf, enc...)
-	buf = append(buf, `","qos":`...)
+	buf = AppendPayload(buf, e.Payload)
+	buf = append(buf, `,"qos":`...)
 	buf = strconv.AppendUint(buf, uint64(e.QoS), 10)
 	buf = append(buf, `,"retained":`...)
 	buf = strconv.AppendBool(buf, e.Retained)
@@ -55,6 +43,26 @@ func AppendJSON(buf []byte, e *Entry) []byte {
 	buf = append(buf, '"')
 	buf = appendProps(buf, e.Props)
 	return append(buf, '}')
+}
+
+// AppendPayload appends a payload and its encoding as JSON:
+//
+//	<payload>,"encoding":"json"
+func AppendPayload(buf, p []byte) []byte {
+	enc := Encoding(p)
+	switch enc {
+	case EncJSON:
+		buf = append(buf, p...)
+	case EncUTF8:
+		buf = AppendString(buf, string(p))
+	default:
+		buf = append(buf, '"')
+		buf = base64.StdEncoding.AppendEncode(buf, p)
+		buf = append(buf, '"')
+	}
+	buf = append(buf, `,"encoding":"`...)
+	buf = append(buf, enc...)
+	return append(buf, '"')
 }
 
 const hexDigits = "0123456789abcdef"

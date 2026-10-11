@@ -359,12 +359,13 @@ func (s *Server) dispatch(ctx context.Context, sess *session, req *request) (any
 	return nil, &rpcError{Code: codeMethodNotFound, Message: "method not found: " + req.Method}
 }
 
-const instructions = `mqtt-get gives you live access to an MQTT broker: the latest value of every topic, publishing, and waiting for events.
+const instructions = `mqtt-get gives you live access to an MQTT broker: the latest value of every topic, recent history of selected topics, publishing, and waiting for events.
 
 How to work with it:
 1. Discover: call describe_topic_tree (start with no prefix, then drill down with prefix) or list_topics with an MQTT filter. Topic levels are separated by "/"; in filters "+" matches one level and "#" matches all remaining levels.
 2. Read: get_value for one topic, get_values for several topics or a filter. Each value has age_seconds; treat old values as possibly stale (max_age_seconds makes that explicit).
 3. React: wait_for_message blocks until a matching message arrives (use it to observe changes or events instead of polling).
+   Look back: get_history summarizes the past values of a topic (trends, min/max, when a state changed) for topics that have history rules; list_history_topics shows which ones do.
 4. Act: publish sends a message. To control a device and confirm the result, use publish_and_wait (publish a command, wait for the state/response topic). Publishing can change real equipment: confirm intent with the user before sending commands, and never guess command formats. Look at existing values on the device's topics first.
 Payloads that are valid JSON are returned as JSON (encoding "json"); text as a string ("utf8"); binary as base64 ("base64").
 Resources: mqtt-get://topic/{topic} is the latest value of a topic (subscribe to get notified when it changes); mqtt-get://values?filter={filter} is the latest values matching a filter.`

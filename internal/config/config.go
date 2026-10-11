@@ -411,6 +411,67 @@ func isSecretHeader(k string) bool {
 	return k == "authorization" || strings.Contains(k, "token") || strings.Contains(k, "key") || strings.Contains(k, "secret")
 }
 
+// HistoryRule keeps a bounded history of the messages on matching topics,
+// in memory. Every limit applies per topic except MaxBytes, which bounds all
+// the topics of the rule together. When several rules match a topic, the
+// first one (in configuration order) applies.
+type HistoryRule struct {
+	ID     string   `json:"id"`
+	Name   string   `json:"name,omitempty"`
+	Topics []string `json:"topics"`
+	// MaxPoints is the ring buffer size per topic (default 1000).
+	MaxPoints int `json:"max_points,omitempty"`
+	// MaxAgeSec drops points older than this (0 = no age limit).
+	MaxAgeSec int `json:"max_age_sec,omitempty"`
+	// MinIntervalMs keeps at most one point per interval per topic (the
+	// first one), downsampling fast publishers. 0 keeps every message.
+	MinIntervalMs int `json:"min_interval_ms,omitempty"`
+	// OnChange skips a message whose payload equals the previous point's.
+	OnChange bool `json:"on_change,omitempty"`
+	// MaxBytes bounds the memory of all the rule's topics together
+	// (0 = only the global HISTORY_MAX_BYTES applies).
+	MaxBytes int64 `json:"max_bytes,omitempty"`
+	Enabled  *bool `json:"enabled,omitempty"`
+	// Env marks the rule built from HISTORY_* environment variables (not
+	// persisted, read-only through the API).
+	Env bool `json:"env,omitempty"`
+}
+
+// History limits.
+const (
+	DefaultHistoryPoints = 1000
+	MaxHistoryPoints     = 1_000_000
+)
+
+// IsEnabled returns the effective enabled flag (default true).
+func (r *HistoryRule) IsEnabled() bool { return r.Enabled == nil || *r.Enabled }
+
+// Normalize fills defaults.
+func (r *HistoryRule) Normalize() {
+	if r.MaxPoints <= 0 {
+		r.MaxPoints = DefaultHistoryPoints
+	}
+}
+
+// Validate checks the rule.
+func (r *HistoryRule) Validate() error {
+	if len(r.Topics) == 0 {
+		return errors.New("at least one topic filter is required")
+	}
+	for _, f := range r.Topics {
+		if err := topic.ValidateFilter(f); err != nil {
+			return fmt.Errorf("topic %q: %w", f, err)
+		}
+	}
+	if r.MaxPoints > MaxHistoryPoints {
+		return fmt.Errorf("max_points must be <= %d", MaxHistoryPoints)
+	}
+	if r.MaxAgeSec < 0 || r.MinIntervalMs < 0 || r.MaxBytes < 0 {
+		return errors.New("max_age_sec, min_interval_ms and max_bytes must not be negative")
+	}
+	return nil
+}
+
 // API key scopes.
 const (
 	ScopeRead    = "read"    // read latest values, topics, status
@@ -453,6 +514,11 @@ type Server struct {
 	PublishTimeout   time.Duration
 	TLSCertFile      string
 	TLSKeyFile       string
+	// History: global memory limit, and whether (and how often) history is
+	// saved to DATA_DIR/history.bin to survive restarts.
+	HistoryMaxBytes    int64
+	HistoryPersist     bool
+	HistorySnapshotSec int
 }
 
 // Env is the source of environment variables (overridable in tests).
@@ -479,11 +545,31 @@ func LoadServer() (Server, error) {
 		PublishTimeout:   time.Duration(envInt("PUBLISH_TIMEOUT_MS", 5000)) * time.Millisecond,
 		TLSCertFile:      envStr("HTTP_TLS_CERT_FILE", ""),
 		TLSKeyFile:       envStr("HTTP_TLS_KEY_FILE", ""),
+
+		HistoryMaxBytes:    int64(envInt("HISTORY_MAX_BYTES", 256<<20)),
+		HistoryPersist:     envBool("HISTORY_PERSIST", true),
+		HistorySnapshotSec: envInt("HISTORY_SNAPSHOT_SEC", 300),
 	}
 	if (s.TLSCertFile == "") != (s.TLSKeyFile == "") {
 		return s, errors.New("HTTP_TLS_CERT_FILE and HTTP_TLS_KEY_FILE must be set together")
 	}
 	return s, nil
+}
+
+// HistoryFromEnv builds the history rule given by HISTORY_TOPICS (and the
+// other HISTORY_* variables). ok is false when HISTORY_TOPICS is not set.
+func HistoryFromEnv() (r HistoryRule, ok bool, err error) {
+	r.Topics = envList("HISTORY_TOPICS")
+	if len(r.Topics) == 0 {
+		return r, false, nil
+	}
+	r.ID, r.Name, r.Env = "env", "environment (HISTORY_TOPICS)", true
+	r.MaxPoints = envInt("HISTORY_MAX_POINTS", DefaultHistoryPoints)
+	r.MaxAgeSec = envInt("HISTORY_MAX_AGE_SEC", 0)
+	r.MinIntervalMs = envInt("HISTORY_MIN_INTERVAL_MS", 0)
+	r.OnChange = envBool("HISTORY_ON_CHANGE", false)
+	r.Normalize()
+	return r, true, r.Validate()
 }
 
 // BrokerFromEnv builds a broker configuration from MQTT_* variables. ok is

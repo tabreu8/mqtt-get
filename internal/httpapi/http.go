@@ -86,6 +86,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/keys", s.auth(admin, s.handleKeyCreate))
 	mux.HandleFunc("DELETE /api/v1/keys/{id}", s.auth(admin, s.handleKeyDelete))
 
+	s.historyRoutes(mux)
+
 	mux.HandleFunc("GET /api/v1/tree", s.auth(read, s.handleTree))
 	mux.HandleFunc("GET /api/v1/wait", s.auth(read, s.handleWait))
 

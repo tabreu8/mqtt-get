@@ -31,7 +31,10 @@ type value struct {
 	ExpiresInSeconds *float64       `json:"expires_in_seconds,omitempty"`
 }
 
-func viewOf(e *store.Entry) value {
+func viewOf(e *store.Entry) value { return viewOfLimit(e, maxPayloadBytes) }
+
+// viewOfLimit is viewOf showing at most limit payload bytes.
+func viewOfLimit(e *store.Entry, limit int) value {
 	v := value{
 		Topic:        e.Topic,
 		QoS:          e.QoS,
@@ -69,9 +72,9 @@ func viewOf(e *store.Entry) value {
 		}
 	}
 	p := e.Payload
-	if len(p) > maxPayloadBytes {
+	if len(p) > limit {
 		v.Truncated = true
-		p = p[:maxPayloadBytes]
+		p = p[:limit]
 		if v.Encoding == store.EncJSON {
 			// Partial JSON is not JSON: show it as text.
 			v.Encoding = store.EncUTF8

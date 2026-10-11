@@ -30,6 +30,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	metric("mqttget_topics", "gauge", "Distinct topics with a stored latest value.", s.svc.Store().Len())
 	metric("mqttget_topics_dropped_total", "counter", "Messages not stored because MAX_TOPICS was reached.", s.svc.Store().Dropped())
 	metric("mqttget_active_watchers", "gauge", "Active waits and MCP resource subscriptions.", s.svc.Status().Watchers)
+	hs := s.svc.HistoryStats()
+	metric("mqttget_history_topics", "gauge", "Topics with recorded history.", hs.Topics)
+	metric("mqttget_history_points", "gauge", "History points kept in memory.", hs.Points)
+	metric("mqttget_history_bytes", "gauge", "Approximate memory used by history.", hs.Bytes)
+	metric("mqttget_history_max_bytes", "gauge", "HISTORY_MAX_BYTES (0 = unlimited).", hs.MaxBytes)
+	metric("mqttget_history_dropped_total", "counter", "Messages not recorded because a history byte budget was exhausted.", hs.Dropped)
 	metric("mqttget_goroutines", "gauge", "Number of goroutines.", runtime.NumGoroutine())
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)

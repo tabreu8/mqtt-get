@@ -1,6 +1,6 @@
 # mqtt-get
 
-**A fast, lightweight bridge between MQTT, systems and AI agents.** mqtt-get connects to your MQTT broker and remembers the **latest value of every topic**. It serves that data through two interfaces built on the same core: a **REST API** for systems and an **MCP server** for AI agents. You can also **publish**, forward messages to **webhooks**, and configure everything from **environment variables, REST, MCP or a built-in web UI**.
+**A fast, lightweight bridge between MQTT, systems and AI agents.** mqtt-get connects to your MQTT broker and remembers the **latest value of every topic**. It serves that data through two interfaces built on the same core: a **REST API** for systems and an **MCP server** for AI agents. You can also keep a bounded **history** of selected topics, **publish**, forward messages to **webhooks**, and configure everything from **environment variables, REST, MCP or a built-in web UI**.
 
 [![ci](https://github.com/tabreu8/mqtt-get/actions/workflows/ci.yml/badge.svg)](https://github.com/tabreu8/mqtt-get/actions/workflows/ci.yml)
 
@@ -22,6 +22,7 @@ curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/values/factory
 - [How it works](#how-it-works)
 - [Reading values (GET)](#reading-values-get)
 - [Publishing (POST)](#publishing-post)
+- [History](#history)
 - [Webhooks](#webhooks)
 - [Connecting to your broker](#connecting-to-your-broker) (auth methods and recipes for Mosquitto, EMQX, HiveMQ, NanoMQ, Coreflux, AWS IoT Core, Azure IoT Hub; [MQTT 5](#mqtt-5), [Last Will](#last-will-and-status-topic), [persistent sessions](#persistent-sessions))
 - [Tested brokers](#tested-brokers)
@@ -45,6 +46,7 @@ MQTT is great for devices and poor for everything else. A dashboard, a spreadshe
 | | |
 |---|---|
 | **Latest value, instantly** | Every message is kept in memory per topic. `GET` returns the newest one; `?filter=home/+/temp` returns many at once. |
+| **Recent history, on request** | Topics matched by a history rule keep their last N messages in memory, with TTL, downsampling and byte budgets. Ask for raw points, time buckets (min/max/avg) or a compact summary that fits an agent's context. |
 | **Publish over HTTP** | Raw body or JSON, single messages or batches, QoS 0/1/2, retain. |
 | **Built for agents too** | A full MCP server (tools, resources with live notifications, prompts, completion) over HTTP or stdio, tested with the official TypeScript and Python SDKs. |
 | **Webhooks** | Push matching messages to any URL, with batching, retries, HMAC signatures and backpressure. |
@@ -123,7 +125,7 @@ flowchart LR
 3. The message is matched, using lock-free topic tries, against webhook filters (each webhook has its own bounded queue) and against active watchers (agents waiting for events, resource subscriptions).
 4. **REST and MCP are two thin interfaces over the same core.** Every operation, validation rule, scope check and error is implemented once, so both behave the same way. The interfaces only differ in presentation: REST speaks HTTP and JSON for systems, while MCP adds what agents need (discovery, events, safety hints).
 
-Values live in memory. After a restart they are rebuilt as messages arrive, and **retained** messages are replayed by the broker immediately on subscribe. Configuration (broker settings, webhooks, API keys) is persisted to `DATA_DIR/state.json`.
+Values live in memory. After a restart they are rebuilt as messages arrive, and **retained** messages are replayed by the broker immediately on subscribe. Configuration (broker settings, webhooks, history rules, API keys) is persisted to `DATA_DIR/state.json`. [History](#history), when enabled, is kept in memory too and saved to `DATA_DIR/history.bin` periodically and on shutdown.
 
 ## Reading values (GET)
 
@@ -214,6 +216,88 @@ curl -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json'
 Batches are pipelined. All messages are handed to the broker first, then acknowledgements are awaited, so a batch of 1000 QoS 1 messages takes about one round trip instead of 1000. QoS 1/2 publishes return only after the broker acknowledges them (timeout `PUBLISH_TIMEOUT_MS`).
 
 If the broker is unreachable you get **503** `{"error":"not connected to MQTT broker"}`, and nothing is queued.
+
+## History
+
+By default mqtt-get keeps only the latest value of each topic. **History rules** make selected topics also keep their recent messages, so systems and agents can ask *"what was the temperature over the last hour?"* or *"when did the press stop?"*.
+
+History is **opt-in, in memory and bounded**. With no rules it costs nothing. It is meant for short-term context (minutes to days). For long-term storage, forward messages to a time-series database with a [webhook](#webhooks).
+
+```bash
+# Keep up to 1000 points per temperature topic, at most one per minute, for 24 hours
+curl -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"temperatures","topics":["home/+/temperature"],"max_points":1000,"max_age_sec":86400,"min_interval_ms":60000}' \
+  localhost:8080/api/v1/history-rules
+```
+
+Rules can also be managed in the web UI (History tab), over MCP (`create_history_rule`), or with environment variables (below). Recording starts when the rule is created.
+
+### Rule settings
+
+| Field | Default | |
+|---|---|---|
+| `topics` | (required) | Topic filters to record |
+| `max_points` | `1000` | Ring buffer size per topic: the oldest point is dropped when it's full (max 1,000,000) |
+| `max_age_sec` | `0` (none) | Drop points older than this (TTL) |
+| `min_interval_ms` | `0` (every message) | Keep at most one point per interval per topic (the first one). Downsamples fast publishers: a 10 Hz sensor would otherwise fill 1000 points in 100 s |
+| `on_change` | `false` | Skip a message whose payload equals the previous point (good for status topics) |
+| `max_bytes` | `0` (global limit only) | Memory budget for all the rule's topics together |
+| `enabled` | `true` | |
+
+When several rules match a topic, the **first** one in the list applies. Changing or deleting a rule applies at once: lowering a limit trims the recorded points, and topics no rule matches anymore lose their history.
+
+**Memory** is bounded by `max_points` per topic, each rule's `max_bytes`, and the global `HISTORY_MAX_BYTES` (default 256 MiB). A point costs its payload plus its topic name plus 24 bytes. When a budget is full, a topic makes room by dropping its **own** oldest points, so one noisy topic can't erase the others. A new topic doesn't start recording while the budget is exhausted (counted in `mqttget_history_dropped_total`).
+
+### Reading history
+
+```bash
+# Raw points of the last hour (newest 1000 by default; oldest first)
+curl -H "Authorization: Bearer $KEY" "localhost:8080/api/v1/history/home/kitchen/temperature?since=1h"
+```
+```json
+{"topic":"home/kitchen/temperature","rule":"temperatures","total":60,"count":60,"points":[{"payload":{"celsius":22.9},"encoding":"json","qos":0,"retained":false,"timestamp":"2026-10-11T12:01:00Z"}, …]}
+```
+
+```bash
+# Aggregated: a value inside the JSON payload, in 1-hour buckets
+curl -H "Authorization: Bearer $KEY" "localhost:8080/api/v1/history/home/kitchen/temperature?since=24h&field=celsius&bucket=1h"
+```
+```json
+{"topic":"home/kitchen/temperature","rule":"temperatures","count":1440,"first_timestamp":"…","last_timestamp":"…","field":"celsius",
+ "numeric":{"count":1440,"min":19.2,"min_at":"…","max":24.6,"max_at":"…","avg":21.94,"first":20.1,"last":22.8,"change":2.7},
+ "bucket_seconds":3600,"buckets":[{"start":"2026-10-10T13:00:00Z","count":60,"min":20.1,"max":21.4,"avg":20.7,"first":20.1,"last":21.4}, …]}
+```
+
+| Query | Effect |
+|---|---|
+| `since`, `until` | RFC 3339 timestamp, Unix seconds, or a duration before now (`15m`, `24h`, `7d`). Default: everything recorded |
+| `limit` | Newest points returned (default 1000, max 100000). `total` counts all points in the range |
+| `field` | Dot path of the value inside a JSON payload: `celsius`, `data.temp`, `values.0` |
+| `bucket` | Bucket size (`30s`, `5m`, `1h`) or `auto` (about 60 buckets over the range) |
+| `summary=true` | Summary without buckets |
+| `format=csv` | CSV of the points, or of the buckets when aggregating |
+
+Adding `field`, `bucket` or `summary` returns a **summary** instead of points. Numbers (JSON numbers, numeric text, and booleans as 1/0) get `numeric` statistics and buckets. For text values such as `running`/`stopped`, the summary lists the **distinct values** with counts and the **last 20 changes**.
+
+`GET /api/v1/history?filter=…` lists the topics with history (points, time span, memory). `DELETE /api/v1/history/{topic}` clears one topic, and `DELETE /api/v1/history` clears all (admin).
+
+**Agents** use the MCP tool `get_history`. It returns a summary by default (statistics, about 60 buckets, or distinct values and changes), so a day of data fits in a small part of the context. `mode: "points"` returns raw messages.
+
+### Persistence and environment variables
+
+History survives restarts: it is saved to `DATA_DIR/history.bin` (gzip) every `HISTORY_SNAPSHOT_SEC` and on shutdown, and restored on start under the current rules. Saving copies each topic's point list under its lock, then writes outside it, so ingest isn't blocked. If the process is killed, up to `HISTORY_SNAPSHOT_SEC` of history is lost. Set `HISTORY_PERSIST=false` to keep history in memory only.
+
+| Variable | Default | |
+|---|---|---|
+| `HISTORY_MAX_BYTES` | `268435456` (256 MiB) | Global memory budget for history (`0` = unlimited) |
+| `HISTORY_PERSIST` | `true` | Save and restore history in `DATA_DIR` |
+| `HISTORY_SNAPSHOT_SEC` | `300` | Snapshot interval (`0` = only on shutdown) |
+| `HISTORY_TOPICS` | – | Comma-separated filters: creates a read-only rule `env` (matched before the API rules) |
+| `HISTORY_MAX_POINTS`, `HISTORY_MAX_AGE_SEC`, `HISTORY_MIN_INTERVAL_MS`, `HISTORY_ON_CHANGE` | – | Settings of the `env` rule |
+
+### Performance
+
+Topics without history pay one atomic load per message when there are no rules, and one lock-free filter match (~70 ns) when there are. A recorded message adds about **120 ns and no allocation**: the point keeps a reference to the payload the latest-value store already holds (never copied), and a full ring reuses its slots. Counters are only touched when the totals change. Measured with 10,000 topics all recording: ingest went from ~170 ns to ~290 ns per message, 0 allocations.
 
 ## Webhooks
 
@@ -587,7 +671,8 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `API_KEYS_PUBLISH` | – | Read + publish keys |
 | `AUTH_DISABLED` | `false` | Turn off API authentication (trusted networks only) |
 | `ALLOW_QUERY_API_KEY` | `false` | Also accept `?api_key=` (for clients that can't set headers) |
-| `DATA_DIR` | `./data` | Where `state.json` is kept (`/data` in the Docker image) |
+| `DATA_DIR` | `./data` | Where `state.json` (and `history.bin`) is kept (`/data` in the Docker image) |
+| `HISTORY_*` | – | History memory budget, persistence and an optional environment rule: see [History](#history) |
 | `MAX_TOPICS` | `1000000` | Memory guard: new topics beyond this are not stored (counted in metrics) |
 | `MAX_BODY_BYTES` | `1048576` | Maximum request body |
 | `PUBLISH_TIMEOUT_MS` | `5000` | Maximum wait for broker acknowledgement |
@@ -676,6 +761,7 @@ Open `http://<host>:8080/` and sign in with an API key. The UI uses the same RES
 
 - **Dashboard**: connection state, live message rate, counters, last error.
 - **Explorer**: browse latest values by filter (with auto-refresh), inspect a topic, copy its GET URL, publish messages.
+- **History**: topics with history, a chart (average per bucket with a min–max band) or the values and changes of a status topic, and history rules with live usage.
 - **Broker**: every connection option, including pasting PEM certificates, with *Save & connect*.
 - **Webhooks**: create, edit, test and delete, with live delivered/failed/dropped counters and the last error.
 - **API keys**: create (shown once) and revoke.
@@ -746,6 +832,8 @@ claude mcp add --transport http mqtt http://localhost:8080/mcp --header "Authori
 | `get_value` | read | read-only | Latest value of one topic (`max_age_seconds` detects stale data) |
 | `get_values` | read | read-only | Several topics, or all matching a filter |
 | `wait_for_message` | read | read-only | Block until a matching message arrives (up to 5 min) |
+| `get_history` | read | read-only | Past values of a topic: summary (stats, buckets, distinct values and changes) or raw points |
+| `list_history_topics` | read | read-only | Topics with history and the span each covers |
 | `publish` | publish | **destructive**, open-world | Send a message (string, JSON value or base64) |
 | `publish_and_wait` | publish | **destructive**, open-world | Send a command, return the response or state change |
 | `get_broker_config` | admin | read-only | Connection settings (secrets redacted) |
@@ -753,6 +841,7 @@ claude mcp add --transport http mqtt http://localhost:8080/mcp --header "Authori
 | `reconnect_broker` | admin | | Force a reconnect |
 | `list_webhooks`, `create_webhook`, `update_webhook`, `delete_webhook`, `test_webhook` | admin | `delete_webhook` is **destructive** | Webhooks with delivery stats |
 | `list_api_keys`, `create_api_key`, `revoke_api_key` | admin | `revoke_api_key` is **destructive** | Scoped API keys |
+| `list_history_rules`, `create_history_rule`, `update_history_rule`, `delete_history_rule`, `clear_history` | admin | `update_`, `delete_history_rule` and `clear_history` are **destructive** | [History](#history) rules and data |
 
 ### Resources
 
@@ -797,6 +886,9 @@ Metrics:
 | `mqttget_messages_published_total` / `mqttget_publish_errors_total` | counter | Publishing via the API |
 | `mqttget_topics` | gauge | Topics held in memory |
 | `mqttget_topics_dropped_total` | counter | Messages not stored because `MAX_TOPICS` was reached |
+| `mqttget_history_topics` / `mqttget_history_points` / `mqttget_history_bytes` | gauge | [History](#history) in memory (bytes approximate) |
+| `mqttget_history_max_bytes` | gauge | `HISTORY_MAX_BYTES` |
+| `mqttget_history_dropped_total` | counter | Messages not recorded because a history byte budget was full |
 | `mqttget_webhook_{delivered,failed,dropped,requests}_total{webhook="id"}` | counter | Per webhook |
 | `mqttget_webhook_queue_length{webhook="id"}` | gauge | Rising steadily means the endpoint can't keep up |
 | `mqttget_heap_bytes`, `mqttget_goroutines` | gauge | |
@@ -874,6 +966,7 @@ A stored topic costs about **135 bytes plus its name and payload** (measured wit
 - **Containers.** When a cgroup memory limit exists (Docker `--memory`, Kubernetes `limits.memory`), a soft Go memory limit is set at 90% of it, so the collector works harder instead of the container being OOM-killed.
 - **Overrides.** Setting the standard `GOGC` or `GOMEMLIMIT` environment variables disables the automatic tuning. For example, `GOGC=400 GOMEMLIMIT=400MiB` keeps a 1M-topic instance at ~390 MB while still collecting rarely. The startup log shows the active policy (`runtime: garbage collector`).
 - `MAX_TOPICS` (default 1M) remains the hard guard against unbounded topic growth.
+- History is bounded separately by its own limits (`HISTORY_MAX_BYTES`, default 256 MiB; see [History](#history)).
 
 **Scaling out** to millions of messages per second:
 
@@ -1008,13 +1101,18 @@ All endpoints are under `/api/v1` and take and return JSON unless noted. Errors 
 | POST | `/broker/reconnect` | admin | Force a reconnect |
 | GET · POST | `/keys` | admin | List or create API keys |
 | DELETE | `/keys/{id}` | admin | Revoke |
+| GET | `/history/{topic...}?since=&until=&limit=&field=&bucket=&format=` | read | History of a topic: points or summary |
+| GET | `/history?filter=…&limit=…` | read | Topics with history (`?topic=` = one topic's history) |
+| DELETE | `/history/{topic...}` · `/history` | admin | Clear one topic's history, or all |
+| GET · POST | `/history-rules` | admin | List (with usage) or create history rules |
+| GET · PUT · DELETE | `/history-rules/{id}` | admin | Read, replace, delete |
 | GET | `/status` | read | Service status |
 | GET | `/whoami` | any | The calling key's name and scopes |
 | GET | `/healthz` | none | Health (outside `/api/v1`) |
 | GET | `/metrics` | read | Prometheus (outside `/api/v1`) |
 | POST · GET · DELETE | `/mcp` | per tool | MCP Streamable HTTP endpoint (outside `/api/v1`) |
 
-Status codes: `200`/`201`/`204` success · `400` invalid input · `401` missing or invalid key · `403` key lacks the scope · `404` unknown topic or id · `409` duplicate webhook id · `413` body too large · `429` too many concurrent waits · `502` broker or webhook error · `503` not connected to the broker.
+Status codes: `200`/`201`/`204` success · `400` invalid input · `401` missing or invalid key · `403` key lacks the scope · `404` unknown topic or id · `409` duplicate webhook or history rule id, or a change to the `env` history rule · `413` body too large · `429` too many concurrent waits · `502` broker or webhook error · `503` not connected to the broker.
 
 CLI: `mqtt-get [serve]` (default: REST, MCP and UI over HTTP) · `mqtt-get mcp` (standalone MCP on stdio) · `mqtt-get mcp --url … --key …` (stdio proxy to a server) · `mqtt-get healthcheck` · `mqtt-get version`.
 
@@ -1038,11 +1136,12 @@ internal/httpapi    REST interface for systems + web UI (httpapi/ui/index.html) 
 internal/mcp        MCP interface for agents: tools, resources, prompts, completion; HTTP + stdio transports
 internal/mqttc      broker connections: auth, TLS, dialing, publish, reconnect
 internal/store      sharded latest-value store + JSON encoding
+internal/history    bounded per-topic history: ring buffers, rules, budgets, aggregation, snapshots
 internal/topic      MQTT topic validation, matching, filter trie
 internal/webhook    webhook queues, batching, retries, signatures
-internal/state      persisted settings, webhooks and API keys
+internal/state      persisted settings, webhooks, history rules and API keys
 internal/config     configuration model and environment parsing
 test/interop        real-broker interoperability suite + docker-compose
 ```
 
-**Limitations** (by design, for now): enhanced authentication supports SCRAM only; values and webhook queues live in memory; there is no history, only the latest value per topic.
+**Limitations** (by design, for now): enhanced authentication supports SCRAM only; values, history and webhook queues live in memory (history is snapshotted to disk, not written per message); history is short-term context, not a time-series database.
