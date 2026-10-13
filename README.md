@@ -1269,3 +1269,11 @@ test/sparkplug      Sparkplug B interop with pysparkplug (independent implementa
 ```
 
 **Limitations** (by design, for now): enhanced authentication supports SCRAM only; values, history and webhook queues live in memory (history is snapshotted to disk, not written per message); history is short-term context, not a time-series database.
+
+## License
+
+Copyright 2026 the mqtt-get authors.
+
+Licensed under the [Apache License, Version 2.0](LICENSE): you may use, modify and redistribute this code, including in commercial and closed-source products, provided you keep the license and copyright notices. It comes without warranty.
+
+The Sparkplug B codec is written from the specification and contains no Eclipse Tahu code and no copy of `sparkplug_b.proto`, so the project carries no EPL-licensed files. The test suite uses [pysparkplug](https://pypi.org/project/pysparkplug/) (Apache-2.0) as an independent implementation; it is a test-time dependency and isn't distributed with mqtt-get.
