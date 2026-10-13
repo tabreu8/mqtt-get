@@ -14,3 +14,18 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
       - run: CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/mqtt-get ./cmd/mqtt-get
+  sparkplug:
+    # Sparkplug B against an independent implementation (pysparkplug) through
+    # a real MQTT broker, plus a short fuzz run of the protobuf decoder.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pysparkplug==0.6.1
+      - run: SPARKPLUG_INTEROP_PYTHON="$(command -v python)" go test -race -count=1 -v ./test/sparkplug
+      - run: go test -run '^$' -fuzz FuzzDecode -fuzztime 30s ./internal/sparkplug

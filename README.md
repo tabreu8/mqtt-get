@@ -246,9 +246,10 @@ curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/spb/plant1/pre
 - **Values** are `{"value":…,"type":"…","timestamp":"…","online":true}`. Metric names keep their `/` folders, so `Motors/M1/Speed` becomes three topic levels. `unit` comes from the birth's `engUnit` property, and the birth's other properties are included in the birth values.
 - **Types**: all integer types (signed values decoded as two's complement, per Sparkplug 3.0), Float, Double, Boolean, String, Text, UUID, DateTime (as an RFC 3339 string), Bytes and File (base64), every array type, DataSets (`{"columns","types","rows"}`) and Templates (`{"template_ref","metrics","parameters"}`). 64-bit integers keep every digit.
 - **Births and aliases.** Births record each metric's name, alias and type, so data messages that carry only aliases are decoded. A new node birth invalidates its devices until they're born again.
-- **Deaths.** `NDEATH` and `DDEATH` republish the metrics with `"online":false`, keeping the last value and its age. A death left over from an older session (another `bdSeq`) is ignored.
+- **Deaths.** `NDEATH` and `DDEATH` republish the metrics with `"online":false`, keeping the last value and its age. A death left over from an older session (an older `bdSeq`, e.g. a will delivered late) is ignored. A death with a *newer* `bdSeq` is accepted, because some edge nodes send the next session's `bdSeq` when they disconnect cleanly.
 - **Sequence numbers** are checked for each edge node; gaps (lost messages) are counted.
 - **Joining late.** Data from a node whose birth mqtt-get missed: metrics that carry names are still translated (typed by their value), and metrics sent only as aliases are counted as unknown. With `rebirth` on, mqtt-get then asks the node to publish its births again (an `NCMD` with `Node Control/Rebirth`), at most once per `rebirth_interval_sec`. The same happens after a sequence gap.
+- **Template definitions** in births (such as Ignition's `_types_/…`) describe types and are not translated; template instances are.
 - **Historical** metrics (`is_historical`) keep their own timestamp, so they never replace a newer value, and they land at the right place in [history](#history).
 - **Passive.** mqtt-get never claims to be the primary host application (it doesn't publish `STATE`). Other hosts' `NCMD`/`DCMD` messages are not translated. `STATE` messages are stored as-is.
 - **Raw messages** under `spBv1.0/…` aren't stored, unless `keep_raw` is set.
@@ -314,9 +315,9 @@ ws.onmessage = ev => { const m = JSON.parse(ev.data); if (m.type === 'message') 
 | `{"type":"publish","topic":…,"payload":…,"qos":…,"retain":…}` | `published` | `publish` scope; same fields as `POST /api/v1/publish` (Sparkplug writes included) |
 | `{"type":"ping"}` | `pong` | |
 
-Any message can carry an `"id"`, which is echoed in its reply. Errors come back as `{"type":"error","error":"…"}`. A message matching two of your filters is delivered once per filter.
+Frames arrive in order: a `subscribed` reply comes before its current values and live messages. Any message can carry an `"id"`, which is echoed in its reply. Errors come back as `{"type":"error","error":"…"}`. A message matching two of your filters is delivered once per filter.
 
-- **Limits:** up to 100 subscriptions per connection. Each connection buffers up to 4096 messages. If a client reads too slowly, newer messages are dropped rather than slowing ingest, and the client is told with `{"type":"dropped","count":N}`.
+- **Limits:** up to 100 subscriptions per connection. Each connection buffers up to 4096 frames. If a client reads too slowly, newer live messages are dropped rather than slowing ingest, and the client is told with `{"type":"dropped","count":N}`. Replies and current values are never dropped.
 - **Keepalive:** the server pings every 30 s.
 - **Security:** `Origin` must be same-origin or listed in `CORS_ORIGINS`. Bad keys get `401` before the upgrade; an unauthenticated socket is closed with code 4401.
 
@@ -1238,6 +1239,14 @@ make bench       # micro-benchmarks
 make interop-up && make interop && make interop-down   # real-broker suite (Docker)
 ```
 
+Sparkplug B is also tested against an independent implementation: `test/sparkplug` runs an edge node built on [pysparkplug](https://pypi.org/project/pysparkplug/) through a real MQTT broker, over the lean and paho clients and MQTT 3.1.1 and 5. It covers every data type, data, writes (NCMD/DCMD decoded by pysparkplug), rebirth requests, and the NDEATH the broker publishes when the node drops. The protobuf codec's golden payloads come from the official `sparkplug_b.proto` (`internal/sparkplug/testdata/gen_golden.py`), and the decoder is fuzzed. CI runs both.
+
+```bash
+python3 -m venv /tmp/spb && /tmp/spb/bin/pip install pysparkplug==0.6.1
+SPARKPLUG_INTEROP_PYTHON=/tmp/spb/bin/python go test -v ./test/sparkplug
+go test -run '^$' -fuzz FuzzDecode -fuzztime 1m ./internal/sparkplug
+```
+
 The regular tests need nothing installed. They start embedded MQTT brokers (plain, TLS, mTLS, WS and WSS, with generated certificates) and cover auth, TLS verification, SNI, password-file rotation, the REST API, webhooks and MCP.
 
 ```
@@ -1256,6 +1265,7 @@ internal/webhook    webhook queues, batching, retries, signatures
 internal/state      persisted settings, webhooks, history rules and API keys
 internal/config     configuration model and environment parsing
 test/interop        real-broker interoperability suite + docker-compose
+test/sparkplug      Sparkplug B interop with pysparkplug (independent implementation)
 ```
 
 **Limitations** (by design, for now): enhanced authentication supports SCRAM only; values, history and webhook queues live in memory (history is snapshotted to disk, not written per message); history is short-term context, not a time-series database.

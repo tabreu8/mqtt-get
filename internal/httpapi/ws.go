@@ -19,8 +19,8 @@ import (
 	"github.com/tabreu8/mqtt-get/internal/store"
 )
 
-// WebSocket stream limits.
-const (
+// WebSocket stream limits (variables so tests can shrink them).
+var (
 	wsQueue        = 4096 // messages buffered per connection before dropping
 	wsMaxSubs      = 100  // subscriptions per connection
 	wsMaxCurrent   = 1000 // current values sent for include_current
@@ -42,11 +42,13 @@ type wsRequest struct {
 }
 
 type wsConn struct {
-	s       *Server
-	c       *websocket.Conn
-	p       *core.Principal
-	data    chan []byte // message frames (dropped when full)
-	ctrl    chan []byte // replies (never dropped)
+	s *Server
+	c *websocket.Conn
+	p *core.Principal
+	// out is the single, ordered queue of frames. Live messages (pushed
+	// from the ingest path) are dropped when it is full; replies and
+	// current values (sent from the connection's own goroutine) wait.
+	out     chan []byte
 	done    chan struct{}
 	dropped atomic.Uint64
 
@@ -89,8 +91,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // the upgrader already replied
 	}
-	wc := &wsConn{s: s, c: c, p: p, data: make(chan []byte, wsQueue), ctrl: make(chan []byte, 64),
-		done: make(chan struct{}), subs: map[string]func(){}}
+	wc := &wsConn{s: s, c: c, p: p, out: make(chan []byte, wsQueue), done: make(chan struct{}), subs: map[string]func(){}}
 	c.SetReadLimit(max(s.cfg.MaxBodyBytes, 64<<10))
 	go wc.writer()
 	defer wc.close()
@@ -233,7 +234,9 @@ func (wc *wsConn) subscribe(id json.RawMessage, filter string, current bool) {
 	}
 }
 
-// push queues a message frame. It runs on the ingest path: it never blocks.
+// push queues a message frame. Live messages run on the ingest path and
+// never block (they are dropped and counted when the queue is full);
+// current values wait for room.
 func (wc *wsConn) push(filter string, e *store.Entry, current bool) {
 	buf := make([]byte, 0, 96+len(filter)+len(e.Topic)+len(e.Payload))
 	buf = append(buf, `{"type":"message","filter":`...)
@@ -244,8 +247,15 @@ func (wc *wsConn) push(filter string, e *store.Entry, current bool) {
 	buf = append(buf, `,"data":`...)
 	buf = store.AppendJSON(buf, e)
 	buf = append(buf, '}')
+	if current {
+		select {
+		case wc.out <- buf:
+		case <-wc.done:
+		}
+		return
+	}
 	select {
-	case wc.data <- buf:
+	case wc.out <- buf:
 	default:
 		wc.dropped.Add(1)
 	}
@@ -284,7 +294,7 @@ func (wc *wsConn) reply(id json.RawMessage, v map[string]any) {
 	}
 	b, _ := json.Marshal(v)
 	select {
-	case wc.ctrl <- b:
+	case wc.out <- b:
 	case <-wc.done:
 	}
 }
@@ -304,8 +314,7 @@ func (wc *wsConn) writer() {
 	for {
 		var b []byte
 		select {
-		case b = <-wc.ctrl:
-		case b = <-wc.data:
+		case b = <-wc.out:
 		case <-ping.C:
 			if err := wc.c.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout)); err != nil {
 				wc.c.Close()

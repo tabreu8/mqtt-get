@@ -14,7 +14,10 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
+	"github.com/tabreu8/mqtt-get/internal/core"
+	"github.com/tabreu8/mqtt-get/internal/mqttc"
 	"github.com/tabreu8/mqtt-get/internal/sparkplug"
+	"github.com/tabreu8/mqtt-get/internal/store"
 )
 
 // edgeNode plays a Sparkplug B edge node with one device on the embedded
@@ -362,5 +365,74 @@ func TestSparkplugFromEnvConfig(t *testing.T) {
 	c.Normalize()
 	if c.Prefix != "spb" || c.RebirthIntervalSec != 30 || c.Validate() != nil {
 		t.Fatalf("%+v", c)
+	}
+}
+
+func TestSparkplugWithHistoryRawAndPrefix(t *testing.T) {
+	e := newWSEnv(t, config.Server{})
+	if _, err := e.svc.PutHistoryRule(config.HistoryRule{ID: "spb", Topics: []string{"spb/#", "uns/#"}}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.SetSparkplug(config.Sparkplug{Enabled: true, KeepRaw: true}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	ing := func(topic string, p *sparkplug.Payload, at time.Time) {
+		e.svc.Ingest(store.Entry{Topic: topic, Payload: sparkplug.Encode(p), Time: at.UnixNano()})
+	}
+	dbl := func(alias uint64, f float64) sparkplug.Metric {
+		return sparkplug.Metric{Alias: alias, HasAlias: true, Value: sparkplug.Value{Kind: sparkplug.KindDouble, F: f}}
+	}
+	ing("spBv1.0/g/DBIRTH/e/d", &sparkplug.Payload{Seq: 0, HasSeq: true, Metrics: []sparkplug.Metric{
+		{Name: "Level", Alias: 1, HasAlias: true, Datatype: sparkplug.TypeDouble, Value: sparkplug.Value{Kind: sparkplug.KindDouble, F: 1}}}}, now.Add(-3*time.Second))
+	ing("spBv1.0/g/DDATA/e/d", &sparkplug.Payload{Seq: 1, HasSeq: true, Metrics: []sparkplug.Metric{dbl(1, 2)}}, now.Add(-2*time.Second))
+	ing("spBv1.0/g/DDATA/e/d", &sparkplug.Payload{Seq: 2, HasSeq: true, Metrics: []sparkplug.Metric{dbl(1, 3)}}, now.Add(-time.Second))
+	// A backfilled (historical) point older than everything else.
+	hist := dbl(1, 0.5)
+	hist.IsHistorical, hist.Timestamp, hist.HasTimestamp = true, uint64(now.Add(-time.Hour).UnixMilli()), true
+	ing("spBv1.0/g/DDATA/e/d", &sparkplug.Payload{Seq: 3, HasSeq: true, Metrics: []sparkplug.Metric{hist}}, now)
+
+	// The latest value is the newest real-time one, not the backfilled one.
+	if v, err := e.svc.Latest("spb/g/e/d/Level"); err != nil || !strings.Contains(string(v.Payload), `"value":3,`) {
+		t.Fatalf("latest: %v %v", v, err)
+	}
+	// History has all four points in time order, and the numeric summary
+	// works on the "value" field of the envelopes.
+	res, err := e.svc.History("spb/g/e/d/Level", core.HistoryQuery{})
+	if err != nil || res.Total != 4 {
+		t.Fatalf("history: %v %+v", err, res)
+	}
+	sum, _, err := e.svc.HistorySummary("spb/g/e/d/Level", core.SummaryQuery{Field: "value"})
+	if err != nil || sum.Numeric == nil || sum.Numeric.Min != 0.5 || sum.Numeric.Max != 3 {
+		t.Fatalf("summary: %v %+v", err, sum)
+	}
+	// keep_raw: the raw protobuf message is stored too.
+	if _, ok := e.svc.Store().Get("spBv1.0/g/DDATA/e/d"); !ok {
+		t.Fatal("raw message not kept")
+	}
+
+	// Changing the prefix forgets the old translated values; new messages
+	// use the new prefix.
+	if _, err := e.svc.SetSparkplug(config.Sparkplug{Enabled: true, Prefix: "uns/spb"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.svc.Store().Get("spb/g/e/d/Level"); ok {
+		t.Fatal("old prefix kept")
+	}
+	ing("spBv1.0/g/DBIRTH/e/d", &sparkplug.Payload{Seq: 0, HasSeq: true, Metrics: []sparkplug.Metric{
+		{Name: "Level", Datatype: sparkplug.TypeDouble, Value: sparkplug.Value{Kind: sparkplug.KindDouble, F: 4}}}}, now)
+	if _, err := e.svc.Latest("uns/spb/g/e/d/Level"); err != nil {
+		t.Fatalf("new prefix: %v", err)
+	}
+	// Publishes under the prefix are never sent as plain MQTT: refused
+	// while writes are disabled, and for topics that aren't metrics.
+	if _, err := e.svc.Publish(t.Context(), []mqttc.Message{{Topic: "uns/spb/g/e/d/Level", Payload: []byte("1")}}); core.KindOf(err) != core.Invalid || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("publish with commands disabled: %v", err)
+	}
+	if _, err := e.svc.SetSparkplug(config.Sparkplug{Enabled: true, Prefix: "uns/spb", Commands: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Publish(t.Context(), []mqttc.Message{{Topic: "uns/spb/g/e/d/Nope", Payload: []byte("1")}}); core.KindOf(err) != core.NotFound {
+		t.Fatalf("publish to an unknown metric: %v", err)
 	}
 }

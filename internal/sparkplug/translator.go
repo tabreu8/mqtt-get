@@ -82,7 +82,7 @@ type node struct {
 	devices   map[string]*device
 	rebirthAt time.Time
 
-	seqErrors, unknown, rebirths uint64
+	seqErrors, unknown, rebirths, staleDeaths uint64
 }
 
 // Publisher sends a message to the broker (rebirth requests). It must not
@@ -300,6 +300,9 @@ func (t *Translator) register(n *node, devID string, defs map[string]*metric, p 
 		if pm.Name == "" {
 			continue
 		}
+		if pm.Value.Kind == KindTemplate && pm.Value.Template != nil && pm.Value.Template.IsDefinition {
+			continue // a template type (e.g. Ignition's "_types_/…"), not a value
+		}
 		if len(defs) >= MaxMetricsPerNode {
 			t.dropped.Add(1)
 			break
@@ -346,9 +349,12 @@ func (t *Translator) nodeBirth(n *node, p *Payload, e *store.Entry, now time.Tim
 }
 
 func (t *Translator) nodeDeath(n *node, p *Payload, now time.Time) []store.Entry {
-	// A death left behind by an older session (its will message) has
-	// another bdSeq: ignore it.
-	if bd, ok := bdSeqOf(p); ok && n.bdSeq >= 0 && bd != n.bdSeq {
+	// A death left behind by an older session (its will, delivered late)
+	// has an older bdSeq: ignore it. Deaths carrying a newer bdSeq are
+	// accepted: they can't come from an older session, and some edge nodes
+	// send the next session's bdSeq on a clean disconnect.
+	if bd, ok := bdSeqOf(p); ok && n.bdSeq >= 0 && staleBdSeq(bd, n.bdSeq) {
+		n.staleDeaths++
 		return nil
 	}
 	if !n.online {
@@ -363,6 +369,16 @@ func (t *Translator) nodeDeath(n *node, p *Payload, now time.Time) []store.Entry
 		}
 	}
 	return out
+}
+
+// staleBdSeq reports whether death bdSeq d is older than birth bdSeq b
+// (bdSeq counts 0-255 and wraps).
+func staleBdSeq(d, b int64) bool {
+	diff := (b - d) % 256
+	if diff < 0 {
+		diff += 256
+	}
+	return diff > 0 && diff < 128
 }
 
 func (t *Translator) deviceBirth(n *node, devID string, p *Payload, e *store.Entry, now time.Time) []store.Entry {
@@ -671,6 +687,7 @@ type NodeInfo struct {
 	SeqErrors       uint64       `json:"seq_errors"`
 	Unknown         uint64       `json:"unknown_metrics"`
 	RebirthRequests uint64       `json:"rebirth_requests"`
+	StaleDeaths     uint64       `json:"stale_deaths,omitempty"`
 	Metrics         []MetricInfo `json:"metrics,omitempty"`
 	Count           int          `json:"metric_count"`
 	Devices         []DeviceInfo `json:"devices"`
@@ -714,7 +731,7 @@ func (t *Translator) Nodes(group string, metrics bool) []NodeInfo {
 		n.mu.Lock()
 		ni := NodeInfo{Group: n.group, Edge: n.edge, Online: n.online, BirthSeen: n.born, BirthAt: tp(n.birthAt),
 			DeathAt: tp(n.deathAt), LastMessage: n.lastMsg.UTC(), SeqErrors: n.seqErrors, Unknown: n.unknown,
-			RebirthRequests: n.rebirths, Count: len(n.metrics), Devices: []DeviceInfo{}}
+			RebirthRequests: n.rebirths, StaleDeaths: n.staleDeaths, Count: len(n.metrics), Devices: []DeviceInfo{}}
 		if n.bdSeq >= 0 {
 			b := n.bdSeq
 			ni.BdSeq = &b

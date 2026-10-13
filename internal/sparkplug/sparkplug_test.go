@@ -15,10 +15,10 @@ import (
 	"github.com/tabreu8/mqtt-get/internal/store"
 )
 
-// Golden payloads encoded by the reference protobuf implementation (Python
-// google.protobuf with sparkplug_b.proto; see the test data generator in
-// the commit history). birthHex is an NBIRTH with one metric of every
-// supported type; dataHex an NDATA using aliases (one of them unknown).
+// Golden payloads encoded by the reference protobuf implementation with the
+// official Eclipse Tahu sparkplug_b.proto (regenerate with
+// testdata/gen_golden.py). birthHex is an NBIRTH with one metric of every
+// kind of value; dataHex an NDATA using aliases (one of them unknown).
 const (
 	birthHex = "08fb80b3c19c3312120a05626453657118fb80b3c19c3320085807121c0a144e6f646520436f6e74726f6c2f526562697274681001200b700012470a0b54656d7065726174757265100218e480b3c19c3320094a280a07656e67556e69740a07656e67486967681207080c4203c2b043120b080a310000000000c06240650000ac4112110a05436f756e741003200350fbffffff0f12110a05536d616c6c1004200150feffffff0f12140a03426967100520045880ccbbbcdeffffffff0112140a035536341006200858ffffffffffffffffff0112170a0850726573737572651007200a696666666666d66140120f0a0752756e6e696e671008200b700112170a044d6f64651009200c7a0b6175746f2022666173742212140a0753746172746564100a200d588080b3c19c3312100a04426c6f62100b20118201030001ff120f0a074e6f7468696e67100c2009380112190a04496e7473100d201882010cffffffff02000000e093040012170a06466c6f617473100e201e8201080000c03f000010c012130a05426f6f6c73100f202082010503000000a012130a054e616d6573101020218201056162006300122e0a055461626c65101120108a012008021202696412056c6162656c1803180c220d0a0608ffffffff0f0a0332017812340a054d6f746f7210122013920126120a0a0372706d200750dc0b1a0d0a066d617852706d100718b81722094d6f746f7254797065121d0a11466f6c6465722f446565702f56616c7565101320075080d0acf30e1800"
 	dataHex  = "08e887b3c19c33120e100218e887b3c19c33650000b2411208100350faffffff0f1204106350011801"
@@ -246,6 +246,30 @@ func TestDeviceLifecycleAndDeath(t *testing.T) {
 	}
 	if tr.IsMetricTopic("spb/g/e/pump/Flow") {
 		t.Fatal("old device metric still writable")
+	}
+}
+
+func TestDeathBdSeq(t *testing.T) {
+	death := func(bd uint64) []byte {
+		return Encode(&Payload{Metrics: []Metric{{Name: "bdSeq", Datatype: TypeInt64, Value: Value{Kind: KindLong, U: bd}}}})
+	}
+	for _, c := range []struct {
+		birth, death uint64
+		applies      bool
+	}{
+		{5, 5, true},    // the session's own will or clean death
+		{5, 4, false},   // a late will from the previous session
+		{0, 255, false}, // ... across the wrap
+		{5, 6, true},    // a clean death carrying the next session's bdSeq
+		{255, 0, true},  // ... across the wrap
+	} {
+		tr, _, _ := newT(config.Sparkplug{})
+		tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, c.birth, dbl("X", 1, 1))))
+		tr.Process(entry("spBv1.0/g/NDEATH/e", death(c.death)))
+		n := tr.Nodes("", false)[0]
+		if n.Online == c.applies || (n.StaleDeaths == 1) == c.applies {
+			t.Errorf("birth bdSeq %d, death %d: online=%v stale=%d", c.birth, c.death, n.Online, n.StaleDeaths)
+		}
 	}
 }
 
@@ -482,5 +506,190 @@ func BenchmarkProcessDData(b *testing.B) {
 		if len(out) != 10 {
 			b.Fatal(len(out))
 		}
+	}
+}
+
+func TestTemplateDefinitionsAreNotValues(t *testing.T) {
+	tr, _, _ := newT(config.Sparkplug{})
+	def := Metric{Name: "_types_/Motor", Datatype: TypeTemplate, Value: Value{Kind: KindTemplate, Template: &Template{IsDefinition: true,
+		Metrics: []Metric{{Name: "rpm", Datatype: TypeUInt32, Value: Value{Kind: KindInt}}}}}}
+	inst := Metric{Name: "M1", Datatype: TypeTemplate, Value: Value{Kind: KindTemplate, Template: &Template{TemplateRef: "Motor",
+		Metrics: []Metric{{Name: "rpm", Datatype: TypeUInt32, Value: Value{Kind: KindInt, U: 1200}}}}}}
+	out, _ := tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, def, inst)))
+	v := values(t, out)
+	if _, ok := v["spb/g/e/_types_/Motor"]; ok {
+		t.Fatal("template definition translated as a value")
+	}
+	if jsonOf(v["spb/g/e/M1"]["value"]) != `{"metrics":{"rpm":1200},"template_ref":"Motor"}` {
+		t.Fatalf("template instance: %v", v["spb/g/e/M1"])
+	}
+}
+
+func TestDeviceBeforeNodeBirth(t *testing.T) {
+	// mqtt-get started between a node's NBIRTH and its DBIRTH: the device
+	// is still decoded from its own birth.
+	tr, fb, _ := newT(config.Sparkplug{Rebirth: true})
+	out, _ := tr.Process(entry("spBv1.0/g/DBIRTH/e/d", devBirthPayload(3, dbl("Flow", 4, 1))))
+	if v := values(t, out); v["spb/g/e/d/Flow"]["value"] != 1.0 {
+		t.Fatalf("device birth without node birth: %v", v)
+	}
+	out, _ = tr.Process(entry("spBv1.0/g/DDATA/e/d", dataPayload(4, byAlias(4, 2))))
+	if v := values(t, out); v["spb/g/e/d/Flow"]["value"] != 2.0 {
+		t.Fatalf("device data: %v", v)
+	}
+	if fb.count() != 1 {
+		t.Fatalf("a rebirth should be requested once (node birth missing), got %d", fb.count())
+	}
+}
+
+func TestHistoricalMetrics(t *testing.T) {
+	tr, _, _ := newT(config.Sparkplug{})
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, dbl("X", 1, 10))))
+	past := Metric{Alias: 1, HasAlias: true, IsHistorical: true, Timestamp: 1700000000000, HasTimestamp: true, Value: Value{Kind: KindDouble, F: 5}}
+	out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(1, past)))
+	if len(out) != 1 || out[0].Time != time.UnixMilli(1700000000000).UnixNano() || !strings.Contains(string(out[0].Payload), `"historical":true`) {
+		t.Fatalf("historical entry %+v %s", out, out[0].Payload)
+	}
+	// The death republishes the last real-time value, not the historical one.
+	out, _ = tr.Process(entry("spBv1.0/g/NDEATH/e", Encode(&Payload{Metrics: []Metric{{Name: "bdSeq", Value: Value{Kind: KindLong, U: 1}}}})))
+	for _, e := range out {
+		if e.Topic == "spb/g/e/X" && !strings.Contains(string(e.Payload), `"value":10,`) {
+			t.Fatalf("offline value %s", e.Payload)
+		}
+	}
+}
+
+func TestLimits(t *testing.T) {
+	tr, _, _ := newT(config.Sparkplug{})
+	var ms []Metric
+	for i := 0; i < MaxMetricsPerNode+10; i++ {
+		ms = append(ms, Metric{Name: "m" + strconv.Itoa(i), Datatype: TypeBoolean, Value: Value{Kind: KindBool}})
+	}
+	out, _ := tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, ms...)))
+	if len(out) != MaxMetricsPerNode || tr.Stats().Dropped != 1 {
+		t.Fatalf("metrics per node: %d translated, %+v", len(out), tr.Stats())
+	}
+}
+
+func TestConcurrentProcessing(t *testing.T) {
+	tr, _, _ := newT(config.Sparkplug{Rebirth: true, Commands: true})
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			edge := "e" + strconv.Itoa(g%3) // nodes shared between goroutines
+			for i := 0; i < 300; i++ {
+				switch i % 50 {
+				case 0:
+					tr.Process(entry("spBv1.0/g/NBIRTH/"+edge, birthPayload(0, 1, dbl("A", 1, 1))))
+					tr.Process(entry("spBv1.0/g/DBIRTH/"+edge+"/d", devBirthPayload(1, dbl("B", 2, 1))))
+				case 25:
+					tr.Process(entry("spBv1.0/g/NDEATH/"+edge, Encode(&Payload{})))
+				default:
+					tr.Process(entry("spBv1.0/g/DDATA/"+edge+"/d", dataPayload(uint64(i), byAlias(2, float64(i)))))
+				}
+				if i%10 == 0 {
+					tr.Nodes("", true)
+					tr.Stats()
+					_, _, _ = tr.Command("spb/g/"+edge+"/d/B", []byte("1"))
+					tr.IsMetricTopic("spb/g/" + edge + "/A")
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	if st := tr.Stats(); st.Nodes != 3 || st.Messages != 8*300+8*6 {
+		t.Fatalf("%+v", st)
+	}
+}
+
+func TestValueFromJSONAllTypes(t *testing.T) {
+	ok := []struct {
+		t       uint32
+		payload string
+		want    Value
+	}{
+		{TypeInt8, "-128", Value{Kind: KindInt, U: 0xffffff80}},
+		{TypeInt16, `"-2"`, Value{Kind: KindInt, U: 0xfffffffe}},
+		{TypeInt32, `{"value":-2147483648}`, Value{Kind: KindInt, U: 0x80000000}},
+		{TypeInt64, "-9223372036854775808", Value{Kind: KindLong, U: 1 << 63}},
+		{TypeUInt8, "255", Value{Kind: KindInt, U: 255}},
+		{TypeUInt16, "65535", Value{Kind: KindInt, U: 65535}},
+		{TypeUInt32, "4294967295", Value{Kind: KindInt, U: 4294967295}},
+		{TypeUInt64, "18446744073709551615", Value{Kind: KindLong, U: math.MaxUint64}},
+		{TypeDouble, "-123.25", Value{Kind: KindDouble, F: -123.25}},
+		{TypeBoolean, "1", Value{Kind: KindBool, U: 1}},
+		{TypeBoolean, `"on"`, Value{Kind: KindBool, U: 1}},
+		{TypeBoolean, "false", Value{Kind: KindBool}},
+		{TypeText, `"multi\nline"`, Value{Kind: KindString, S: "multi\nline"}},
+		{TypeUUID, "123e4567-e89b-12d3-a456-426614174000", Value{Kind: KindString, S: "123e4567-e89b-12d3-a456-426614174000"}},
+		{TypeString, `{"a":1}`, Value{Kind: KindString, S: `{"a":1}`}},
+		{TypeDateTime, "1767323045000", Value{Kind: KindLong, U: 1767323045000}},
+		{TypeBytes, `"AAH/"`, Value{Kind: KindBytes, B: []byte{0, 1, 255}}},
+		{TypeFile, `{"value":"aGk="}`, Value{Kind: KindBytes, B: []byte("hi")}},
+	}
+	for _, c := range ok {
+		got, err := ValueFromJSON(c.t, []byte(c.payload))
+		if err != nil || !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s %s: %+v %v, want %+v", TypeName(c.t), c.payload, got, err, c.want)
+		}
+		// What is written reads back as the same JSON value it came from
+		// (numbers and booleans; strings re-quoted).
+		if c.t != TypeString && c.t != TypeBoolean && c.t != TypeDateTime && c.t != TypeBytes && c.t != TypeFile && c.t != TypeText && c.t != TypeUUID {
+			back := string(AppendValue(nil, c.t, got))
+			in := strings.Trim(strings.TrimSuffix(strings.TrimPrefix(c.payload, `{"value":`), "}"), `"`)
+			if back != in {
+				t.Errorf("%s: wrote %s, reads back as %s", TypeName(c.t), in, back)
+			}
+		}
+	}
+	bad := []struct {
+		t       uint32
+		payload string
+		err     string
+	}{
+		{TypeInt8, "128", "out of range"},
+		{TypeUInt8, "-1", "not a number"},
+		{TypeUInt32, "4294967296", "out of range"},
+		{TypeInt32, "1.5", "not a number"},
+		{TypeBoolean, "yes", "true or false"},
+		{TypeDateTime, "tomorrow", "RFC 3339"},
+		{TypeBytes, "12", "base64 string"},
+		{TypeBytes, `"!!!"`, "invalid base64"},
+		{TypeDataSet, "{}", "not supported"},
+		{TypeTemplate, "{}", "not supported"},
+		{TypeInt32Array, "[1]", "not supported"},
+	}
+	for _, c := range bad {
+		if _, err := ValueFromJSON(c.t, []byte(c.payload)); err == nil || !strings.Contains(err.Error(), c.err) {
+			t.Errorf("%s %s: %v, want %q", TypeName(c.t), c.payload, err, c.err)
+		}
+	}
+}
+
+func TestAppendValueFallbacks(t *testing.T) {
+	cases := []struct {
+		t    uint32
+		v    Value
+		want string
+	}{
+		{TypeUnknown, Value{Kind: KindLong, U: 7}, `7`},                  // no type: by wire kind
+		{TypeDouble, Value{Kind: KindFloat, F: 0.5}, `0.5`},              // float sent for a double
+		{TypeFloat, Value{Kind: KindDouble, F: 0.25}, `0.25`},            // and the reverse
+		{TypeInt32Array, Value{Kind: KindBytes, B: []byte{1}}, `"AQ=="`}, // bad array length: raw bytes
+		{TypeBooleanArray, Value{Kind: KindBytes, B: []byte{9, 0, 0, 0, 0}}, `"CQAAAAA="`},
+		{TypeStringArray, Value{Kind: KindBytes, B: []byte("ab")}, `"YWI="`}, // missing terminator
+		{TypeStringArray, Value{Kind: KindBytes, B: nil}, `[]`},
+		{TypeDataSet, Value{Kind: KindNone}, `null`},
+		{TypeUnknown, Value{Kind: KindPropertySet, Set: &PropertySet{Keys: []string{"a"}, Values: []PropertyValue{{IsNull: true}}}}, `{"a":null}`},
+	}
+	for _, c := range cases {
+		if got := string(AppendValue(nil, c.t, c.v)); got != c.want {
+			t.Errorf("%s %+v: %s, want %s", TypeName(c.t), c.v, got, c.want)
+		}
+	}
+	if TypeName(999) != "Unknown" {
+		t.Error("TypeName out of range")
 	}
 }
