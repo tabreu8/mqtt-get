@@ -23,6 +23,7 @@ import (
 	"github.com/tabreu8/mqtt-get/internal/config"
 	"github.com/tabreu8/mqtt-get/internal/history"
 	"github.com/tabreu8/mqtt-get/internal/mqttc"
+	"github.com/tabreu8/mqtt-get/internal/sparkplug"
 	"github.com/tabreu8/mqtt-get/internal/state"
 	"github.com/tabreu8/mqtt-get/internal/store"
 	"github.com/tabreu8/mqtt-get/internal/topic"
@@ -47,8 +48,12 @@ type Service struct {
 	envHistory *config.HistoryRule
 	histMu     sync.Mutex // serializes history rule changes
 	histSaved  bool       // a snapshot file exists (owned by historyLoop after Start)
-	stop       chan struct{}
-	bg         sync.WaitGroup
+	// spb translates Sparkplug B traffic (nil = disabled).
+	spb          atomic.Pointer[sparkplug.Translator]
+	spbMu        sync.Mutex
+	envSparkplug *config.Sparkplug
+	stop         chan struct{}
+	bg           sync.WaitGroup
 	// brokerSource tells where the active broker config came from
 	// ("saved", "env" or "none").
 	brokerSource atomic.Value
@@ -77,7 +82,24 @@ func New(cfg config.Server, log *slog.Logger, st *state.State) *Service {
 // The message is passed by value and only copied to the heap when a webhook
 // or watcher matches it, so plain ingest allocates nothing here (and the
 // store updates existing topics in place; history rings reuse their slots).
+//
+// Sparkplug B messages (when enabled) are decoded into one entry per
+// metric, each going through the same path as a plain message.
 func (s *Service) Ingest(e store.Entry) {
+	if sp := s.spb.Load(); sp != nil && sparkplug.IsSparkplug(e.Topic) {
+		if out, handled := sp.Process(e); handled {
+			for i := range out {
+				s.ingest(out[i])
+			}
+			if !sp.Config().KeepRaw {
+				return
+			}
+		}
+	}
+	s.ingest(e)
+}
+
+func (s *Service) ingest(e store.Entry) {
 	s.store.Set(&e)
 	s.hist.Add(&e)
 	s.hooks.Dispatch(e)
@@ -102,6 +124,10 @@ func (s *Service) historyPath() string {
 func (s *Service) Start(envBroker config.Broker, envOK bool) error {
 	s.hooks.Set(s.state.Webhooks())
 	s.applyHistoryRules()
+	if c, src := s.sparkplugConfig(); c.Enabled {
+		s.applySparkplug(c)
+		s.log.Info("sparkplug: enabled", "prefix", c.Prefix, "source", src, "rebirth", c.Rebirth, "commands", c.Commands)
+	}
 	if p := s.historyPath(); p != "" {
 		_, err := os.Stat(p)
 		s.histSaved = err == nil
@@ -422,6 +448,10 @@ func (s *Service) Publish(ctx context.Context, msgs []mqttc.Message) (int, error
 	if len(msgs) == 0 {
 		return 0, invalid(errors.New("no messages to publish"))
 	}
+	msgs, err := s.sparkplugCommands(msgs)
+	if err != nil {
+		return 0, err
+	}
 	if s.mqtt.Config().ProtocolVersion != 5 {
 		for _, m := range msgs {
 			if !m.Props.Empty() {
@@ -614,17 +644,18 @@ func (s *Service) DeleteKey(caller *Principal, id string) error {
 
 // StatusView summarizes the service.
 type StatusView struct {
-	Version       string        `json:"version"`
-	UptimeSec     int64         `json:"uptime_sec"`
-	MQTT          mqttc.Status  `json:"mqtt"`
-	Topics        int           `json:"topics"`
-	TopicsDropped uint64        `json:"topics_dropped"`
-	MaxTopics     int           `json:"max_topics"`
-	Webhooks      int           `json:"webhooks"`
-	History       history.Stats `json:"history"`
-	Watchers      int           `json:"active_watchers"`
-	BrokerSource  string        `json:"broker_source"`
-	StateFile     string        `json:"state_file,omitempty"`
+	Version       string           `json:"version"`
+	UptimeSec     int64            `json:"uptime_sec"`
+	MQTT          mqttc.Status     `json:"mqtt"`
+	Topics        int              `json:"topics"`
+	TopicsDropped uint64           `json:"topics_dropped"`
+	MaxTopics     int              `json:"max_topics"`
+	Webhooks      int              `json:"webhooks"`
+	History       history.Stats    `json:"history"`
+	Sparkplug     *sparkplug.Stats `json:"sparkplug,omitempty"`
+	Watchers      int              `json:"active_watchers"`
+	BrokerSource  string           `json:"broker_source"`
+	StateFile     string           `json:"state_file,omitempty"`
 }
 
 // Status returns the service status.
@@ -638,6 +669,7 @@ func (s *Service) Status() StatusView {
 		MaxTopics:     s.cfg.MaxTopics,
 		Webhooks:      len(s.state.Webhooks()),
 		History:       s.hist.Stats(),
+		Sparkplug:     s.Sparkplug().Stats,
 		Watchers:      s.watch.count(),
 		BrokerSource:  s.source(),
 		StateFile:     s.state.Path(),

@@ -1,6 +1,6 @@
 # mqtt-get
 
-**A fast, lightweight bridge between MQTT, systems and AI agents.** mqtt-get connects to your MQTT broker and remembers the **latest value of every topic**. It serves that data through two interfaces built on the same core: a **REST API** for systems and an **MCP server** for AI agents. You can also keep a bounded **history** of selected topics, **publish**, forward messages to **webhooks**, and configure everything from **environment variables, REST, MCP or a built-in web UI**.
+**A fast, lightweight bridge between MQTT, systems and AI agents.** mqtt-get connects to your MQTT broker and remembers the **latest value of every topic**. It serves that data through two interfaces built on the same core: a **REST API** for systems and an **MCP server** for AI agents. It decodes **Sparkplug B** into plain topics, streams changes over **WebSocket**, keeps a bounded **history** of selected topics, can **publish**, forwards messages to **webhooks**, and configure everything from **environment variables, REST, MCP or a built-in web UI**.
 
 [![ci](https://github.com/tabreu8/mqtt-get/actions/workflows/ci.yml/badge.svg)](https://github.com/tabreu8/mqtt-get/actions/workflows/ci.yml)
 
@@ -22,6 +22,8 @@ curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/values/factory
 - [How it works](#how-it-works)
 - [Reading values (GET)](#reading-values-get)
 - [Publishing (POST)](#publishing-post)
+- [Sparkplug B](#sparkplug-b)
+- [Live stream (WebSocket)](#live-stream-websocket)
 - [History](#history)
 - [Webhooks](#webhooks)
 - [Connecting to your broker](#connecting-to-your-broker) (auth methods and recipes for Mosquitto, EMQX, HiveMQ, NanoMQ, Coreflux, AWS IoT Core, Azure IoT Hub; [MQTT 5](#mqtt-5), [Last Will](#last-will-and-status-topic), [persistent sessions](#persistent-sessions))
@@ -46,6 +48,8 @@ MQTT is great for devices and poor for everything else. A dashboard, a spreadshe
 | | |
 |---|---|
 | **Latest value, instantly** | Every message is kept in memory per topic. `GET` returns the newest one; `?filter=home/+/temp` returns many at once. |
+| **Sparkplug B, readable** | Protobuf Sparkplug payloads become plain topics with JSON values (`spb/<group>/<edge>/<device>/<metric>`), with births, deaths, aliases and rebirth requests handled. Writing a metric sends a typed NCMD/DCMD. |
+| **Live stream** | A WebSocket API pushes every matching message to dashboards and apps, and accepts publishes. |
 | **Recent history, on request** | Topics matched by a history rule keep their last N messages in memory, with TTL, downsampling and byte budgets. Ask for raw points, time buckets (min/max/avg) or a compact summary that fits an agent's context. |
 | **Publish over HTTP** | Raw body or JSON, single messages or batches, QoS 0/1/2, retain. |
 | **Built for agents too** | A full MCP server (tools, resources with live notifications, prompts, completion) over HTTP or stdio, tested with the official TypeScript and Python SDKs. |
@@ -216,6 +220,105 @@ curl -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json'
 Batches are pipelined. All messages are handed to the broker first, then acknowledgements are awaited, so a batch of 1000 QoS 1 messages takes about one round trip instead of 1000. QoS 1/2 publishes return only after the broker acknowledges them (timeout `PUBLISH_TIMEOUT_MS`).
 
 If the broker is unreachable you get **503** `{"error":"not connected to MQTT broker"}`, and nothing is queued.
+
+## Sparkplug B
+
+[Sparkplug B](https://sparkplug.eclipse.org/) is the MQTT payload standard of many IIoT systems (Ignition, Cirrus Link, HiveMQ, edge gateways). Its payloads are protobuf with numeric aliases, so a dashboard, a script or an AI agent can't read them without a Sparkplug host application. mqtt-get is one: with Sparkplug support on, every metric becomes a plain topic with a JSON value, and everything else (latest values, history, webhooks, waits, the WebSocket stream, MCP) works on it unchanged.
+
+```bash
+curl -X PUT -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"rebirth":true,"commands":true}' localhost:8080/api/v1/sparkplug
+# or: SPARKPLUG_ENABLED=true SPARKPLUG_REBIRTH=true SPARKPLUG_COMMANDS=true
+
+curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/spb/plant1/press-gw/Press3/Temperature
+```
+```json
+{"topic":"spb/plant1/press-gw/Press3/Temperature","payload":{"value":72.4,"type":"Float","timestamp":"2026-10-13T09:15:02.311Z","unit":"°C","online":true}, …}
+```
+
+### How it is translated
+
+| Sparkplug | Translated topic |
+|---|---|
+| Node metric (`NBIRTH`/`NDATA` on `spBv1.0/<group>/…/<edge_node>`) | `spb/<group>/<edge_node>/<metric name>` |
+| Device metric (`DBIRTH`/`DDATA` on `…/<edge_node>/<device>`) | `spb/<group>/<edge_node>/<device>/<metric name>` |
+
+- **Values** are `{"value":…,"type":"…","timestamp":"…","online":true}`. Metric names keep their `/` folders, so `Motors/M1/Speed` becomes three topic levels. `unit` comes from the birth's `engUnit` property, and the birth's other properties are included in the birth values.
+- **Types**: all integer types (signed values decoded as two's complement, per Sparkplug 3.0), Float, Double, Boolean, String, Text, UUID, DateTime (as an RFC 3339 string), Bytes and File (base64), every array type, DataSets (`{"columns","types","rows"}`) and Templates (`{"template_ref","metrics","parameters"}`). 64-bit integers keep every digit.
+- **Births and aliases.** Births record each metric's name, alias and type, so data messages that carry only aliases are decoded. A new node birth invalidates its devices until they're born again.
+- **Deaths.** `NDEATH` and `DDEATH` republish the metrics with `"online":false`, keeping the last value and its age. A death left over from an older session (another `bdSeq`) is ignored.
+- **Sequence numbers** are checked for each edge node; gaps (lost messages) are counted.
+- **Joining late.** Data from a node whose birth mqtt-get missed: metrics that carry names are still translated (typed by their value), and metrics sent only as aliases are counted as unknown. With `rebirth` on, mqtt-get then asks the node to publish its births again (an `NCMD` with `Node Control/Rebirth`), at most once per `rebirth_interval_sec`. The same happens after a sequence gap.
+- **Historical** metrics (`is_historical`) keep their own timestamp, so they never replace a newer value, and they land at the right place in [history](#history).
+- **Passive.** mqtt-get never claims to be the primary host application (it doesn't publish `STATE`). Other hosts' `NCMD`/`DCMD` messages are not translated. `STATE` messages are stored as-is.
+- **Raw messages** under `spBv1.0/…` aren't stored, unless `keep_raw` is set.
+- **The prefix belongs to the translator.** While Sparkplug is on, publishing under `spb/…` is treated as a metric write (see below), and turning Sparkplug off or changing the prefix forgets the translated values.
+- **Limits:** up to 100,000 edge nodes and 100,000 metrics per node or device; beyond that, messages are dropped and counted. Translated topics also count toward `MAX_TOPICS`.
+
+### Writing metrics (NCMD/DCMD)
+
+With `commands` on, publishing to a translated metric topic sends the write to the edge node: an `NCMD` (node metric) or `DCMD` (device metric) with the metric's name and the type from its birth, QoS 0 and not retained, as the specification requires.
+
+```bash
+curl -X POST -H "Authorization: Bearer $KEY" --data 61.5 localhost:8080/api/v1/publish/spb/plant1/press-gw/Press3/Setpoint
+```
+
+The payload is the value (`61.5`, `true`, `"text"`) or `{"value": …}`. It is checked against the metric's type: a range error or a non-number for a Float is rejected with `400`, and a metric with no birth seen gives `404`. Agents use `publish` or `publish_and_wait` the same way. `publish_and_wait` on the metric's own topic returns the device's confirmation (its next data message for that metric).
+
+### Settings
+
+| Field | Env | Default | |
+|---|---|---|---|
+| `enabled` | `SPARKPLUG_ENABLED` | `false` | Decode `spBv1.0/#` |
+| `prefix` | `SPARKPLUG_PREFIX` | `spb` | Prefix of the translated topics |
+| `rebirth` | `SPARKPLUG_REBIRTH` | `false` | Request births from nodes that can't be decoded or lost messages (publishes `NCMD`) |
+| `rebirth_interval_sec` | `SPARKPLUG_REBIRTH_INTERVAL_SEC` | `30` | Minimum time between rebirth requests to one node |
+| `commands` | `SPARKPLUG_COMMANDS` | `false` | Allow writes through publish (needs the `publish` scope) |
+| `keep_raw` | `SPARKPLUG_KEEP_RAW` | `false` | Also store the raw protobuf messages |
+
+Settings saved through the API, MCP (`configure_sparkplug`) or the web UI (Broker tab) take precedence over the environment. The broker subscriptions must include `spBv1.0/#` (the default `#` does); `GET /api/v1/sparkplug` warns when they don't.
+
+`GET /api/v1/sparkplug/nodes?metrics=true` (MCP: `list_sparkplug_nodes`) lists edge nodes and devices with their online state, `bdSeq`, sequence errors and every metric with its type, unit and topic. `POST /api/v1/sparkplug/nodes/{group}/{edge_node}/rebirth` (MCP: `request_sparkplug_rebirth`) asks a node for a rebirth.
+
+**Performance:** decoding and translating a data message with 10 metrics takes about 3.8 µs and 15 allocations (about 2.6M metric values per second on one core). Plain MQTT traffic is unaffected: it costs one prefix check.
+
+## Live stream (WebSocket)
+
+`GET /api/v1/ws` is a WebSocket that pushes every message matching your subscriptions, and accepts publishes. Dashboards and apps get changes as they happen instead of polling. The web UI's Explorer uses it for **Live updates**.
+
+```bash
+websocat -H "Authorization: Bearer $KEY" "ws://localhost:8080/api/v1/ws?filter=home/%23&include_current=true"
+```
+```json
+{"type":"subscribed","filter":"home/#"}
+{"type":"message","filter":"home/#","current":true,"data":{"topic":"home/kitchen/temperature","payload":{"celsius":23.1},"encoding":"json","qos":0,"retained":true,"timestamp":"…"}}
+{"type":"message","filter":"home/#","data":{"topic":"home/lamp/state","payload":"ON","encoding":"utf8", …}}
+```
+
+From a browser, which can't set headers on a WebSocket, send the key as the first message:
+
+```js
+const ws = new WebSocket('wss://mqtt-get.example.com/api/v1/ws');
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: 'auth', key: API_KEY }));
+  ws.send(JSON.stringify({ type: 'subscribe', filter: 'factory/+/status', include_current: true }));
+};
+ws.onmessage = ev => { const m = JSON.parse(ev.data); if (m.type === 'message') render(m.data); };
+```
+
+| Client message | Reply | |
+|---|---|---|
+| `{"type":"auth","key":"…"}` | `authenticated` | Only when no key was sent in the request; must come first, within 10 s |
+| `{"type":"subscribe","filter":"a/#"}` or `"filters":[…]`, optional `"include_current":true` | `subscribed`, then `message` frames | `read` scope. `include_current` first sends the stored values (up to 1000, flagged `"current":true`) |
+| `{"type":"unsubscribe","filter":"a/#"}` | `unsubscribed` | |
+| `{"type":"publish","topic":…,"payload":…,"qos":…,"retain":…}` | `published` | `publish` scope; same fields as `POST /api/v1/publish` (Sparkplug writes included) |
+| `{"type":"ping"}` | `pong` | |
+
+Any message can carry an `"id"`, which is echoed in its reply. Errors come back as `{"type":"error","error":"…"}`. A message matching two of your filters is delivered once per filter.
+
+- **Limits:** up to 100 subscriptions per connection. Each connection buffers up to 4096 messages. If a client reads too slowly, newer messages are dropped rather than slowing ingest, and the client is told with `{"type":"dropped","count":N}`.
+- **Keepalive:** the server pings every 30 s.
+- **Security:** `Origin` must be same-origin or listed in `CORS_ORIGINS`. Bad keys get `401` before the upgrade; an unauthenticated socket is closed with code 4401.
 
 ## History
 
@@ -673,6 +776,7 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `ALLOW_QUERY_API_KEY` | `false` | Also accept `?api_key=` (for clients that can't set headers) |
 | `DATA_DIR` | `./data` | Where `state.json` (and `history.bin`) is kept (`/data` in the Docker image) |
 | `HISTORY_*` | – | History memory budget, persistence and an optional environment rule: see [History](#history) |
+| `SPARKPLUG_*` | – | Sparkplug B support: see [Sparkplug B](#sparkplug-b) |
 | `MAX_TOPICS` | `1000000` | Memory guard: new topics beyond this are not stored (counted in metrics) |
 | `MAX_BODY_BYTES` | `1048576` | Maximum request body |
 | `PUBLISH_TIMEOUT_MS` | `5000` | Maximum wait for broker acknowledgement |
@@ -760,9 +864,9 @@ Open `http://<host>:8080/` and sign in with an API key. The UI uses the same RES
 | ![dashboard](docs/images/ui-dashboard.png) | ![explorer](docs/images/ui-explorer.png) |
 
 - **Dashboard**: connection state, live message rate, counters, last error.
-- **Explorer**: browse latest values by filter (with auto-refresh), inspect a topic, copy its GET URL, publish messages.
+- **Explorer**: browse latest values by filter (with live updates over WebSocket), inspect a topic, copy its GET URL, publish messages.
 - **History**: topics with history, a chart (average per bucket with a min–max band) or the values and changes of a status topic, and history rules with live usage.
-- **Broker**: every connection option, including pasting PEM certificates, with *Save & connect*.
+- **Broker**: Sparkplug B settings and the edge nodes seen (online state, devices, rebirth button); every connection option, including pasting PEM certificates, with *Save & connect*.
 - **Webhooks**: create, edit, test and delete, with live delivered/failed/dropped counters and the last error.
 - **API keys**: create (shown once) and revoke.
 - **Help**: ready-to-paste `curl` and MCP snippets for this server.
@@ -834,14 +938,17 @@ claude mcp add --transport http mqtt http://localhost:8080/mcp --header "Authori
 | `wait_for_message` | read | read-only | Block until a matching message arrives (up to 5 min) |
 | `get_history` | read | read-only | Past values of a topic: summary (stats, buckets, distinct values and changes) or raw points |
 | `list_history_topics` | read | read-only | Topics with history and the span each covers |
+| `list_sparkplug_nodes` | read | read-only | Sparkplug edge nodes, devices and metrics with their translated topics |
 | `publish` | publish | **destructive**, open-world | Send a message (string, JSON value or base64) |
 | `publish_and_wait` | publish | **destructive**, open-world | Send a command, return the response or state change |
+| `request_sparkplug_rebirth` | publish | open-world | Ask a Sparkplug edge node to publish its births again |
 | `get_broker_config` | admin | read-only | Connection settings (secrets redacted) |
 | `configure_broker` | admin | **destructive** | Change only the given fields; reconnects and saves |
 | `reconnect_broker` | admin | | Force a reconnect |
 | `list_webhooks`, `create_webhook`, `update_webhook`, `delete_webhook`, `test_webhook` | admin | `delete_webhook` is **destructive** | Webhooks with delivery stats |
 | `list_api_keys`, `create_api_key`, `revoke_api_key` | admin | `revoke_api_key` is **destructive** | Scoped API keys |
 | `list_history_rules`, `create_history_rule`, `update_history_rule`, `delete_history_rule`, `clear_history` | admin | `update_`, `delete_history_rule` and `clear_history` are **destructive** | [History](#history) rules and data |
+| `configure_sparkplug` | admin | **destructive** | [Sparkplug B](#sparkplug-b) settings (only the given fields change) |
 
 ### Resources
 
@@ -865,7 +972,7 @@ claude mcp add --transport http mqtt http://localhost:8080/mcp --header "Authori
 
 ### REST equivalents
 
-The same core features are available to systems: `GET /api/v1/tree?prefix=&depth=` (namespace summary) and `GET /api/v1/wait?filter=&timeout=30s` (long-poll for the next message; `204` on timeout).
+The same core features are available to systems: `GET /api/v1/tree?prefix=&depth=` (namespace summary), `GET /api/v1/wait?filter=&timeout=30s` (long-poll for the next message; `204` on timeout) and the [WebSocket stream](#live-stream-websocket) (`/api/v1/ws`), the counterpart of resource subscriptions.
 
 ## Monitoring
 
@@ -889,6 +996,8 @@ Metrics:
 | `mqttget_history_topics` / `mqttget_history_points` / `mqttget_history_bytes` | gauge | [History](#history) in memory (bytes approximate) |
 | `mqttget_history_max_bytes` | gauge | `HISTORY_MAX_BYTES` |
 | `mqttget_history_dropped_total` | counter | Messages not recorded because a history byte budget was full |
+| `mqttget_sparkplug_{messages,metrics,malformed,dropped,unknown_metrics,seq_errors,rebirth_requests,commands}_total` | counter | [Sparkplug B](#sparkplug-b) translation (when enabled) |
+| `mqttget_sparkplug_nodes` / `mqttget_sparkplug_nodes_online` | gauge | Sparkplug edge nodes seen / online |
 | `mqttget_webhook_{delivered,failed,dropped,requests}_total{webhook="id"}` | counter | Per webhook |
 | `mqttget_webhook_queue_length{webhook="id"}` | gauge | Rising steadily means the endpoint can't keep up |
 | `mqttget_heap_bytes`, `mqttget_goroutines` | gauge | |
@@ -1106,13 +1215,17 @@ All endpoints are under `/api/v1` and take and return JSON unless noted. Errors 
 | DELETE | `/history/{topic...}` · `/history` | admin | Clear one topic's history, or all |
 | GET · POST | `/history-rules` | admin | List (with usage) or create history rules |
 | GET · PUT · DELETE | `/history-rules/{id}` | admin | Read, replace, delete |
+| GET | `/ws?filter=…&include_current=` | read (publish to publish) | [WebSocket stream](#live-stream-websocket): subscribe, unsubscribe, publish |
+| GET · PUT | `/sparkplug` | read · admin | [Sparkplug B](#sparkplug-b) settings and counters |
+| GET | `/sparkplug/nodes?group=…&metrics=` | read | Edge nodes, devices and metrics |
+| POST | `/sparkplug/nodes/{group}/{edge_node}/rebirth` | publish | Ask a node to publish its births |
 | GET | `/status` | read | Service status |
 | GET | `/whoami` | any | The calling key's name and scopes |
 | GET | `/healthz` | none | Health (outside `/api/v1`) |
 | GET | `/metrics` | read | Prometheus (outside `/api/v1`) |
 | POST · GET · DELETE | `/mcp` | per tool | MCP Streamable HTTP endpoint (outside `/api/v1`) |
 
-Status codes: `200`/`201`/`204` success · `400` invalid input · `401` missing or invalid key · `403` key lacks the scope · `404` unknown topic or id · `409` duplicate webhook or history rule id, or a change to the `env` history rule · `413` body too large · `429` too many concurrent waits · `502` broker or webhook error · `503` not connected to the broker.
+Status codes: `200`/`201`/`204` success · `400` invalid input · `401` missing or invalid key · `403` key lacks the scope · `404` unknown topic or id · `409` duplicate webhook or history rule id, or a change to the `env` history rule · `413` body too large · `429` too many concurrent waits, or a Sparkplug rebirth requested too soon · `502` broker or webhook error · `503` not connected to the broker.
 
 CLI: `mqtt-get [serve]` (default: REST, MCP and UI over HTTP) · `mqtt-get mcp` (standalone MCP on stdio) · `mqtt-get mcp --url … --key …` (stdio proxy to a server) · `mqtt-get healthcheck` · `mqtt-get version`.
 
@@ -1137,6 +1250,7 @@ internal/mcp        MCP interface for agents: tools, resources, prompts, complet
 internal/mqttc      broker connections: auth, TLS, dialing, publish, reconnect
 internal/store      sharded latest-value store + JSON encoding
 internal/history    bounded per-topic history: ring buffers, rules, budgets, aggregation, snapshots
+internal/sparkplug  Sparkplug B protobuf codec (hand-written, fuzzed) and translator: births, deaths, aliases, commands
 internal/topic      MQTT topic validation, matching, filter trie
 internal/webhook    webhook queues, batching, retries, signatures
 internal/state      persisted settings, webhooks, history rules and API keys

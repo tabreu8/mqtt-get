@@ -89,6 +89,11 @@ func mcpStandalone(ctx context.Context) error {
 	if historyOK {
 		svc.SetEnvHistoryRule(envHistory)
 	}
+	if envSpb, ok, err := config.SparkplugFromEnv(); err != nil {
+		return fmt.Errorf("SPARKPLUG_*: %w", err)
+	} else if ok {
+		svc.SetEnvSparkplug(envSpb)
+	}
 	if err := svc.Start(envBroker, envOK); err != nil {
 		log.Error("broker configuration error", "err", err)
 	}

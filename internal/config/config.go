@@ -472,6 +472,50 @@ func (r *HistoryRule) Validate() error {
 	return nil
 }
 
+// Sparkplug configures Sparkplug B support: messages on spBv1.0/# are
+// decoded into plain topics <prefix>/<group>/<edge_node>[/<device>]/<metric>
+// holding JSON values, which feed the store, history, webhooks and agents.
+type Sparkplug struct {
+	Enabled bool `json:"enabled"`
+	// Prefix of the translated topics (default "spb").
+	Prefix string `json:"prefix,omitempty"`
+	// KeepRaw also stores the raw protobuf messages under spBv1.0/...
+	KeepRaw bool `json:"keep_raw,omitempty"`
+	// Rebirth publishes a rebirth request (NCMD Node Control/Rebirth) when
+	// a node's metrics can't be decoded (no birth seen, unknown alias) or
+	// messages were lost, at most once per RebirthIntervalSec per node.
+	Rebirth            bool `json:"rebirth,omitempty"`
+	RebirthIntervalSec int  `json:"rebirth_interval_sec,omitempty"`
+	// Commands lets publishes to translated metric topics be sent to the
+	// edge node as NCMD/DCMD writes.
+	Commands bool `json:"commands,omitempty"`
+}
+
+// Normalize fills defaults.
+func (s *Sparkplug) Normalize() {
+	s.Prefix = strings.Trim(s.Prefix, "/")
+	if s.Prefix == "" {
+		s.Prefix = "spb"
+	}
+	if s.RebirthIntervalSec <= 0 {
+		s.RebirthIntervalSec = 30
+	}
+}
+
+// Validate checks the settings.
+func (s *Sparkplug) Validate() error {
+	if err := topic.ValidateName(s.Prefix); err != nil {
+		return fmt.Errorf("prefix: %w", err)
+	}
+	if s.Prefix == "spBv1.0" || strings.HasPrefix(s.Prefix, "spBv1.0/") {
+		return errors.New("prefix must not be inside the spBv1.0 namespace")
+	}
+	if s.RebirthIntervalSec > 86400 {
+		return errors.New("rebirth_interval_sec must be <= 86400")
+	}
+	return nil
+}
+
 // API key scopes.
 const (
 	ScopeRead    = "read"    // read latest values, topics, status
@@ -570,6 +614,24 @@ func HistoryFromEnv() (r HistoryRule, ok bool, err error) {
 	r.OnChange = envBool("HISTORY_ON_CHANGE", false)
 	r.Normalize()
 	return r, true, r.Validate()
+}
+
+// SparkplugFromEnv reads SPARKPLUG_* variables. ok is false when
+// SPARKPLUG_ENABLED is not set.
+func SparkplugFromEnv() (s Sparkplug, ok bool, err error) {
+	if Env("SPARKPLUG_ENABLED") == "" {
+		return s, false, nil
+	}
+	s = Sparkplug{
+		Enabled:            envBool("SPARKPLUG_ENABLED", false),
+		Prefix:             envStr("SPARKPLUG_PREFIX", ""),
+		KeepRaw:            envBool("SPARKPLUG_KEEP_RAW", false),
+		Rebirth:            envBool("SPARKPLUG_REBIRTH", false),
+		RebirthIntervalSec: envInt("SPARKPLUG_REBIRTH_INTERVAL_SEC", 0),
+		Commands:           envBool("SPARKPLUG_COMMANDS", false),
+	}
+	s.Normalize()
+	return s, true, s.Validate()
 }
 
 // BrokerFromEnv builds a broker configuration from MQTT_* variables. ok is

@@ -611,7 +611,7 @@ var tools = []*tool{
 }
 
 func init() {
-	tools = withHistoryTools(tools)
+	tools = withExtraTools(tools)
 	for _, t := range tools {
 		t.Title, _ = t.Annotations["title"].(string)
 	}
