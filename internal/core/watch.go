@@ -197,9 +197,15 @@ func (s *Service) PublishAndWait(ctx context.Context, msg mqttc.Message, respons
 		correlation = p.CorrelationData
 		msg.Props = &p
 	}
+	// A write to a Sparkplug metric is answered on the same (translated)
+	// topic by the edge node's data message: don't ignore it.
+	echo := msg.Topic
+	if sp := s.spb.Load(); sp != nil && sp.IsMetricTopic(msg.Topic) {
+		echo = ""
+	}
 	ch := make(chan *store.Entry, 1)
 	cancel, err := s.watch.add(responseFilter, func(e *store.Entry) {
-		if e.Topic == msg.Topic {
+		if e.Topic == echo {
 			return
 		}
 		if correlation != nil && e.Props != nil && len(e.Props.CorrelationData) > 0 &&

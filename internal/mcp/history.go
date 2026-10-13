@@ -17,17 +17,23 @@ import (
 // (points mode returns up to 1000 of them).
 const maxHistoryPayloadBytes = 2 << 10
 
-// withHistoryTools inserts the history read tools after wait_for_message
-// and appends the administration tools.
-func withHistoryTools(list []*tool) []*tool {
-	out := make([]*tool, 0, len(list)+len(historyReadTools)+len(historyAdminTools))
+// withExtraTools inserts the history and Sparkplug read tools after
+// wait_for_message, the publish tools after publish_and_wait, and appends
+// the administration tools.
+func withExtraTools(list []*tool) []*tool {
+	var out []*tool
 	for _, t := range list {
 		out = append(out, t)
-		if t.Name == "wait_for_message" {
+		switch t.Name {
+		case "wait_for_message":
 			out = append(out, historyReadTools...)
+			out = append(out, sparkplugReadTools...)
+		case "publish_and_wait":
+			out = append(out, sparkplugPublishTools...)
 		}
 	}
-	return append(out, historyAdminTools...)
+	out = append(out, historyAdminTools...)
+	return append(out, sparkplugAdminTools...)
 }
 
 var historyReadTools = []*tool{

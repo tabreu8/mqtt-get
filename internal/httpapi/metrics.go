@@ -36,6 +36,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	metric("mqttget_history_bytes", "gauge", "Approximate memory used by history.", hs.Bytes)
 	metric("mqttget_history_max_bytes", "gauge", "HISTORY_MAX_BYTES (0 = unlimited).", hs.MaxBytes)
 	metric("mqttget_history_dropped_total", "counter", "Messages not recorded because a history byte budget was exhausted.", hs.Dropped)
+	if sp := s.svc.Sparkplug().Stats; sp != nil {
+		metric("mqttget_sparkplug_messages_total", "counter", "Sparkplug B messages processed.", sp.Messages)
+		metric("mqttget_sparkplug_metrics_total", "counter", "Sparkplug metric values translated to topics.", sp.Metrics)
+		metric("mqttget_sparkplug_malformed_total", "counter", "Sparkplug payloads that could not be decoded.", sp.Malformed)
+		metric("mqttget_sparkplug_dropped_total", "counter", "Sparkplug messages or metrics dropped by the memory limits.", sp.Dropped)
+		metric("mqttget_sparkplug_unknown_metrics_total", "counter", "Sparkplug metrics dropped: alias without a birth certificate.", sp.Unknown)
+		metric("mqttget_sparkplug_seq_errors_total", "counter", "Sparkplug sequence number gaps (lost messages).", sp.SeqErrors)
+		metric("mqttget_sparkplug_rebirth_requests_total", "counter", "Rebirth requests sent to edge nodes.", sp.RebirthRequests)
+		metric("mqttget_sparkplug_commands_total", "counter", "NCMD/DCMD writes sent.", sp.Commands)
+		metric("mqttget_sparkplug_nodes", "gauge", "Sparkplug edge nodes seen.", sp.Nodes)
+		metric("mqttget_sparkplug_nodes_online", "gauge", "Sparkplug edge nodes online.", sp.NodesOnline)
+	}
 	metric("mqttget_goroutines", "gauge", "Number of goroutines.", runtime.NumGoroutine())
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)

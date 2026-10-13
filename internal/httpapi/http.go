@@ -87,6 +87,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/keys/{id}", s.auth(admin, s.handleKeyDelete))
 
 	s.historyRoutes(mux)
+	s.sparkplugRoutes(mux)
+	// Authenticates itself: browsers can't send headers on a WebSocket.
+	mux.HandleFunc("GET /api/v1/ws", s.handleWS)
 
 	mux.HandleFunc("GET /api/v1/tree", s.auth(read, s.handleTree))
 	mux.HandleFunc("GET /api/v1/wait", s.auth(read, s.handleWait))

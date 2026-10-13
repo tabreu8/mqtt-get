@@ -103,7 +103,7 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
     </div>
     <div class="actions">
       <button class="btn" id="refresh">Refresh</button>
-      <label style="margin:0;display:flex;align-items:center"><input type="checkbox" id="auto">Auto-refresh (2s)</label>
+      <label style="margin:0;display:flex;align-items:center" title="Streams changes over the WebSocket API"><input type="checkbox" id="auto">Live updates</label>
       <span class="muted" id="count"></span>
     </div>
     <div style="overflow:auto;margin-top:10px"><table><thead><tr><th>Topic</th><th>Payload</th><th>Age</th></tr></thead><tbody id="values"></tbody></table></div>
@@ -191,6 +191,24 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
         <button class="btn secondary" type="button" id="reconnect">Reconnect</button>
       </div>
     </form>
+  </div>
+  <div class="card">
+    <h2>Sparkplug B</h2>
+    <p class="muted">Decodes <span class="mono">spBv1.0/#</span> messages into plain topics <span class="mono">&lt;prefix&gt;/&lt;group&gt;/&lt;edge node&gt;[/&lt;device&gt;]/&lt;metric&gt;</span> with JSON values, readable like any other topic.</p>
+    <p class="err" id="spbHint"></p>
+    <form id="spbForm" autocomplete="off">
+      <label><input type="checkbox" name="enabled">Decode Sparkplug B messages</label>
+      <div class="row">
+        <div><label>Topic prefix</label><input name="prefix" placeholder="spb"></div>
+        <div><label>Minimum seconds between rebirth requests</label><input name="rebirth_interval_sec" type="number" min="1" value="30"></div>
+      </div>
+      <label><input type="checkbox" name="rebirth">Request a rebirth when a node's metrics can't be decoded or messages were lost</label>
+      <label><input type="checkbox" name="commands">Allow writes: publishing to a metric topic sends an NCMD/DCMD to the device</label>
+      <label><input type="checkbox" name="keep_raw">Also keep the raw protobuf messages</label>
+      <div class="err" id="spbErr"></div>
+      <div class="actions"><button class="btn" type="submit">Save</button><span class="muted" id="spbStats"></span></div>
+    </form>
+    <div style="overflow:auto;margin-top:10px"><table><thead><tr><th>Group / edge node</th><th>State</th><th>Devices</th><th>Metrics</th><th>Seq errors</th><th></th></tr></thead><tbody id="spbNodes"></tbody></table></div>
   </div>
 </section>
 
@@ -338,6 +356,7 @@ function showTab(t) {
   $$('#nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
   $$('main section').forEach(s => s.classList.toggle('active', s.id === t));
   store.set('mqttget.tab', t);
+  if (t !== 'explorer' && live) { stopLive(); $('#auto').checked = false; }
   ({ explorer: loadValues, history: loadHistory, broker: loadBroker, webhooks: loadHooks, keys: loadKeys, help: loadHelp })[t]?.();
 }
 
@@ -370,6 +389,7 @@ async function loadStatus() {
 // ---- explorer ----
 function preview(v) { return v.encoding === 'json' ? JSON.stringify(v.payload) : v.encoding === 'base64' ? '[binary] ' + v.payload : v.payload; }
 async function loadValues() {
+  if (live) return startLive();
   const f = $('#filter').value.trim() || '#', lim = $('#limit').value || 200;
   try {
     const r = await api('GET', `/api/v1/values?filter=${encodeURIComponent(f)}&limit=${lim}`);
@@ -388,7 +408,33 @@ async function showDetail(t) {
 $('#detailHist').onclick = () => { showTab('history'); showHistory($('#pubTopic').value); };
 $('#refresh').onclick = loadValues;
 $('#filter').onkeydown = e => { if (e.key === 'Enter') loadValues(); };
-let autoT; $('#auto').onchange = e => { clearInterval(autoT); if (e.target.checked) autoT = setInterval(loadValues, 2000); };
+// Live updates: subscribe to the filter over the WebSocket API.
+let live = null, liveVals = new Map(), liveDirty = false, liveTick;
+function renderLive() {
+  const lim = +$('#limit').value || 200, vals = [...liveVals.values()].sort((a, b) => a.topic < b.topic ? -1 : 1);
+  $('#count').textContent = `${Math.min(vals.length, lim)} of ${vals.length} topics · live`;
+  $('#values').innerHTML = vals.slice(0, lim).map(v => `<tr class="click" data-t="${esc(v.topic)}"><td class="mono">${esc(v.topic)}</td><td class="mono payload">${esc(preview(v))}</td><td>${age(v.timestamp)}</td></tr>`).join('') || '<tr><td colspan=3 class="muted">Waiting for messages…</td></tr>';
+  $$('#values tr.click').forEach(tr => tr.onclick = () => showDetail(tr.dataset.t));
+}
+function stopLive() { clearInterval(liveTick); if (live) { const ws = live; live = null; ws.close(); } }
+function startLive() {
+  stopLive();
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/v1/ws');
+  live = ws; liveVals = new Map();
+  ws.onopen = () => {
+    if (apiKey) ws.send(JSON.stringify({ type: 'auth', key: apiKey }));
+    ws.send(JSON.stringify({ type: 'subscribe', filter: $('#filter').value.trim() || '#', include_current: true }));
+  };
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'message') { liveVals.set(m.data.topic, m.data); liveDirty = true; }
+    else if (m.type === 'error') toast(m.error);
+    else if (m.type === 'dropped') toast(`${m.count} updates skipped (too fast to display)`);
+  };
+  ws.onclose = ev => { if (live === ws) { live = null; clearInterval(liveTick); $('#auto').checked = false; toast('Live updates stopped' + (ev.reason ? ': ' + ev.reason : '')); } };
+  liveTick = setInterval(() => { if (liveDirty || liveVals.size) { liveDirty = false; renderLive(); } }, 500);
+}
+$('#auto').onchange = e => e.target.checked ? startLive() : (stopLive(), loadValues());
 $('#pubBtn').onclick = async () => {
   const t = $('#pubTopic').value.trim();
   if (!t) return toast('Topic required');
@@ -399,7 +445,7 @@ $('#pubBtn').onclick = async () => {
       await api('POST', '/api/v1/publish', { topic: t, payload: $('#pubPayload').value, qos: +$('#pubQos').value, retain: $('#pubRetain').checked, properties: p });
     } else
     await api('POST', `/api/v1/publish/${t.split('/').map(encodeURIComponent).join('/')}?qos=${$('#pubQos').value}&retain=${$('#pubRetain').checked}`, $('#pubPayload').value, true);
-    toast('Published'); setTimeout(loadValues, 300);
+    toast('Published'); if (!live) setTimeout(loadValues, 300);
   } catch (e) { toast(e.message) }
 };
 
@@ -524,6 +570,7 @@ async function loadBroker() {
   for (const k of ['topic', 'payload', 'online_payload', 'retain']) set('will.' + k, w[k]);
   set('will.qos', w.qos || 0); set('will.delay_sec', w.delay_sec || '');
   set('connections', c.connections || 1); set('shared_group', c.shared_group); set('subscription_mode', c.subscription_mode || 'auto');
+  loadSparkplug();
 }
 const lines = s => s.split('\n').map(x => x.trim()).filter(Boolean);
 const headers = s => Object.fromEntries(lines(s).map(l => { const i = l.indexOf(':'); return [l.slice(0, i).trim(), l.slice(i + 1).trim()]; }).filter(([k]) => k));
@@ -548,6 +595,38 @@ $('#brokerForm').onsubmit = async ev => {
   };
   try { await api('PUT', '/api/v1/broker', body); $('#brokerErr').textContent = ''; toast('Saved — connecting…'); loadBroker(); setTimeout(loadStatus, 1500); }
   catch (err) { $('#brokerErr').textContent = err.message; }
+};
+// ---- sparkplug ----
+async function loadSparkplug() {
+  let v;
+  try { v = await api('GET', '/api/v1/sparkplug'); } catch (e) { return; }
+  const c = v.config, e = $('#spbForm').elements;
+  e.enabled.checked = c.enabled; e.prefix.value = c.prefix || ''; e.rebirth_interval_sec.value = c.rebirth_interval_sec || 30;
+  e.rebirth.checked = !!c.rebirth; e.commands.checked = !!c.commands; e.keep_raw.checked = !!c.keep_raw;
+  $('#spbHint').textContent = v.hint || '';
+  const st = v.stats;
+  $('#spbStats').textContent = st ? `${fmtN(st.metrics)} values from ${fmtN(st.messages)} messages · ${st.nodes_online}/${st.nodes} nodes online` +
+    (st.unknown_metrics ? ` · ${fmtN(st.unknown_metrics)} undecodable` : '') + (st.malformed ? ` · ${fmtN(st.malformed)} malformed` : '') + ` · settings: ${v.source}` : `settings: ${v.source}`;
+  if (!c.enabled) { $('#spbNodes').innerHTML = '<tr><td colspan=6 class="muted">Disabled</td></tr>'; return; }
+  const r = await api('GET', '/api/v1/sparkplug/nodes').catch(() => ({ nodes: [] }));
+  const on = x => `<span class="pill ${x ? 'ok' : 'bad'}">${x ? 'online' : 'offline'}</span>`;
+  $('#spbNodes').innerHTML = r.nodes.map(n => `<tr><td class="mono">${esc(n.group)} / ${esc(n.edge_node)}${n.birth_seen ? '' : ' <span class="pill" title="no birth seen yet: aliases unknown">no birth</span>'}</td>
+    <td>${on(n.online)}</td><td>${n.devices.map(d => `<span class="mono">${esc(d.id)}</span> ${on(d.online)}`).join('<br>') || '—'}</td>
+    <td>${n.metric_count + n.devices.reduce((a, d) => a + d.metric_count, 0)}</td><td>${n.seq_errors}</td>
+    <td><button class="btn small secondary" data-g="${esc(n.group)}" data-e="${esc(n.edge_node)}">Rebirth</button></td></tr>`).join('') ||
+    '<tr><td colspan=6 class="muted">No Sparkplug messages received yet</td></tr>';
+  $$('#spbNodes button').forEach(b => b.onclick = async () => {
+    try { await api('POST', `/api/v1/sparkplug/nodes/${encodeURIComponent(b.dataset.g)}/${encodeURIComponent(b.dataset.e)}/rebirth`); toast('Rebirth requested'); setTimeout(loadSparkplug, 1000); }
+    catch (err) { toast(err.message) }
+  });
+}
+$('#spbForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const e = ev.target.elements;
+  const body = { enabled: e.enabled.checked, prefix: e.prefix.value.trim(), rebirth_interval_sec: parseInt(e.rebirth_interval_sec.value) || 0,
+    rebirth: e.rebirth.checked, commands: e.commands.checked, keep_raw: e.keep_raw.checked };
+  try { await api('PUT', '/api/v1/sparkplug', body); $('#spbErr').textContent = ''; toast('Sparkplug settings saved'); loadSparkplug(); }
+  catch (err) { $('#spbErr').textContent = err.message; }
 };
 $('#reconnect').onclick = async () => { try { await api('POST', '/api/v1/broker/reconnect'); toast('Reconnecting…'); setTimeout(loadStatus, 1500); } catch (e) { toast(e.message) } };
 
@@ -634,6 +713,9 @@ curl -H "Authorization: Bearer ${k}" "${o}/api/v1/history/home/kitchen/temperatu
 # Keep the last 1000 points (at most one per minute) of every temperature topic
 curl -X POST -H "Authorization: Bearer ${k}" -H 'Content-Type: application/json' \\
   -d '{"topics":["home/+/temperature"],"max_points":1000,"min_interval_ms":60000}' ${o}/api/v1/history-rules
+
+# Live stream of messages (WebSocket; browsers send {"type":"auth","key":"…"} first)
+websocat -H "Authorization: Bearer ${k}" "${o.replace(/^http/, 'ws')}/api/v1/ws?filter=home/%23"
 
 # Prometheus metrics
 curl -H "Authorization: Bearer ${k}" ${o}/metrics`;

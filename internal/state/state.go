@@ -24,10 +24,11 @@ import (
 var ErrNotFound = errors.New("not found")
 
 type fileData struct {
-	Broker   *config.Broker       `json:"broker,omitempty"`
-	Webhooks []config.Webhook     `json:"webhooks"`
-	History  []config.HistoryRule `json:"history_rules,omitempty"`
-	APIKeys  []config.APIKey      `json:"api_keys"`
+	Broker    *config.Broker       `json:"broker,omitempty"`
+	Webhooks  []config.Webhook     `json:"webhooks"`
+	History   []config.HistoryRule `json:"history_rules,omitempty"`
+	Sparkplug *config.Sparkplug    `json:"sparkplug,omitempty"`
+	APIKeys   []config.APIKey      `json:"api_keys"`
 }
 
 // State is the persisted configuration. All methods are safe for concurrent use.
@@ -161,6 +162,26 @@ func (s *State) DeleteWebhook(id string) error {
 		}
 	}
 	return ErrNotFound
+}
+
+// --- sparkplug ---
+
+// Sparkplug returns the persisted Sparkplug settings, if any.
+func (s *State) Sparkplug() (config.Sparkplug, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.data.Sparkplug == nil {
+		return config.Sparkplug{}, false
+	}
+	return *s.data.Sparkplug, true
+}
+
+// SetSparkplug persists the Sparkplug settings.
+func (s *State) SetSparkplug(c config.Sparkplug) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Sparkplug = &c
+	return s.saveLocked()
 }
 
 // --- history rules ---

@@ -163,3 +163,23 @@ func TestHistoryRuleValidate(t *testing.T) {
 		t.Fatalf("%+v", r)
 	}
 }
+
+func TestSparkplugFromEnv(t *testing.T) {
+	env := map[string]string{}
+	Env = func(k string) string { return env[k] }
+	defer func() { Env = os.Getenv }()
+	if _, ok, _ := SparkplugFromEnv(); ok {
+		t.Fatal("configured without SPARKPLUG_ENABLED")
+	}
+	env["SPARKPLUG_ENABLED"] = "true"
+	env["SPARKPLUG_PREFIX"] = "/uns/sparkplug/"
+	env["SPARKPLUG_COMMANDS"] = "true"
+	s, ok, err := SparkplugFromEnv()
+	if !ok || err != nil || !s.Enabled || s.Prefix != "uns/sparkplug" || !s.Commands || s.Rebirth || s.RebirthIntervalSec != 30 {
+		t.Fatalf("%+v %v", s, err)
+	}
+	env["SPARKPLUG_PREFIX"] = "a/+/b"
+	if _, _, err := SparkplugFromEnv(); err == nil {
+		t.Fatal("wildcard prefix accepted")
+	}
+}
