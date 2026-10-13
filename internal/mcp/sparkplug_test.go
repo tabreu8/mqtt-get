@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tabreu8/mqtt-get/internal/sparkplug"
 	"github.com/tabreu8/mqtt-get/internal/store"
+	spb "github.com/tabreu8/mqtt-get/sparkplug"
 )
 
 func TestSparkplugTools(t *testing.T) {
@@ -41,8 +41,8 @@ func TestSparkplugTools(t *testing.T) {
 		t.Fatalf("partial update: %v", out)
 	}
 
-	birth := sparkplug.Encode(&sparkplug.Payload{Seq: 0, HasSeq: true, Metrics: []sparkplug.Metric{
-		{Name: "Level", Datatype: sparkplug.TypeDouble, Value: sparkplug.Value{Kind: sparkplug.KindDouble, F: 3.5}},
+	birth := spb.Encode(&spb.Payload{Seq: 0, HasSeq: true, Metrics: []spb.Metric{
+		{Name: "Level", Datatype: spb.TypeDouble, Value: spb.Value{Kind: spb.KindDouble, Float: 3.5}},
 	}})
 	svc.Ingest(store.Entry{Topic: "spBv1.0/site/DBIRTH/edge/tank", Payload: birth, Time: time.Now().UnixNano()})
 

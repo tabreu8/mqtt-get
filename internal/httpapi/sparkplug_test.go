@@ -18,6 +18,7 @@ import (
 	"github.com/tabreu8/mqtt-get/internal/mqttc"
 	"github.com/tabreu8/mqtt-get/internal/sparkplug"
 	"github.com/tabreu8/mqtt-get/internal/store"
+	spb "github.com/tabreu8/mqtt-get/sparkplug"
 )
 
 // edgeNode plays a Sparkplug B edge node with one device on the embedded
@@ -28,7 +29,7 @@ type edgeNode struct {
 	mu     sync.Mutex
 	seq    uint64
 	setp   float64
-	cmds   []sparkplug.Metric
+	cmds   []spb.Metric
 	births int
 }
 
@@ -40,17 +41,17 @@ func (n *edgeNode) next() uint64 {
 	return s
 }
 
-func (n *edgeNode) publish(typ, dev string, metrics ...sparkplug.Metric) {
+func (n *edgeNode) publish(typ, dev string, metrics ...spb.Metric) {
 	n.t.Helper()
 	topic := "spBv1.0/plant/" + typ + "/gw1"
 	if dev != "" {
 		topic += "/" + dev
 	}
-	p := &sparkplug.Payload{Timestamp: uint64(time.Now().UnixMilli()), HasTimestamp: true, Metrics: metrics}
+	p := &spb.Payload{Timestamp: uint64(time.Now().UnixMilli()), HasTimestamp: true, Metrics: metrics}
 	if typ != sparkplug.NDEATH {
 		p.Seq, p.HasSeq = n.next(), true
 	}
-	if err := n.b.Publish(topic, sparkplug.Encode(p), false, 0); err != nil {
+	if err := n.b.Publish(topic, spb.Encode(p), false, 0); err != nil {
 		n.t.Fatal(err)
 	}
 }
@@ -61,21 +62,21 @@ func (n *edgeNode) birth() {
 	setp := n.setp
 	n.mu.Unlock()
 	n.publish(sparkplug.NBIRTH, "",
-		sparkplug.Metric{Name: "bdSeq", Datatype: sparkplug.TypeUInt64, Value: sparkplug.Value{Kind: sparkplug.KindLong, U: 1}},
-		sparkplug.Metric{Name: sparkplug.RebirthMetric, Datatype: sparkplug.TypeBoolean, Value: sparkplug.Value{Kind: sparkplug.KindBool}})
+		spb.Metric{Name: "bdSeq", Datatype: spb.TypeUInt64, Value: spb.Value{Kind: spb.KindLong, Uint: 1}},
+		spb.Metric{Name: sparkplug.RebirthMetric, Datatype: spb.TypeBoolean, Value: spb.Value{Kind: spb.KindBool}})
 	n.publish(sparkplug.DBIRTH, "press",
-		sparkplug.Metric{Name: "Temperature", Alias: 1, HasAlias: true, Datatype: sparkplug.TypeDouble, Value: sparkplug.Value{Kind: sparkplug.KindDouble, F: 20},
-			Properties: &sparkplug.PropertySet{Keys: []string{"engUnit"}, Values: []sparkplug.PropertyValue{{Type: sparkplug.TypeString, Value: sparkplug.Value{Kind: sparkplug.KindString, S: "C"}}}}},
-		sparkplug.Metric{Name: "Setpoint", Alias: 2, HasAlias: true, Datatype: sparkplug.TypeFloat, Value: sparkplug.Value{Kind: sparkplug.KindFloat, F: setp}})
+		spb.Metric{Name: "Temperature", Alias: 1, HasAlias: true, Datatype: spb.TypeDouble, Value: spb.Value{Kind: spb.KindDouble, Float: 20},
+			Properties: &spb.PropertySet{Keys: []string{"engUnit"}, Values: []spb.PropertyValue{{Type: spb.TypeString, Value: spb.Value{Kind: spb.KindString, Str: "C"}}}}},
+		spb.Metric{Name: "Setpoint", Alias: 2, HasAlias: true, Datatype: spb.TypeFloat, Value: spb.Value{Kind: spb.KindFloat, Float: setp}})
 }
 
 func (n *edgeNode) temperature(v float64) {
-	n.publish(sparkplug.DDATA, "press", sparkplug.Metric{Alias: 1, HasAlias: true, Value: sparkplug.Value{Kind: sparkplug.KindDouble, F: v}})
+	n.publish(sparkplug.DDATA, "press", spb.Metric{Alias: 1, HasAlias: true, Value: spb.Value{Kind: spb.KindDouble, Float: v}})
 }
 
 func (n *edgeNode) listen() {
 	handle := func(_ *mochi.Client, _ packets.Subscription, pk packets.Packet) {
-		p, err := sparkplug.Decode(pk.Payload)
+		p, err := spb.Decode(pk.Payload)
 		if err != nil {
 			n.t.Errorf("edge node got an invalid command on %s: %v", pk.TopicName, err)
 			return
@@ -85,13 +86,13 @@ func (n *edgeNode) listen() {
 			n.cmds = append(n.cmds, m)
 			n.mu.Unlock()
 			switch {
-			case m.Name == sparkplug.RebirthMetric && m.Value.U == 1:
+			case m.Name == sparkplug.RebirthMetric && m.Value.Bool:
 				go n.birth()
 			case m.Name == "Setpoint":
 				n.mu.Lock()
-				n.setp = m.Value.F
+				n.setp = m.Value.Float
 				n.mu.Unlock()
-				go n.publish(sparkplug.DDATA, "press", sparkplug.Metric{Alias: 2, HasAlias: true, Value: m.Value})
+				go n.publish(sparkplug.DDATA, "press", spb.Metric{Alias: 2, HasAlias: true, Value: m.Value})
 			}
 		}
 	}
@@ -103,10 +104,10 @@ func (n *edgeNode) listen() {
 	}
 }
 
-func (n *edgeNode) commands() []sparkplug.Metric {
+func (n *edgeNode) commands() []spb.Metric {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return append([]sparkplug.Metric(nil), n.cmds...)
+	return append([]spb.Metric(nil), n.cmds...)
 }
 
 func TestSparkplugEndToEnd(t *testing.T) {
@@ -181,7 +182,7 @@ func TestSparkplugEndToEnd(t *testing.T) {
 	}
 	eventually(t, func() bool {
 		for _, m := range edge.commands() {
-			if m.Name == "Setpoint" && m.Datatype == sparkplug.TypeFloat && m.Value.Kind == sparkplug.KindFloat && m.Value.F == 61.5 {
+			if m.Name == "Setpoint" && m.Datatype == spb.TypeFloat && m.Value.Kind == spb.KindFloat && m.Value.Float == 61.5 {
 				return true
 			}
 		}
@@ -217,7 +218,7 @@ func TestSparkplugEndToEnd(t *testing.T) {
 	}
 
 	// Death marks the values offline.
-	edge.publish(sparkplug.NDEATH, "", sparkplug.Metric{Name: "bdSeq", Value: sparkplug.Value{Kind: sparkplug.KindLong, U: 1}})
+	edge.publish(sparkplug.NDEATH, "", spb.Metric{Name: "bdSeq", Value: spb.Value{Kind: spb.KindLong, Uint: 1}})
 	eventually(t, func() bool {
 		v, _ := e.svc.Store().Get("spb/plant/gw1/press/Temperature")
 		return v != nil && strings.Contains(string(v.Payload), `"online":false`)
@@ -377,20 +378,20 @@ func TestSparkplugWithHistoryRawAndPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	ing := func(topic string, p *sparkplug.Payload, at time.Time) {
-		e.svc.Ingest(store.Entry{Topic: topic, Payload: sparkplug.Encode(p), Time: at.UnixNano()})
+	ing := func(topic string, p *spb.Payload, at time.Time) {
+		e.svc.Ingest(store.Entry{Topic: topic, Payload: spb.Encode(p), Time: at.UnixNano()})
 	}
-	dbl := func(alias uint64, f float64) sparkplug.Metric {
-		return sparkplug.Metric{Alias: alias, HasAlias: true, Value: sparkplug.Value{Kind: sparkplug.KindDouble, F: f}}
+	dbl := func(alias uint64, f float64) spb.Metric {
+		return spb.Metric{Alias: alias, HasAlias: true, Value: spb.Value{Kind: spb.KindDouble, Float: f}}
 	}
-	ing("spBv1.0/g/DBIRTH/e/d", &sparkplug.Payload{Seq: 0, HasSeq: true, Metrics: []sparkplug.Metric{
-		{Name: "Level", Alias: 1, HasAlias: true, Datatype: sparkplug.TypeDouble, Value: sparkplug.Value{Kind: sparkplug.KindDouble, F: 1}}}}, now.Add(-3*time.Second))
-	ing("spBv1.0/g/DDATA/e/d", &sparkplug.Payload{Seq: 1, HasSeq: true, Metrics: []sparkplug.Metric{dbl(1, 2)}}, now.Add(-2*time.Second))
-	ing("spBv1.0/g/DDATA/e/d", &sparkplug.Payload{Seq: 2, HasSeq: true, Metrics: []sparkplug.Metric{dbl(1, 3)}}, now.Add(-time.Second))
+	ing("spBv1.0/g/DBIRTH/e/d", &spb.Payload{Seq: 0, HasSeq: true, Metrics: []spb.Metric{
+		{Name: "Level", Alias: 1, HasAlias: true, Datatype: spb.TypeDouble, Value: spb.Value{Kind: spb.KindDouble, Float: 1}}}}, now.Add(-3*time.Second))
+	ing("spBv1.0/g/DDATA/e/d", &spb.Payload{Seq: 1, HasSeq: true, Metrics: []spb.Metric{dbl(1, 2)}}, now.Add(-2*time.Second))
+	ing("spBv1.0/g/DDATA/e/d", &spb.Payload{Seq: 2, HasSeq: true, Metrics: []spb.Metric{dbl(1, 3)}}, now.Add(-time.Second))
 	// A backfilled (historical) point older than everything else.
 	hist := dbl(1, 0.5)
 	hist.IsHistorical, hist.Timestamp, hist.HasTimestamp = true, uint64(now.Add(-time.Hour).UnixMilli()), true
-	ing("spBv1.0/g/DDATA/e/d", &sparkplug.Payload{Seq: 3, HasSeq: true, Metrics: []sparkplug.Metric{hist}}, now)
+	ing("spBv1.0/g/DDATA/e/d", &spb.Payload{Seq: 3, HasSeq: true, Metrics: []spb.Metric{hist}}, now)
 
 	// The latest value is the newest real-time one, not the backfilled one.
 	if v, err := e.svc.Latest("spb/g/e/d/Level"); err != nil || !strings.Contains(string(v.Payload), `"value":3,`) {
@@ -419,8 +420,8 @@ func TestSparkplugWithHistoryRawAndPrefix(t *testing.T) {
 	if _, ok := e.svc.Store().Get("spb/g/e/d/Level"); ok {
 		t.Fatal("old prefix kept")
 	}
-	ing("spBv1.0/g/DBIRTH/e/d", &sparkplug.Payload{Seq: 0, HasSeq: true, Metrics: []sparkplug.Metric{
-		{Name: "Level", Datatype: sparkplug.TypeDouble, Value: sparkplug.Value{Kind: sparkplug.KindDouble, F: 4}}}}, now)
+	ing("spBv1.0/g/DBIRTH/e/d", &spb.Payload{Seq: 0, HasSeq: true, Metrics: []spb.Metric{
+		{Name: "Level", Datatype: spb.TypeDouble, Value: spb.Value{Kind: spb.KindDouble, Float: 4}}}}, now)
 	if _, err := e.svc.Latest("uns/spb/g/e/d/Level"); err != nil {
 		t.Fatalf("new prefix: %v", err)
 	}

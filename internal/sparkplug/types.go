@@ -12,87 +12,33 @@ import (
 	"time"
 
 	"github.com/tabreu8/mqtt-get/internal/store"
+	spb "github.com/tabreu8/mqtt-get/sparkplug"
 )
-
-// Sparkplug B data types.
-const (
-	TypeUnknown         = 0
-	TypeInt8            = 1
-	TypeInt16           = 2
-	TypeInt32           = 3
-	TypeInt64           = 4
-	TypeUInt8           = 5
-	TypeUInt16          = 6
-	TypeUInt32          = 7
-	TypeUInt64          = 8
-	TypeFloat           = 9
-	TypeDouble          = 10
-	TypeBoolean         = 11
-	TypeString          = 12
-	TypeDateTime        = 13
-	TypeText            = 14
-	TypeUUID            = 15
-	TypeDataSet         = 16
-	TypeBytes           = 17
-	TypeFile            = 18
-	TypeTemplate        = 19
-	TypePropertySet     = 20
-	TypePropertySetList = 21
-	TypeInt8Array       = 22
-	TypeInt16Array      = 23
-	TypeInt32Array      = 24
-	TypeInt64Array      = 25
-	TypeUInt8Array      = 26
-	TypeUInt16Array     = 27
-	TypeUInt32Array     = 28
-	TypeUInt64Array     = 29
-	TypeFloatArray      = 30
-	TypeDoubleArray     = 31
-	TypeBooleanArray    = 32
-	TypeStringArray     = 33
-	TypeDateTimeArray   = 34
-)
-
-var typeNames = []string{
-	"Unknown", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
-	"Float", "Double", "Boolean", "String", "DateTime", "Text", "UUID", "DataSet", "Bytes", "File",
-	"Template", "PropertySet", "PropertySetList", "Int8Array", "Int16Array", "Int32Array", "Int64Array",
-	"UInt8Array", "UInt16Array", "UInt32Array", "UInt64Array", "FloatArray", "DoubleArray",
-	"BooleanArray", "StringArray", "DateTimeArray",
-}
-
-// TypeName returns the Sparkplug name of a data type.
-func TypeName(t uint32) string {
-	if int(t) < len(typeNames) {
-		return typeNames[t]
-	}
-	return "Unknown"
-}
 
 // inferType guesses a data type from the value field that is set, for
 // metrics whose type is unknown (no birth seen).
-func inferType(v Value) uint32 {
+func inferType(v spb.Value) spb.DataType {
 	switch v.Kind {
-	case KindInt:
-		return TypeUInt32
-	case KindLong:
-		return TypeUInt64
-	case KindFloat:
-		return TypeFloat
-	case KindDouble:
-		return TypeDouble
-	case KindBool:
-		return TypeBoolean
-	case KindString:
-		return TypeString
-	case KindBytes:
-		return TypeBytes
-	case KindDataSet:
-		return TypeDataSet
-	case KindTemplate:
-		return TypeTemplate
+	case spb.KindInt:
+		return spb.TypeUInt32
+	case spb.KindLong:
+		return spb.TypeUInt64
+	case spb.KindFloat:
+		return spb.TypeFloat
+	case spb.KindDouble:
+		return spb.TypeDouble
+	case spb.KindBool:
+		return spb.TypeBoolean
+	case spb.KindString:
+		return spb.TypeString
+	case spb.KindBytes:
+		return spb.TypeBytes
+	case spb.KindDataSet:
+		return spb.TypeDataSet
+	case spb.KindTemplate:
+		return spb.TypeTemplate
 	}
-	return TypeUnknown
+	return spb.TypeUnknown
 }
 
 func appendFloat(buf []byte, f float64, bits int) []byte {
@@ -109,52 +55,52 @@ func appendTime(buf []byte, ms int64) []byte {
 }
 
 // AppendValue appends v, interpreted as data type t, as JSON.
-func AppendValue(buf []byte, t uint32, v Value) []byte {
-	if t == TypeUnknown {
+func AppendValue(buf []byte, t spb.DataType, v spb.Value) []byte {
+	if t == spb.TypeUnknown {
 		t = inferType(v)
 	}
 	switch t {
-	case TypeInt8:
-		return strconv.AppendInt(buf, int64(int8(v.U)), 10)
-	case TypeInt16:
-		return strconv.AppendInt(buf, int64(int16(v.U)), 10)
-	case TypeInt32:
-		return strconv.AppendInt(buf, int64(int32(v.U)), 10)
-	case TypeInt64:
-		return strconv.AppendInt(buf, int64(v.U), 10)
-	case TypeUInt8, TypeUInt16, TypeUInt32, TypeUInt64:
-		return strconv.AppendUint(buf, v.U, 10)
-	case TypeFloat:
-		if v.Kind == KindDouble {
-			return appendFloat(buf, v.F, 64)
+	case spb.TypeInt8:
+		return strconv.AppendInt(buf, int64(int8(v.Uint)), 10)
+	case spb.TypeInt16:
+		return strconv.AppendInt(buf, int64(int16(v.Uint)), 10)
+	case spb.TypeInt32:
+		return strconv.AppendInt(buf, int64(int32(v.Uint)), 10)
+	case spb.TypeInt64:
+		return strconv.AppendInt(buf, int64(v.Uint), 10)
+	case spb.TypeUInt8, spb.TypeUInt16, spb.TypeUInt32, spb.TypeUInt64:
+		return strconv.AppendUint(buf, v.Uint, 10)
+	case spb.TypeFloat:
+		if v.Kind == spb.KindDouble {
+			return appendFloat(buf, v.Float, 64)
 		}
-		return appendFloat(buf, v.F, 32)
-	case TypeDouble:
-		if v.Kind == KindFloat {
-			return appendFloat(buf, v.F, 32)
+		return appendFloat(buf, v.Float, 32)
+	case spb.TypeDouble:
+		if v.Kind == spb.KindFloat {
+			return appendFloat(buf, v.Float, 32)
 		}
-		return appendFloat(buf, v.F, 64)
-	case TypeBoolean:
-		return strconv.AppendBool(buf, v.U != 0)
-	case TypeDateTime:
-		return appendTime(buf, int64(v.U))
-	case TypeString, TypeText, TypeUUID:
-		return store.AppendString(buf, v.S)
-	case TypeBytes, TypeFile:
+		return appendFloat(buf, v.Float, 64)
+	case spb.TypeBoolean:
+		return strconv.AppendBool(buf, v.Bool)
+	case spb.TypeDateTime:
+		return appendTime(buf, int64(v.Uint))
+	case spb.TypeString, spb.TypeText, spb.TypeUUID:
+		return store.AppendString(buf, v.Str)
+	case spb.TypeBytes, spb.TypeFile:
 		buf = append(buf, '"')
-		buf = base64.StdEncoding.AppendEncode(buf, v.B)
+		buf = base64.StdEncoding.AppendEncode(buf, v.Bytes)
 		return append(buf, '"')
-	case TypeDataSet:
+	case spb.TypeDataSet:
 		if v.DataSet != nil {
 			return appendDataSet(buf, v.DataSet)
 		}
-	case TypeTemplate:
+	case spb.TypeTemplate:
 		if v.Template != nil {
 			return appendTemplate(buf, v.Template)
 		}
 	}
-	if t >= TypeInt8Array && t <= TypeDateTimeArray && v.Kind == KindBytes {
-		if out, ok := appendArray(buf, t, v.B); ok {
+	if t >= spb.TypeInt8Array && t <= spb.TypeDateTimeArray && v.Kind == spb.KindBytes {
+		if out, ok := appendArray(buf, t, v.Bytes); ok {
 			return out
 		}
 	}
@@ -162,35 +108,35 @@ func AppendValue(buf []byte, t uint32, v Value) []byte {
 }
 
 // appendKind renders a value by its wire kind (type unknown or mismatched).
-func appendKind(buf []byte, v Value) []byte {
+func appendKind(buf []byte, v spb.Value) []byte {
 	switch v.Kind {
-	case KindInt, KindLong:
-		return strconv.AppendUint(buf, v.U, 10)
-	case KindFloat:
-		return appendFloat(buf, v.F, 32)
-	case KindDouble:
-		return appendFloat(buf, v.F, 64)
-	case KindBool:
-		return strconv.AppendBool(buf, v.U != 0)
-	case KindString:
-		return store.AppendString(buf, v.S)
-	case KindBytes:
+	case spb.KindInt, spb.KindLong:
+		return strconv.AppendUint(buf, v.Uint, 10)
+	case spb.KindFloat:
+		return appendFloat(buf, v.Float, 32)
+	case spb.KindDouble:
+		return appendFloat(buf, v.Float, 64)
+	case spb.KindBool:
+		return strconv.AppendBool(buf, v.Bool)
+	case spb.KindString:
+		return store.AppendString(buf, v.Str)
+	case spb.KindBytes:
 		buf = append(buf, '"')
-		buf = base64.StdEncoding.AppendEncode(buf, v.B)
+		buf = base64.StdEncoding.AppendEncode(buf, v.Bytes)
 		return append(buf, '"')
-	case KindDataSet:
+	case spb.KindDataSet:
 		return appendDataSet(buf, v.DataSet)
-	case KindTemplate:
+	case spb.KindTemplate:
 		return appendTemplate(buf, v.Template)
-	case KindPropertySet:
-		return AppendProperties(buf, v.Set)
-	case KindPropertySetList:
+	case spb.KindPropertySet:
+		return AppendProperties(buf, v.Properties)
+	case spb.KindPropertySetList:
 		buf = append(buf, '[')
-		for i := range v.Sets {
+		for i := range v.PropertiesList {
 			if i > 0 {
 				buf = append(buf, ',')
 			}
-			buf = AppendProperties(buf, &v.Sets[i])
+			buf = AppendProperties(buf, &v.PropertiesList[i])
 		}
 		return append(buf, ']')
 	}
@@ -199,14 +145,14 @@ func appendKind(buf []byte, v Value) []byte {
 
 // appendArray decodes a packed array (Sparkplug 3.0: little-endian values
 // in bytes_value). ok is false when the length doesn't fit the type.
-func appendArray(buf []byte, t uint32, b []byte) ([]byte, bool) {
-	size := map[uint32]int{
-		TypeInt8Array: 1, TypeUInt8Array: 1, TypeInt16Array: 2, TypeUInt16Array: 2,
-		TypeInt32Array: 4, TypeUInt32Array: 4, TypeFloatArray: 4,
-		TypeInt64Array: 8, TypeUInt64Array: 8, TypeDoubleArray: 8, TypeDateTimeArray: 8,
+func appendArray(buf []byte, t spb.DataType, b []byte) ([]byte, bool) {
+	size := map[spb.DataType]int{
+		spb.TypeInt8Array: 1, spb.TypeUInt8Array: 1, spb.TypeInt16Array: 2, spb.TypeUInt16Array: 2,
+		spb.TypeInt32Array: 4, spb.TypeUInt32Array: 4, spb.TypeFloatArray: 4,
+		spb.TypeInt64Array: 8, spb.TypeUInt64Array: 8, spb.TypeDoubleArray: 8, spb.TypeDateTimeArray: 8,
 	}[t]
 	switch t {
-	case TypeBooleanArray:
+	case spb.TypeBooleanArray:
 		// uint32 count, then the booleans packed MSB first.
 		if len(b) < 4 {
 			return buf, false
@@ -224,7 +170,7 @@ func appendArray(buf []byte, t uint32, b []byte) ([]byte, bool) {
 			buf = strconv.AppendBool(buf, bits[i/8]&(0x80>>(i%8)) != 0)
 		}
 		return append(buf, ']'), true
-	case TypeStringArray:
+	case spb.TypeStringArray:
 		// NUL-terminated strings.
 		if len(b) > 0 && b[len(b)-1] != 0 {
 			return buf, false
@@ -251,27 +197,27 @@ func appendArray(buf []byte, t uint32, b []byte) ([]byte, bool) {
 			buf = append(buf, ',')
 		}
 		switch t {
-		case TypeInt8Array:
+		case spb.TypeInt8Array:
 			buf = strconv.AppendInt(buf, int64(int8(b[i])), 10)
-		case TypeUInt8Array:
+		case spb.TypeUInt8Array:
 			buf = strconv.AppendUint(buf, uint64(b[i]), 10)
-		case TypeInt16Array:
+		case spb.TypeInt16Array:
 			buf = strconv.AppendInt(buf, int64(int16(le.Uint16(b[i:]))), 10)
-		case TypeUInt16Array:
+		case spb.TypeUInt16Array:
 			buf = strconv.AppendUint(buf, uint64(le.Uint16(b[i:])), 10)
-		case TypeInt32Array:
+		case spb.TypeInt32Array:
 			buf = strconv.AppendInt(buf, int64(int32(le.Uint32(b[i:]))), 10)
-		case TypeUInt32Array:
+		case spb.TypeUInt32Array:
 			buf = strconv.AppendUint(buf, uint64(le.Uint32(b[i:])), 10)
-		case TypeFloatArray:
+		case spb.TypeFloatArray:
 			buf = appendFloat(buf, float64(math.Float32frombits(le.Uint32(b[i:]))), 32)
-		case TypeInt64Array:
+		case spb.TypeInt64Array:
 			buf = strconv.AppendInt(buf, int64(le.Uint64(b[i:])), 10)
-		case TypeUInt64Array:
+		case spb.TypeUInt64Array:
 			buf = strconv.AppendUint(buf, le.Uint64(b[i:]), 10)
-		case TypeDoubleArray:
+		case spb.TypeDoubleArray:
 			buf = appendFloat(buf, math.Float64frombits(le.Uint64(b[i:])), 64)
-		case TypeDateTimeArray:
+		case spb.TypeDateTimeArray:
 			buf = appendTime(buf, int64(le.Uint64(b[i:])))
 		}
 	}
@@ -279,7 +225,7 @@ func appendArray(buf []byte, t uint32, b []byte) ([]byte, bool) {
 }
 
 // appendDataSet renders {"columns":[...],"types":[...],"rows":[[...],...]}.
-func appendDataSet(buf []byte, ds *DataSet) []byte {
+func appendDataSet(buf []byte, ds *spb.DataSet) []byte {
 	if ds == nil {
 		return append(buf, "null"...)
 	}
@@ -295,7 +241,7 @@ func appendDataSet(buf []byte, ds *DataSet) []byte {
 		if i > 0 {
 			buf = append(buf, ',')
 		}
-		buf = store.AppendString(buf, TypeName(t))
+		buf = store.AppendString(buf, t.String())
 	}
 	buf = append(buf, `],"rows":[`...)
 	for i, row := range ds.Rows {
@@ -307,7 +253,7 @@ func appendDataSet(buf []byte, ds *DataSet) []byte {
 			if j > 0 {
 				buf = append(buf, ',')
 			}
-			var t uint32
+			var t spb.DataType
 			if j < len(ds.Types) {
 				t = ds.Types[j]
 			}
@@ -319,7 +265,7 @@ func appendDataSet(buf []byte, ds *DataSet) []byte {
 }
 
 // appendTemplate renders {"template_ref":...,"metrics":{name:value},"parameters":{name:value}}.
-func appendTemplate(buf []byte, t *Template) []byte {
+func appendTemplate(buf []byte, t *spb.Template) []byte {
 	if t == nil {
 		return append(buf, "null"...)
 	}
@@ -368,7 +314,7 @@ func appendTemplate(buf []byte, t *Template) []byte {
 }
 
 // AppendProperties renders a property set as a JSON object.
-func AppendProperties(buf []byte, ps *PropertySet) []byte {
+func AppendProperties(buf []byte, ps *spb.PropertySet) []byte {
 	if ps == nil {
 		return append(buf, "null"...)
 	}
@@ -385,7 +331,7 @@ func AppendProperties(buf []byte, ps *PropertySet) []byte {
 		}
 		pv := ps.Values[i]
 		switch pv.Value.Kind {
-		case KindPropertySet, KindPropertySetList:
+		case spb.KindPropertySet, spb.KindPropertySetList:
 			buf = appendKind(buf, pv.Value)
 		default:
 			buf = AppendValue(buf, pv.Type, pv.Value)
@@ -394,25 +340,12 @@ func AppendProperties(buf []byte, ps *PropertySet) []byte {
 	return append(buf, '}')
 }
 
-// Property returns the string value of property key (case-insensitive).
-func (ps *PropertySet) Property(key string) (string, bool) {
-	if ps == nil {
-		return "", false
-	}
-	for i, k := range ps.Keys {
-		if strings.EqualFold(k, key) && i < len(ps.Values) && ps.Values[i].Value.Kind == KindString {
-			return ps.Values[i].Value.S, true
-		}
-	}
-	return "", false
-}
-
 // --- values from JSON (commands) ---
 
 // ValueFromJSON converts a command payload to a Sparkplug value of data
 // type t. The payload is a JSON value (72.5, true, "text"), an object with
 // a "value" member, or plain text.
-func ValueFromJSON(t uint32, payload []byte) (Value, error) {
+func ValueFromJSON(t spb.DataType, payload []byte) (spb.Value, error) {
 	var raw any = string(payload)
 	if trimmed := bytes.TrimSpace(payload); json.Valid(trimmed) && len(trimmed) > 0 {
 		dec := json.NewDecoder(bytes.NewReader(trimmed))
@@ -428,80 +361,80 @@ func ValueFromJSON(t uint32, payload []byte) (Value, error) {
 		}
 	}
 	switch t {
-	case TypeInt8, TypeInt16, TypeInt32, TypeInt64:
-		bits := map[uint32]int{TypeInt8: 8, TypeInt16: 16, TypeInt32: 32, TypeInt64: 64}[t]
+	case spb.TypeInt8, spb.TypeInt16, spb.TypeInt32, spb.TypeInt64:
+		bits := map[spb.DataType]int{spb.TypeInt8: 8, spb.TypeInt16: 16, spb.TypeInt32: 32, spb.TypeInt64: 64}[t]
 		n, err := strconv.ParseInt(numText(raw), 10, bits)
 		if err != nil {
-			return Value{}, fmt.Errorf("%s value: %v", TypeName(t), errText(raw, err))
+			return spb.Value{}, fmt.Errorf("%s value: %v", t.String(), errText(raw, err))
 		}
-		if t == TypeInt64 {
-			return Value{Kind: KindLong, U: uint64(n)}, nil
+		if t == spb.TypeInt64 {
+			return spb.Value{Kind: spb.KindLong, Uint: uint64(n)}, nil
 		}
-		return Value{Kind: KindInt, U: uint64(uint32(int32(n)))}, nil // two's complement
-	case TypeUInt8, TypeUInt16, TypeUInt32, TypeUInt64:
-		bits := map[uint32]int{TypeUInt8: 8, TypeUInt16: 16, TypeUInt32: 32, TypeUInt64: 64}[t]
+		return spb.Value{Kind: spb.KindInt, Uint: uint64(uint32(int32(n)))}, nil // two's complement
+	case spb.TypeUInt8, spb.TypeUInt16, spb.TypeUInt32, spb.TypeUInt64:
+		bits := map[spb.DataType]int{spb.TypeUInt8: 8, spb.TypeUInt16: 16, spb.TypeUInt32: 32, spb.TypeUInt64: 64}[t]
 		n, err := strconv.ParseUint(numText(raw), 10, bits)
 		if err != nil {
-			return Value{}, fmt.Errorf("%s value: %v", TypeName(t), errText(raw, err))
+			return spb.Value{}, fmt.Errorf("%s value: %v", t.String(), errText(raw, err))
 		}
-		if t == TypeUInt64 {
-			return Value{Kind: KindLong, U: n}, nil
+		if t == spb.TypeUInt64 {
+			return spb.Value{Kind: spb.KindLong, Uint: n}, nil
 		}
-		return Value{Kind: KindInt, U: n}, nil
-	case TypeFloat, TypeDouble:
+		return spb.Value{Kind: spb.KindInt, Uint: n}, nil
+	case spb.TypeFloat, spb.TypeDouble:
 		f, err := strconv.ParseFloat(numText(raw), 64)
 		if err != nil {
-			return Value{}, fmt.Errorf("%s value: %v", TypeName(t), errText(raw, err))
+			return spb.Value{}, fmt.Errorf("%s value: %v", t.String(), errText(raw, err))
 		}
-		if t == TypeFloat {
+		if t == spb.TypeFloat {
 			if math.Abs(f) > math.MaxFloat32 {
-				return Value{}, fmt.Errorf("Float value %g out of range", f)
+				return spb.Value{}, fmt.Errorf("Float value %g out of range", f)
 			}
-			return Value{Kind: KindFloat, F: float64(float32(f))}, nil
+			return spb.Value{Kind: spb.KindFloat, Float: float64(float32(f))}, nil
 		}
-		return Value{Kind: KindDouble, F: f}, nil
-	case TypeBoolean:
+		return spb.Value{Kind: spb.KindDouble, Float: f}, nil
+	case spb.TypeBoolean:
 		switch x := raw.(type) {
 		case bool:
-			return Value{Kind: KindBool, U: b2u(x)}, nil
+			return spb.Value{Kind: spb.KindBool, Bool: x}, nil
 		default:
 			s := strings.ToLower(strings.TrimSpace(numText(raw)))
 			switch s {
 			case "true", "1", "on":
-				return Value{Kind: KindBool, U: 1}, nil
+				return spb.Value{Kind: spb.KindBool, Bool: true}, nil
 			case "false", "0", "off":
-				return Value{Kind: KindBool, U: 0}, nil
+				return spb.Value{Kind: spb.KindBool}, nil
 			}
-			return Value{}, fmt.Errorf("Boolean value: want true or false, got %s", textOf(raw))
+			return spb.Value{}, fmt.Errorf("Boolean value: want true or false, got %s", textOf(raw))
 		}
-	case TypeString, TypeText, TypeUUID:
+	case spb.TypeString, spb.TypeText, spb.TypeUUID:
 		if s, ok := raw.(string); ok {
-			return Value{Kind: KindString, S: s}, nil
+			return spb.Value{Kind: spb.KindString, Str: s}, nil
 		}
-		return Value{Kind: KindString, S: strings.TrimSpace(string(payload))}, nil
-	case TypeDateTime:
+		return spb.Value{Kind: spb.KindString, Str: strings.TrimSpace(string(payload))}, nil
+	case spb.TypeDateTime:
 		if s, ok := raw.(string); ok {
 			if ts, err := time.Parse(time.RFC3339Nano, s); err == nil {
-				return Value{Kind: KindLong, U: uint64(ts.UnixMilli())}, nil
+				return spb.Value{Kind: spb.KindLong, Uint: uint64(ts.UnixMilli())}, nil
 			}
 		}
 		n, err := strconv.ParseInt(numText(raw), 10, 64)
 		if err != nil {
-			return Value{}, fmt.Errorf("DateTime value: want an RFC 3339 timestamp or milliseconds since the epoch, got %s", textOf(raw))
+			return spb.Value{}, fmt.Errorf("DateTime value: want an RFC 3339 timestamp or milliseconds since the epoch, got %s", textOf(raw))
 		}
-		return Value{Kind: KindLong, U: uint64(n)}, nil
-	case TypeBytes, TypeFile:
+		return spb.Value{Kind: spb.KindLong, Uint: uint64(n)}, nil
+	case spb.TypeBytes, spb.TypeFile:
 		s, ok := raw.(string)
 		if !ok {
-			return Value{}, fmt.Errorf("%s value: want a base64 string", TypeName(t))
+			return spb.Value{}, fmt.Errorf("%s value: want a base64 string", t.String())
 		}
 		b, err := base64.StdEncoding.DecodeString(s)
 		if err != nil {
-			return Value{}, fmt.Errorf("%s value: invalid base64: %v", TypeName(t), err)
+			return spb.Value{}, fmt.Errorf("%s value: invalid base64: %v", t.String(), err)
 		}
-		return Value{Kind: KindBytes, B: b}, nil
+		return spb.Value{Kind: spb.KindBytes, Bytes: b}, nil
 	}
-	return Value{}, fmt.Errorf("writing %s metrics is not supported", TypeName(t))
+	return spb.Value{}, fmt.Errorf("writing %s metrics is not supported", t.String())
 }
 
 // numText returns the text of a JSON number or string.

@@ -1,9 +1,3 @@
-// Package sparkplug decodes and encodes Eclipse Sparkplug B payloads and
-// translates Sparkplug traffic into plain MQTT topics with JSON values.
-//
-// The protobuf wire format of sparkplug_b.proto is implemented by hand
-// (it is small and stable), so the package has no generated code and no
-// protobuf runtime dependency.
 package sparkplug
 
 import (
@@ -12,104 +6,157 @@ import (
 	"math"
 )
 
-// Payload is a Sparkplug B payload.
+// Payload is a Sparkplug B payload: the body of every Sparkplug MQTT
+// message (NBIRTH, NDATA, DCMD, …) except STATE.
 type Payload struct {
-	Timestamp    uint64 // ms since the Unix epoch
+	// Timestamp is when the message was created, in milliseconds since
+	// the Unix epoch. HasTimestamp tells whether it was present.
+	Timestamp    uint64
 	HasTimestamp bool
-	Metrics      []Metric
-	Seq          uint64
-	HasSeq       bool
-	UUID         string
-	Body         []byte
+	// Metrics are the metrics carried by the message.
+	Metrics []Metric
+	// Seq is the message sequence number (0-255 in Sparkplug 3.0; absent
+	// in NDEATH and commands). HasSeq tells whether it was present.
+	Seq    uint64
+	HasSeq bool
+	// UUID optionally identifies how Body is encoded.
+	UUID string
+	// Body is optional application-specific data.
+	Body []byte
 }
 
-// Metric is one metric of a payload (or of a template).
+// Metric is one metric of a payload or of a template.
 type Metric struct {
-	Name         string
-	Alias        uint64
-	HasAlias     bool
-	Timestamp    uint64 // ms since the Unix epoch
+	// Name identifies the metric. Births always carry names; data and
+	// command messages may carry only the Alias instead.
+	Name string
+	// Alias is the metric's numeric alias, set when HasAlias is true. An
+	// edge node announces aliases in its births.
+	Alias    uint64
+	HasAlias bool
+	// Timestamp is when the value was sampled, in milliseconds since the
+	// Unix epoch, set when HasTimestamp is true.
+	Timestamp    uint64
 	HasTimestamp bool
-	Datatype     uint32
+	// Datatype tells how to read Value. Births always carry it; data
+	// messages may leave it unset (TypeUnknown), relying on the birth.
+	Datatype DataType
+	// IsHistorical marks backfilled data that must not replace the
+	// current value.
 	IsHistorical bool
-	IsTransient  bool
-	IsNull       bool
-	Properties   *PropertySet
-	Value        Value
+	// IsTransient marks a value that consumers should not store.
+	IsTransient bool
+	// IsNull marks a null value; Value is then unset.
+	IsNull bool
+	// Metadata describes file and multi-part values (optional).
+	Metadata *MetaData
+	// Properties are optional typed properties such as "engUnit".
+	Properties *PropertySet
+	// Value is the metric's value (see the package documentation for how
+	// each data type is represented).
+	Value Value
 }
 
-// Kind tells which field of a value oneof is set.
-type Kind uint8
+// MetaData describes a metric's value, mainly for File metrics and values
+// split across several messages. Unset fields are left zero.
+type MetaData struct {
+	IsMultiPart bool   // the value is one part of a larger value
+	ContentType string // content type of the value
+	Size        uint64 // size in bytes of the complete value
+	Seq         uint64 // sequence number of this part
+	FileName    string // file name, for File metrics
+	FileType    string // file type, for File metrics
+	MD5         string // MD5 checksum of the complete value
+	Description string // free-form description
+}
 
-// Value kinds (the oneof fields of Metric, PropertyValue, DataSetValue and
-// Template.Parameter).
-const (
-	KindNone     Kind = iota
-	KindInt           // uint32 int_value
-	KindLong          // uint64 long_value
-	KindFloat         // float float_value
-	KindDouble        // double double_value
-	KindBool          // bool boolean_value
-	KindString        // string string_value
-	KindBytes         // bytes bytes_value (metrics only)
-	KindDataSet       // dataset_value (metrics only)
-	KindTemplate      // template_value (metrics only)
-	KindPropertySet
-	KindPropertySetList
-)
-
-// Value is a decoded oneof value.
+// Value is the value of a metric, property, data set cell or template
+// parameter. Kind tells which field is set; the other fields are zero.
 type Value struct {
-	Kind     Kind
-	U        uint64  // KindInt, KindLong, KindBool (0/1)
-	F        float64 // KindFloat, KindDouble
-	S        string  // KindString
-	B        []byte  // KindBytes
-	DataSet  *DataSet
+	// Kind tells which of the fields below holds the value.
+	Kind Kind
+	// Uint holds KindInt (a uint32) and KindLong values. Signed data types
+	// are stored in two's complement: convert with int32(v.Uint) etc.
+	Uint uint64
+	// Float holds KindFloat (a float32, widened) and KindDouble values.
+	Float float64
+	// Bool holds KindBool values.
+	Bool bool
+	// Str holds KindString values.
+	Str string
+	// Bytes holds KindBytes values, including packed arrays.
+	Bytes []byte
+	// DataSet holds KindDataSet values.
+	DataSet *DataSet
+	// Template holds KindTemplate values.
 	Template *Template
-	Set      *PropertySet
-	Sets     []PropertySet
+	// Properties holds KindPropertySet values (property values only).
+	Properties *PropertySet
+	// PropertiesList holds KindPropertySetList values (property values
+	// only).
+	PropertiesList []PropertySet
 }
 
-// PropertySet is a set of typed key/value properties (e.g. engUnit).
+// PropertySet is a set of typed properties, such as a metric's
+// engineering unit ("engUnit") or range. Keys[i] names Values[i].
 type PropertySet struct {
-	Keys   []string
+	// Keys are the property names.
+	Keys []string
+	// Values are the property values, one per key.
 	Values []PropertyValue
 }
 
-// PropertyValue is one property.
+// PropertyValue is one property of a PropertySet.
 type PropertyValue struct {
-	Type   uint32
+	// Type is the property's data type.
+	Type DataType
+	// IsNull marks a null property; Value is then unset.
 	IsNull bool
-	Value  Value
+	// Value is the property's value.
+	Value Value
 }
 
-// DataSet is a table.
+// DataSet is a table of typed columns.
 type DataSet struct {
+	// NumColumns is the number of columns.
 	NumColumns uint64
-	Columns    []string
-	Types      []uint32
-	Rows       [][]Value
+	// Columns are the column names.
+	Columns []string
+	// Types are the column data types, one per column.
+	Types []DataType
+	// Rows hold one value per column. A cell with Kind KindNone is null.
+	Rows [][]Value
 }
 
-// Template is a template definition or instance.
+// Template is a user-defined type: a definition (IsDefinition, usually
+// published in an NBIRTH) or an instance of one (TemplateRef names the
+// definition).
 type Template struct {
-	Version      string
-	Metrics      []Metric
-	Parameters   []Parameter
-	TemplateRef  string
+	// Version is an optional version of the definition.
+	Version string
+	// Metrics are the template's members.
+	Metrics []Metric
+	// Parameters are the template's parameters.
+	Parameters []Parameter
+	// TemplateRef names the definition of an instance.
+	TemplateRef string
+	// IsDefinition tells a definition from an instance.
 	IsDefinition bool
 }
 
 // Parameter is a template parameter.
 type Parameter struct {
-	Name  string
-	Type  uint32
+	// Name is the parameter's name.
+	Name string
+	// Type is the parameter's data type.
+	Type DataType
+	// Value is the parameter's value.
 	Value Value
 }
 
-// ErrMalformed is returned for payloads that are not valid protobuf.
-var ErrMalformed = errors.New("malformed Sparkplug B payload")
+// ErrMalformed is returned by Decode for input that is not a valid
+// Sparkplug B payload.
+var ErrMalformed = errors.New("sparkplug: malformed payload")
 
 // --- wire decoding ---
 
@@ -214,7 +261,12 @@ func (r *reader) expect(wt, want int) bool {
 	return true
 }
 
-// Decode parses a Sparkplug B payload.
+// Decode parses a Sparkplug B payload, such as the body of an MQTT message
+// published on an spBv1.0 topic. Input that isn't a valid payload returns
+// ErrMalformed; Decode never panics. Fields unknown to the schema and
+// extensions are skipped. Nesting (templates in metrics, property sets in
+// property sets) is limited to 16 levels. The returned payload doesn't
+// reference b.
 func Decode(b []byte) (*Payload, error) {
 	p := &Payload{}
 	if n := countMetrics(b); n > 0 {
@@ -315,7 +367,7 @@ func decodeMetric(b []byte, m *Metric, parent *reader, depth int) {
 				}
 			case 4:
 				if r.expect(wt, wireVarint) {
-					m.Datatype = uint32(r.varint())
+					m.Datatype = DataType(r.varint())
 				}
 			case 5:
 				if r.expect(wt, wireVarint) {
@@ -338,7 +390,7 @@ func decodeMetric(b []byte, m *Metric, parent *reader, depth int) {
 				decodeScalar(r, f-10, wt, &m.Value)
 			case 16:
 				if r.expect(wt, wireBytes) {
-					m.Value = Value{Kind: KindBytes, B: append([]byte(nil), r.bytes()...)}
+					m.Value = Value{Kind: KindBytes, Bytes: append([]byte(nil), r.bytes()...)}
 				}
 			case 17:
 				if r.expect(wt, wireBytes) {
@@ -352,7 +404,12 @@ func decodeMetric(b []byte, m *Metric, parent *reader, depth int) {
 					decodeTemplate(r.bytes(), t, r, depth)
 					m.Value = Value{Kind: KindTemplate, Template: t}
 				}
-			default: // 8 metadata, 19 extension, unknown fields
+			case 8:
+				if r.expect(wt, wireBytes) {
+					m.Metadata = &MetaData{}
+					decodeMetaData(r.bytes(), m.Metadata, r, depth)
+				}
+			default: // 19 extension, unknown fields
 				r.skip(wt)
 			}
 		}
@@ -366,27 +423,27 @@ func decodeScalar(r *reader, idx uint64, wt int, v *Value) {
 	switch idx {
 	case 0:
 		if r.expect(wt, wireVarint) {
-			*v = Value{Kind: KindInt, U: uint64(uint32(r.varint()))}
+			*v = Value{Kind: KindInt, Uint: uint64(uint32(r.varint()))}
 		}
 	case 1:
 		if r.expect(wt, wireVarint) {
-			*v = Value{Kind: KindLong, U: r.varint()}
+			*v = Value{Kind: KindLong, Uint: r.varint()}
 		}
 	case 2:
 		if r.expect(wt, wire32) {
-			*v = Value{Kind: KindFloat, F: float64(math.Float32frombits(r.fixed32()))}
+			*v = Value{Kind: KindFloat, Float: float64(math.Float32frombits(r.fixed32()))}
 		}
 	case 3:
 		if r.expect(wt, wire64) {
-			*v = Value{Kind: KindDouble, F: math.Float64frombits(r.fixed64())}
+			*v = Value{Kind: KindDouble, Float: math.Float64frombits(r.fixed64())}
 		}
 	case 4:
 		if r.expect(wt, wireVarint) {
-			*v = Value{Kind: KindBool, U: b2u(r.varint() != 0)}
+			*v = Value{Kind: KindBool, Bool: r.varint() != 0}
 		}
 	case 5:
 		if r.expect(wt, wireBytes) {
-			*v = Value{Kind: KindString, S: string(r.bytes())}
+			*v = Value{Kind: KindString, Str: string(r.bytes())}
 		}
 	}
 }
@@ -396,6 +453,37 @@ func b2u(b bool) uint64 {
 		return 1
 	}
 	return 0
+}
+
+func decodeMetaData(b []byte, md *MetaData, parent *reader, depth int) {
+	sub(b, parent, depth, func(r *reader, _ int) {
+		for {
+			f, wt, ok := r.next()
+			if !ok {
+				return
+			}
+			switch {
+			case f == 1 && wt == wireVarint:
+				md.IsMultiPart = r.varint() != 0
+			case f == 2 && wt == wireBytes:
+				md.ContentType = string(r.bytes())
+			case f == 3 && wt == wireVarint:
+				md.Size = r.varint()
+			case f == 4 && wt == wireVarint:
+				md.Seq = r.varint()
+			case f == 5 && wt == wireBytes:
+				md.FileName = string(r.bytes())
+			case f == 6 && wt == wireBytes:
+				md.FileType = string(r.bytes())
+			case f == 7 && wt == wireBytes:
+				md.MD5 = string(r.bytes())
+			case f == 8 && wt == wireBytes:
+				md.Description = string(r.bytes())
+			default:
+				r.skip(wt)
+			}
+		}
+	})
 }
 
 func decodePropertySet(b []byte, ps *PropertySet, parent *reader, depth int) {
@@ -429,7 +517,7 @@ func decodePropertyValue(b []byte, pv *PropertyValue, parent *reader, depth int)
 			switch f {
 			case 1:
 				if r.expect(wt, wireVarint) {
-					pv.Type = uint32(r.varint())
+					pv.Type = DataType(r.varint())
 				}
 			case 2:
 				if r.expect(wt, wireVarint) {
@@ -441,7 +529,7 @@ func decodePropertyValue(b []byte, pv *PropertyValue, parent *reader, depth int)
 				if r.expect(wt, wireBytes) {
 					ps := &PropertySet{}
 					decodePropertySet(r.bytes(), ps, r, depth)
-					pv.Value = Value{Kind: KindPropertySet, Set: ps}
+					pv.Value = Value{Kind: KindPropertySet, Properties: ps}
 				}
 			case 10:
 				if r.expect(wt, wireBytes) {
@@ -461,7 +549,7 @@ func decodePropertyValue(b []byte, pv *PropertyValue, parent *reader, depth int)
 							}
 						}
 					})
-					pv.Value = Value{Kind: KindPropertySetList, Sets: list}
+					pv.Value = Value{Kind: KindPropertySetList, PropertiesList: list}
 				}
 			default:
 				r.skip(wt)
@@ -483,11 +571,11 @@ func decodeDataSet(b []byte, ds *DataSet, parent *reader, depth int) {
 			case f == 2 && wt == wireBytes:
 				ds.Columns = append(ds.Columns, string(r.bytes()))
 			case f == 3 && wt == wireVarint:
-				ds.Types = append(ds.Types, uint32(r.varint()))
+				ds.Types = append(ds.Types, DataType(r.varint()))
 			case f == 3 && wt == wireBytes: // packed
 				pr := &reader{b: r.bytes()}
 				for len(pr.b) > 0 && pr.err == nil {
-					ds.Types = append(ds.Types, uint32(pr.varint()))
+					ds.Types = append(ds.Types, DataType(pr.varint()))
 				}
 				if pr.err != nil {
 					r.fail()
@@ -558,7 +646,7 @@ func decodeTemplate(b []byte, t *Template, parent *reader, depth int) {
 							}
 						case 2:
 							if pr.expect(wt, wireVarint) {
-								p.Type = uint32(pr.varint())
+								p.Type = DataType(pr.varint())
 							}
 						case 3, 4, 5, 6, 7, 8:
 							decodeScalar(pr, f-3, wt, &p.Value)
@@ -615,25 +703,31 @@ func (w *writer) msg(field uint64, fn func(w *writer)) {
 func (w *writer) scalar(base uint64, v Value) {
 	switch v.Kind {
 	case KindInt:
-		w.varint(base, uint64(uint32(v.U)))
+		w.varint(base, uint64(uint32(v.Uint)))
 	case KindLong:
-		w.varint(base+1, v.U)
+		w.varint(base+1, v.Uint)
 	case KindFloat:
 		w.key(base+2, wire32)
-		w.b = binary.LittleEndian.AppendUint32(w.b, math.Float32bits(float32(v.F)))
+		w.b = binary.LittleEndian.AppendUint32(w.b, math.Float32bits(float32(v.Float)))
 	case KindDouble:
 		w.key(base+3, wire64)
-		w.b = binary.LittleEndian.AppendUint64(w.b, math.Float64bits(v.F))
+		w.b = binary.LittleEndian.AppendUint64(w.b, math.Float64bits(v.Float))
 	case KindBool:
-		w.bool(base+4, v.U != 0)
+		w.bool(base+4, v.Bool)
 	case KindString:
-		w.str(base+5, v.S)
+		w.str(base+5, v.Str)
 	}
 }
 
-// Encode serializes a payload.
+// Encode serializes a payload. Fields are written in field-number order,
+// so encoding is deterministic. Values are written as given: Encode
+// doesn't check them against the metrics' data types. A nil payload encodes
+// as an empty one.
 func Encode(p *Payload) []byte {
 	var w writer
+	if p == nil {
+		return w.b
+	}
 	if p.HasTimestamp {
 		w.varint(1, p.Timestamp)
 	}
@@ -675,12 +769,40 @@ func encodeMetric(w *writer, m *Metric) {
 	if m.IsNull {
 		w.bool(7, true)
 	}
+	if md := m.Metadata; md != nil {
+		w.msg(8, func(w *writer) {
+			if md.IsMultiPart {
+				w.bool(1, true)
+			}
+			if md.ContentType != "" {
+				w.str(2, md.ContentType)
+			}
+			if md.Size != 0 {
+				w.varint(3, md.Size)
+			}
+			if md.Seq != 0 {
+				w.varint(4, md.Seq)
+			}
+			if md.FileName != "" {
+				w.str(5, md.FileName)
+			}
+			if md.FileType != "" {
+				w.str(6, md.FileType)
+			}
+			if md.MD5 != "" {
+				w.str(7, md.MD5)
+			}
+			if md.Description != "" {
+				w.str(8, md.Description)
+			}
+		})
+	}
 	if m.Properties != nil {
 		w.msg(9, func(w *writer) { encodePropertySet(w, m.Properties) })
 	}
 	switch m.Value.Kind {
 	case KindBytes:
-		w.bytes(16, m.Value.B)
+		w.bytes(16, m.Value.Bytes)
 	case KindDataSet:
 		w.msg(17, func(w *writer) { encodeDataSet(w, m.Value.DataSet) })
 	case KindTemplate:
@@ -705,11 +827,11 @@ func encodePropertySet(w *writer, ps *PropertySet) {
 			}
 			switch pv.Value.Kind {
 			case KindPropertySet:
-				w.msg(9, func(w *writer) { encodePropertySet(w, pv.Value.Set) })
+				w.msg(9, func(w *writer) { encodePropertySet(w, pv.Value.Properties) })
 			case KindPropertySetList:
 				w.msg(10, func(w *writer) {
-					for j := range pv.Value.Sets {
-						w.msg(1, func(w *writer) { encodePropertySet(w, &pv.Value.Sets[j]) })
+					for j := range pv.Value.PropertiesList {
+						w.msg(1, func(w *writer) { encodePropertySet(w, &pv.Value.PropertiesList[j]) })
 					}
 				})
 			default:

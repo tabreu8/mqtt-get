@@ -23,6 +23,7 @@ curl -H "Authorization: Bearer $KEY" http://localhost:8080/api/v1/values/factory
 - [Reading values (GET)](#reading-values-get)
 - [Publishing (POST)](#publishing-post)
 - [Sparkplug B](#sparkplug-b)
+- [Sparkplug B codec as a Go library](#sparkplug-b-codec-as-a-go-library)
 - [Live stream (WebSocket)](#live-stream-websocket)
 - [History](#history)
 - [Webhooks](#webhooks)
@@ -282,6 +283,30 @@ Settings saved through the API, MCP (`configure_sparkplug`) or the web UI (Broke
 `GET /api/v1/sparkplug/nodes?metrics=true` (MCP: `list_sparkplug_nodes`) lists edge nodes and devices with their online state, `bdSeq`, sequence errors and every metric with its type, unit and topic. `POST /api/v1/sparkplug/nodes/{group}/{edge_node}/rebirth` (MCP: `request_sparkplug_rebirth`) asks a node for a rebirth.
 
 **Performance:** decoding and translating a data message with 10 metrics takes about 3.8 µs and 15 allocations (about 2.6M metric values per second on one core). Plain MQTT traffic is unaffected: it costs one prefix check.
+
+## Sparkplug B codec as a Go library
+
+The Sparkplug B payload codec mqtt-get uses is a public Go package with no dependencies outside the standard library and no generated code:
+
+```bash
+go get github.com/tabreu8/mqtt-get/sparkplug
+```
+```go
+p, err := sparkplug.Decode(msg.Payload()) // body of a message on spBv1.0/...
+if err != nil {
+	return err // sparkplug.ErrMalformed; Decode never panics
+}
+for _, m := range p.Metrics {
+	fmt.Println(m.Name, m.Alias, m.Datatype, m.Value.Kind)
+}
+cmd := sparkplug.Encode(&sparkplug.Payload{Metrics: []sparkplug.Metric{{
+	Name: "Node Control/Rebirth", Datatype: sparkplug.TypeBoolean,
+	Value: sparkplug.Value{Kind: sparkplug.KindBool, Bool: true}}}})
+```
+
+It encodes and decodes every message of the Sparkplug 3.0 payload schema: metrics with metadata, property sets, data sets and templates. Its output is byte-identical to the reference protobuf implementation, and the decoder is fuzzed. See the [package documentation](https://pkg.go.dev/github.com/tabreu8/mqtt-get/sparkplug) for how each data type is represented.
+
+What it is **not**: not an edge node, not a host application, and not an MQTT client. It doesn't connect to brokers, build topics, track births and deaths, resolve aliases or check sequence numbers, and it doesn't unpack array values (they stay packed bytes). mqtt-get's own host logic, built on this codec, stays internal.
 
 ## Live stream (WebSocket)
 
@@ -1239,12 +1264,12 @@ make bench       # micro-benchmarks
 make interop-up && make interop && make interop-down   # real-broker suite (Docker)
 ```
 
-Sparkplug B is also tested against an independent implementation: `test/sparkplug` runs an edge node built on [pysparkplug](https://pypi.org/project/pysparkplug/) through a real MQTT broker, over the lean and paho clients and MQTT 3.1.1 and 5. It covers every data type, data, writes (NCMD/DCMD decoded by pysparkplug), rebirth requests, and the NDEATH the broker publishes when the node drops. The protobuf codec's golden payloads come from the official `sparkplug_b.proto` (`internal/sparkplug/testdata/gen_golden.py`), and the decoder is fuzzed. CI runs both.
+Sparkplug B is also tested against an independent implementation: `test/sparkplug` runs an edge node built on [pysparkplug](https://pypi.org/project/pysparkplug/) through a real MQTT broker, over the lean and paho clients and MQTT 3.1.1 and 5. It covers every data type, data, writes (NCMD/DCMD decoded by pysparkplug), rebirth requests, and the NDEATH the broker publishes when the node drops. The protobuf codec's golden payloads come from the official `sparkplug_b.proto` (`sparkplug/testdata/gen_golden.py`), and the decoder is fuzzed. CI runs both.
 
 ```bash
 python3 -m venv /tmp/spb && /tmp/spb/bin/pip install pysparkplug==0.6.1
 SPARKPLUG_INTEROP_PYTHON=/tmp/spb/bin/python go test -v ./test/sparkplug
-go test -run '^$' -fuzz FuzzDecode -fuzztime 1m ./internal/sparkplug
+go test -run '^$' -fuzz FuzzDecode -fuzztime 1m ./sparkplug
 ```
 
 The regular tests need nothing installed. They start embedded MQTT brokers (plain, TLS, mTLS, WS and WSS, with generated certificates) and cover auth, TLS verification, SNI, password-file rotation, the REST API, webhooks and MCP.
@@ -1259,7 +1284,8 @@ internal/mcp        MCP interface for agents: tools, resources, prompts, complet
 internal/mqttc      broker connections: auth, TLS, dialing, publish, reconnect
 internal/store      sharded latest-value store + JSON encoding
 internal/history    bounded per-topic history: ring buffers, rules, budgets, aggregation, snapshots
-internal/sparkplug  Sparkplug B protobuf codec (hand-written, fuzzed) and translator: births, deaths, aliases, commands
+internal/sparkplug  Sparkplug B translator: births, deaths, aliases, rebirths, commands
+sparkplug           public Sparkplug B payload codec (hand-written, fuzzed, standard library only)
 internal/topic      MQTT topic validation, matching, filter trie
 internal/webhook    webhook queues, batching, retries, signatures
 internal/state      persisted settings, webhooks, history rules and API keys

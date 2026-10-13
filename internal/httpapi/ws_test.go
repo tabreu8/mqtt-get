@@ -16,9 +16,9 @@ import (
 
 	"github.com/tabreu8/mqtt-get/internal/config"
 	"github.com/tabreu8/mqtt-get/internal/core"
-	"github.com/tabreu8/mqtt-get/internal/sparkplug"
 	"github.com/tabreu8/mqtt-get/internal/state"
 	"github.com/tabreu8/mqtt-get/internal/store"
+	spb "github.com/tabreu8/mqtt-get/sparkplug"
 )
 
 // wsEnv is a server without a broker: messages are injected with Ingest.
@@ -231,8 +231,8 @@ func TestWebSocketSparkplugWrite(t *testing.T) {
 	if _, err := e.svc.SetSparkplug(config.Sparkplug{Enabled: true, Commands: true}); err != nil {
 		t.Fatal(err)
 	}
-	e.svc.Ingest(store.Entry{Topic: "spBv1.0/g/DBIRTH/e/d", Time: time.Now().UnixNano(), Payload: sparkplug.Encode(&sparkplug.Payload{
-		Metrics: []sparkplug.Metric{{Name: "Speed", Datatype: sparkplug.TypeInt16, Value: sparkplug.Value{Kind: sparkplug.KindInt}}}})})
+	e.svc.Ingest(store.Entry{Topic: "spBv1.0/g/DBIRTH/e/d", Time: time.Now().UnixNano(), Payload: spb.Encode(&spb.Payload{
+		Metrics: []spb.Metric{{Name: "Speed", Datatype: spb.TypeInt16, Value: spb.Value{Kind: spb.KindInt}}}})})
 	c := e.dial(t, "/api/v1/ws", http.Header{"Authorization": {"Bearer admin-key"}})
 	// Validation runs before the (here unavailable) broker is needed.
 	_ = c.WriteJSON(map[string]any{"type": "publish", "topic": "spb/g/e/d/Speed", "payload": 99999})

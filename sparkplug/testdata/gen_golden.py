@@ -1,9 +1,10 @@
-"""Regenerates the golden payloads of sparkplug_test.go (birthHex, dataHex)
+"""Regenerates the golden payloads of codec_test.go (birthHex, dataHex,
+metadataHex)
 with the reference protobuf implementation and the official Eclipse Tahu
 sparkplug_b.proto (as generated in pysparkplug):
 
     python3 -m venv /tmp/spb && /tmp/spb/bin/pip install pysparkplug==0.6.1
-    /tmp/spb/bin/python internal/sparkplug/testdata/gen_golden.py
+    /tmp/spb/bin/python sparkplug/testdata/gen_golden.py
 """
 import json
 import struct
@@ -56,4 +57,19 @@ def data():
     return p
 
 
-print(json.dumps({"birth": birth().SerializeToString().hex(), "data": data().SerializeToString().hex()}))
+def metadata():
+    p = pb.Payload(timestamp=1760000002000, seq=2)
+    m = p.metrics.add(name="Config", alias=20, datatype=18, bytes_value=b"PK\x03\x04")
+    m.metadata.is_multi_part = True
+    m.metadata.content_type = "application/zip"
+    m.metadata.size = 4096
+    m.metadata.seq = 3
+    m.metadata.file_name = "config.zip"
+    m.metadata.file_type = "zip"
+    m.metadata.md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    m.metadata.description = "part 3"
+    return p
+
+
+print(json.dumps({"birth": birth().SerializeToString().hex(), "data": data().SerializeToString().hex(),
+                  "metadata": metadata().SerializeToString().hex()}))

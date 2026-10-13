@@ -13,11 +13,12 @@ import (
 
 	"github.com/tabreu8/mqtt-get/internal/config"
 	"github.com/tabreu8/mqtt-get/internal/store"
+	spb "github.com/tabreu8/mqtt-get/sparkplug"
 )
 
-// Golden payloads encoded by the reference protobuf implementation with the
-// official Eclipse Tahu sparkplug_b.proto (regenerate with
-// testdata/gen_golden.py). birthHex is an NBIRTH with one metric of every
+// Golden payloads from the public codec's tests (sparkplug/codec_test.go):
+// encoded by the reference protobuf implementation with the official
+// sparkplug_b.proto. birthHex is an NBIRTH with one metric of every
 // kind of value; dataHex an NDATA using aliases (one of them unknown).
 const (
 	birthHex = "08fb80b3c19c3312120a05626453657118fb80b3c19c3320085807121c0a144e6f646520436f6e74726f6c2f526562697274681001200b700012470a0b54656d7065726174757265100218e480b3c19c3320094a280a07656e67556e69740a07656e67486967681207080c4203c2b043120b080a310000000000c06240650000ac4112110a05436f756e741003200350fbffffff0f12110a05536d616c6c1004200150feffffff0f12140a03426967100520045880ccbbbcdeffffffff0112140a035536341006200858ffffffffffffffffff0112170a0850726573737572651007200a696666666666d66140120f0a0752756e6e696e671008200b700112170a044d6f64651009200c7a0b6175746f2022666173742212140a0753746172746564100a200d588080b3c19c3312100a04426c6f62100b20118201030001ff120f0a074e6f7468696e67100c2009380112190a04496e7473100d201882010cffffffff02000000e093040012170a06466c6f617473100e201e8201080000c03f000010c012130a05426f6f6c73100f202082010503000000a012130a054e616d6573101020218201056162006300122e0a055461626c65101120108a012008021202696412056c6162656c1803180c220d0a0608ffffffff0f0a0332017812340a054d6f746f7210122013920126120a0a0372706d200750dc0b1a0d0a066d617852706d100718b81722094d6f746f7254797065121d0a11466f6c6465722f446565702f56616c7565101320075080d0acf30e1800"
@@ -85,28 +86,6 @@ func values(t *testing.T, out []store.Entry) map[string]map[string]any {
 }
 
 func jsonOf(v any) string { b, _ := json.Marshal(v); return string(b) }
-
-func TestDecodeGoldenBirth(t *testing.T) {
-	p, err := Decode(mustHex(t, birthHex))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !p.HasSeq || p.Seq != 0 || p.Timestamp != 1760000000123 || len(p.Metrics) != 20 {
-		t.Fatalf("payload header %+v (%d metrics)", p, len(p.Metrics))
-	}
-	temp := p.Metrics[2]
-	if temp.Name != "Temperature" || temp.Alias != 2 || temp.Datatype != TypeFloat || temp.Value.F != 21.5 {
-		t.Fatalf("temperature %+v", temp)
-	}
-	if u, ok := temp.Properties.Property("engunit"); !ok || u != "°C" {
-		t.Fatalf("engUnit %q", u)
-	}
-	// Re-encoding and decoding again is lossless.
-	p2, err := Decode(Encode(p))
-	if err != nil || !reflect.DeepEqual(p, p2) {
-		t.Fatalf("round trip: %v\n%+v\n%+v", err, p, p2)
-	}
-}
 
 func TestTranslateBirthAndData(t *testing.T) {
 	tr, fb, _ := newT(config.Sparkplug{})
@@ -176,26 +155,26 @@ func TestTranslateBirthAndData(t *testing.T) {
 	}
 }
 
-func birthPayload(seq uint64, bdSeq uint64, metrics ...Metric) []byte {
-	p := &Payload{Timestamp: 1, HasTimestamp: true, Seq: seq, HasSeq: true}
-	p.Metrics = append([]Metric{{Name: "bdSeq", Datatype: TypeUInt64, Value: Value{Kind: KindLong, U: bdSeq}}}, metrics...)
-	return Encode(p)
+func birthPayload(seq uint64, bdSeq uint64, metrics ...spb.Metric) []byte {
+	p := &spb.Payload{Timestamp: 1, HasTimestamp: true, Seq: seq, HasSeq: true}
+	p.Metrics = append([]spb.Metric{{Name: "bdSeq", Datatype: spb.TypeUInt64, Value: spb.Value{Kind: spb.KindLong, Uint: bdSeq}}}, metrics...)
+	return spb.Encode(p)
 }
 
-func devBirthPayload(seq uint64, metrics ...Metric) []byte {
-	return Encode(&Payload{Timestamp: 1, HasTimestamp: true, Seq: seq, HasSeq: true, Metrics: metrics})
+func devBirthPayload(seq uint64, metrics ...spb.Metric) []byte {
+	return spb.Encode(&spb.Payload{Timestamp: 1, HasTimestamp: true, Seq: seq, HasSeq: true, Metrics: metrics})
 }
 
-func dataPayload(seq uint64, metrics ...Metric) []byte {
-	return Encode(&Payload{Timestamp: 2, HasTimestamp: true, Seq: seq, HasSeq: true, Metrics: metrics})
+func dataPayload(seq uint64, metrics ...spb.Metric) []byte {
+	return spb.Encode(&spb.Payload{Timestamp: 2, HasTimestamp: true, Seq: seq, HasSeq: true, Metrics: metrics})
 }
 
-func dbl(name string, alias uint64, f float64) Metric {
-	return Metric{Name: name, Alias: alias, HasAlias: true, Datatype: TypeDouble, Value: Value{Kind: KindDouble, F: f}}
+func dbl(name string, alias uint64, f float64) spb.Metric {
+	return spb.Metric{Name: name, Alias: alias, HasAlias: true, Datatype: spb.TypeDouble, Value: spb.Value{Kind: spb.KindDouble, Float: f}}
 }
 
-func byAlias(alias uint64, f float64) Metric {
-	return Metric{Alias: alias, HasAlias: true, Value: Value{Kind: KindDouble, F: f}}
+func byAlias(alias uint64, f float64) spb.Metric {
+	return spb.Metric{Alias: alias, HasAlias: true, Value: spb.Value{Kind: spb.KindDouble, Float: f}}
 }
 
 func TestDeviceLifecycleAndDeath(t *testing.T) {
@@ -224,13 +203,13 @@ func TestDeviceLifecycleAndDeath(t *testing.T) {
 	}
 
 	// A death from an older session (other bdSeq) is ignored.
-	if out, _ = tr.Process(entry("spBv1.0/g/NDEATH/e", Encode(&Payload{Metrics: []Metric{{Name: "bdSeq", Value: Value{Kind: KindLong, U: 2}}}}))); len(out) != 0 {
+	if out, _ = tr.Process(entry("spBv1.0/g/NDEATH/e", spb.Encode(&spb.Payload{Metrics: []spb.Metric{{Name: "bdSeq", Value: spb.Value{Kind: spb.KindLong, Uint: 2}}}}))); len(out) != 0 {
 		t.Fatalf("stale death applied: %v", out)
 	}
 	if !tr.Nodes("", false)[0].Online {
 		t.Fatal("stale death took the node offline")
 	}
-	out, _ = tr.Process(entry("spBv1.0/g/NDEATH/e", Encode(&Payload{Metrics: []Metric{{Name: "bdSeq", Value: Value{Kind: KindLong, U: 3}}}})))
+	out, _ = tr.Process(entry("spBv1.0/g/NDEATH/e", spb.Encode(&spb.Payload{Metrics: []spb.Metric{{Name: "bdSeq", Value: spb.Value{Kind: spb.KindLong, Uint: 3}}}})))
 	if v := values(t, out); v["spb/g/e/Uptime"]["online"] != false {
 		t.Fatalf("node death %v", v)
 	}
@@ -251,7 +230,7 @@ func TestDeviceLifecycleAndDeath(t *testing.T) {
 
 func TestDeathBdSeq(t *testing.T) {
 	death := func(bd uint64) []byte {
-		return Encode(&Payload{Metrics: []Metric{{Name: "bdSeq", Datatype: TypeInt64, Value: Value{Kind: KindLong, U: bd}}}})
+		return spb.Encode(&spb.Payload{Metrics: []spb.Metric{{Name: "bdSeq", Datatype: spb.TypeInt64, Value: spb.Value{Kind: spb.KindLong, Uint: bd}}}})
 	}
 	for _, c := range []struct {
 		birth, death uint64
@@ -277,7 +256,7 @@ func TestRebirthRequests(t *testing.T) {
 	tr, fb, now := newT(config.Sparkplug{Rebirth: true, RebirthIntervalSec: 30})
 	// Data from a node whose birth we missed: named metrics are still
 	// translated (typed by value) and a rebirth is requested, once per interval.
-	out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(5, Metric{Name: "Speed", Value: Value{Kind: KindFloat, F: 3}}, byAlias(7, 1))))
+	out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(5, spb.Metric{Name: "Speed", Value: spb.Value{Kind: spb.KindFloat, Float: 3}}, byAlias(7, 1))))
 	if v := values(t, out); v["spb/g/e/Speed"]["value"] != 3.0 || v["spb/g/e/Speed"]["type"] != "Float" {
 		t.Fatalf("named metric without birth: %v", v)
 	}
@@ -286,9 +265,9 @@ func TestRebirthRequests(t *testing.T) {
 		t.Fatalf("rebirth requests: %d, want 1 (rate limited)", fb.count())
 	}
 	sent := fb.sent[0]
-	p, err := Decode(sent.payload)
+	p, err := spb.Decode(sent.payload)
 	if err != nil || sent.topic != "spBv1.0/g/NCMD/e" || len(p.Metrics) != 1 || p.Metrics[0].Name != RebirthMetric ||
-		p.Metrics[0].Datatype != TypeBoolean || p.Metrics[0].Value.U != 1 {
+		p.Metrics[0].Datatype != spb.TypeBoolean || !p.Metrics[0].Value.Bool {
 		t.Fatalf("rebirth request %s %+v %v", sent.topic, p, err)
 	}
 	*now = now.Add(31 * time.Second)
@@ -332,29 +311,29 @@ func TestRebirthRequests(t *testing.T) {
 func TestCommands(t *testing.T) {
 	tr, _, _ := newT(config.Sparkplug{Commands: true})
 	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1,
-		Metric{Name: "Setpoint", Alias: 1, HasAlias: true, Datatype: TypeFloat, Value: Value{Kind: KindFloat, F: 20}},
-		Metric{Name: "Mode", Datatype: TypeString, Value: Value{Kind: KindString, S: "auto"}})))
+		spb.Metric{Name: "Setpoint", Alias: 1, HasAlias: true, Datatype: spb.TypeFloat, Value: spb.Value{Kind: spb.KindFloat, Float: 20}},
+		spb.Metric{Name: "Mode", Datatype: spb.TypeString, Value: spb.Value{Kind: spb.KindString, Str: "auto"}})))
 	tr.Process(entry("spBv1.0/g/DBIRTH/e/valve", devBirthPayload(1,
-		Metric{Name: "Open", Datatype: TypeBoolean, Value: Value{Kind: KindBool}},
-		Metric{Name: "Offset", Datatype: TypeInt16, Value: Value{Kind: KindInt}})))
+		spb.Metric{Name: "Open", Datatype: spb.TypeBoolean, Value: spb.Value{Kind: spb.KindBool}},
+		spb.Metric{Name: "Offset", Datatype: spb.TypeInt16, Value: spb.Value{Kind: spb.KindInt}})))
 
 	cases := []struct {
 		topic, payload, cmdTopic string
-		want                     Value
+		want                     spb.Value
 	}{
-		{"spb/g/e/Setpoint", "21.5", "spBv1.0/g/NCMD/e", Value{Kind: KindFloat, F: 21.5}},
-		{"spb/g/e/Setpoint", `{"value":"22"}`, "spBv1.0/g/NCMD/e", Value{Kind: KindFloat, F: 22}},
-		{"spb/g/e/Mode", "manual", "spBv1.0/g/NCMD/e", Value{Kind: KindString, S: "manual"}},
-		{"spb/g/e/valve/Open", "true", "spBv1.0/g/DCMD/e/valve", Value{Kind: KindBool, U: 1}},
-		{"spb/g/e/valve/Open", "OFF", "spBv1.0/g/DCMD/e/valve", Value{Kind: KindBool, U: 0}},
-		{"spb/g/e/valve/Offset", "-3", "spBv1.0/g/DCMD/e/valve", Value{Kind: KindInt, U: uint64(uint32(0xfffffffd))}},
+		{"spb/g/e/Setpoint", "21.5", "spBv1.0/g/NCMD/e", spb.Value{Kind: spb.KindFloat, Float: 21.5}},
+		{"spb/g/e/Setpoint", `{"value":"22"}`, "spBv1.0/g/NCMD/e", spb.Value{Kind: spb.KindFloat, Float: 22}},
+		{"spb/g/e/Mode", "manual", "spBv1.0/g/NCMD/e", spb.Value{Kind: spb.KindString, Str: "manual"}},
+		{"spb/g/e/valve/Open", "true", "spBv1.0/g/DCMD/e/valve", spb.Value{Kind: spb.KindBool, Bool: true}},
+		{"spb/g/e/valve/Open", "OFF", "spBv1.0/g/DCMD/e/valve", spb.Value{Kind: spb.KindBool}},
+		{"spb/g/e/valve/Offset", "-3", "spBv1.0/g/DCMD/e/valve", spb.Value{Kind: spb.KindInt, Uint: uint64(uint32(0xfffffffd))}},
 	}
 	for _, c := range cases {
 		ct, cmd, err := tr.Command(c.topic, []byte(c.payload))
 		if err != nil {
 			t.Fatalf("%s %s: %v", c.topic, c.payload, err)
 		}
-		p, err := Decode(cmd)
+		p, err := spb.Decode(cmd)
 		if err != nil || ct != c.cmdTopic || len(p.Metrics) != 1 || !p.HasTimestamp {
 			t.Fatalf("%s: %s %+v %v", c.topic, ct, p, err)
 		}
@@ -402,82 +381,36 @@ func TestTopicHandling(t *testing.T) {
 	}
 }
 
-func TestPackedTypesAndUnknownFields(t *testing.T) {
-	// A DataSet with packed types and an unknown field (99) must decode.
-	var w writer
-	w.msg(2, func(w *writer) {
-		w.str(1, "T")
-		w.varint(4, TypeDataSet)
-		w.msg(17, func(w *writer) {
-			w.varint(1, 2)
-			w.str(2, "a")
-			w.str(2, "b")
-			w.bytes(3, []byte{TypeInt32, TypeDouble}) // packed varints
-			w.varint(99, 5)
-		})
-	})
-	w.varint(99, 1)
-	p, err := Decode(w.b)
-	if err != nil || len(p.Metrics) != 1 || !reflect.DeepEqual(p.Metrics[0].Value.DataSet.Types, []uint32{TypeInt32, TypeDouble}) {
-		t.Fatalf("%+v %v", p, err)
-	}
-}
-
-func TestDecodeRejectsGarbage(t *testing.T) {
-	for _, b := range [][]byte{{0x12, 0x05, 0x01}, {0x08}, {0x00}, {0x12, 0x80}} {
-		if _, err := Decode(b); err == nil {
-			t.Errorf("% x decoded", b)
-		}
-	}
-	// Deep nesting is bounded.
-	inner := []byte{}
-	for i := 0; i < 100; i++ {
-		var w writer
-		w.msg(2, func(w *writer) { w.b = append(w.b, inner...) }) // Template.metrics
-		var m writer
-		m.bytes(18, w.b) // Metric.template_value
-		inner = m.b
-	}
-	var top writer
-	top.bytes(2, inner)
-	if _, err := Decode(top.b); err == nil {
-		t.Error("unbounded nesting accepted")
-	}
-}
-
 func TestValueFromJSONFloatPrecision(t *testing.T) {
-	v, err := ValueFromJSON(TypeFloat, []byte("0.1"))
-	if err != nil || float32(v.F) != float32(0.1) {
+	v, err := ValueFromJSON(spb.TypeFloat, []byte("0.1"))
+	if err != nil || float32(v.Float) != float32(0.1) {
 		t.Fatalf("%v %v", v, err)
 	}
-	if _, err := ValueFromJSON(TypeFloat, []byte("1e300")); err == nil {
+	if _, err := ValueFromJSON(spb.TypeFloat, []byte("1e300")); err == nil {
 		t.Fatal("float overflow accepted")
 	}
-	if b := AppendValue(nil, TypeDouble, Value{Kind: KindDouble, F: math.NaN()}); string(b) != "null" {
+	if b := AppendValue(nil, spb.TypeDouble, spb.Value{Kind: spb.KindDouble, Float: math.NaN()}); string(b) != "null" {
 		t.Fatalf("NaN rendered as %s", b)
 	}
-	v, err = ValueFromJSON(TypeDateTime, []byte(`"2026-01-02T03:04:05Z"`))
-	if err != nil || v.U != uint64(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC).UnixMilli()) {
+	v, err = ValueFromJSON(spb.TypeDateTime, []byte(`"2026-01-02T03:04:05Z"`))
+	if err != nil || v.Uint != uint64(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC).UnixMilli()) {
 		t.Fatalf("datetime %v %v", v, err)
 	}
 }
 
-func FuzzDecode(f *testing.F) {
+// FuzzRender: whatever decodes renders as valid JSON.
+func FuzzRender(f *testing.F) {
 	f.Add(mustHexF(birthHex))
 	f.Add(mustHexF(dataHex))
 	f.Fuzz(func(t *testing.T, b []byte) {
-		p, err := Decode(b)
+		p, err := spb.Decode(b)
 		if err != nil {
 			return
 		}
-		// Anything decoded renders as valid JSON and re-encodes losslessly.
 		for _, m := range p.Metrics {
 			if out := AppendValue(nil, m.Datatype, m.Value); !json.Valid(out) {
 				t.Fatalf("invalid JSON %s for %+v", out, m)
 			}
-		}
-		if _, err := Decode(Encode(p)); err != nil {
-			t.Fatalf("re-encoded payload does not decode: %v", err)
 		}
 	})
 }
@@ -488,7 +421,7 @@ func mustHexF(s string) []byte { b, _ := hex.DecodeString(s); return b }
 // with 10 metrics (aliases), the common steady-state message.
 func BenchmarkProcessDData(b *testing.B) {
 	tr := New(config.Sparkplug{Enabled: true, Prefix: "spb", RebirthIntervalSec: 30}, nil)
-	var birth, data []Metric
+	var birth, data []spb.Metric
 	for i := uint64(0); i < 10; i++ {
 		birth = append(birth, dbl("Metric"+strconv.Itoa(int(i)), i, 0))
 		data = append(data, byAlias(i, float64(i)))
@@ -511,10 +444,10 @@ func BenchmarkProcessDData(b *testing.B) {
 
 func TestTemplateDefinitionsAreNotValues(t *testing.T) {
 	tr, _, _ := newT(config.Sparkplug{})
-	def := Metric{Name: "_types_/Motor", Datatype: TypeTemplate, Value: Value{Kind: KindTemplate, Template: &Template{IsDefinition: true,
-		Metrics: []Metric{{Name: "rpm", Datatype: TypeUInt32, Value: Value{Kind: KindInt}}}}}}
-	inst := Metric{Name: "M1", Datatype: TypeTemplate, Value: Value{Kind: KindTemplate, Template: &Template{TemplateRef: "Motor",
-		Metrics: []Metric{{Name: "rpm", Datatype: TypeUInt32, Value: Value{Kind: KindInt, U: 1200}}}}}}
+	def := spb.Metric{Name: "_types_/Motor", Datatype: spb.TypeTemplate, Value: spb.Value{Kind: spb.KindTemplate, Template: &spb.Template{IsDefinition: true,
+		Metrics: []spb.Metric{{Name: "rpm", Datatype: spb.TypeUInt32, Value: spb.Value{Kind: spb.KindInt}}}}}}
+	inst := spb.Metric{Name: "M1", Datatype: spb.TypeTemplate, Value: spb.Value{Kind: spb.KindTemplate, Template: &spb.Template{TemplateRef: "Motor",
+		Metrics: []spb.Metric{{Name: "rpm", Datatype: spb.TypeUInt32, Value: spb.Value{Kind: spb.KindInt, Uint: 1200}}}}}}
 	out, _ := tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, def, inst)))
 	v := values(t, out)
 	if _, ok := v["spb/g/e/_types_/Motor"]; ok {
@@ -545,13 +478,13 @@ func TestDeviceBeforeNodeBirth(t *testing.T) {
 func TestHistoricalMetrics(t *testing.T) {
 	tr, _, _ := newT(config.Sparkplug{})
 	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, dbl("X", 1, 10))))
-	past := Metric{Alias: 1, HasAlias: true, IsHistorical: true, Timestamp: 1700000000000, HasTimestamp: true, Value: Value{Kind: KindDouble, F: 5}}
+	past := spb.Metric{Alias: 1, HasAlias: true, IsHistorical: true, Timestamp: 1700000000000, HasTimestamp: true, Value: spb.Value{Kind: spb.KindDouble, Float: 5}}
 	out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(1, past)))
 	if len(out) != 1 || out[0].Time != time.UnixMilli(1700000000000).UnixNano() || !strings.Contains(string(out[0].Payload), `"historical":true`) {
 		t.Fatalf("historical entry %+v %s", out, out[0].Payload)
 	}
 	// The death republishes the last real-time value, not the historical one.
-	out, _ = tr.Process(entry("spBv1.0/g/NDEATH/e", Encode(&Payload{Metrics: []Metric{{Name: "bdSeq", Value: Value{Kind: KindLong, U: 1}}}})))
+	out, _ = tr.Process(entry("spBv1.0/g/NDEATH/e", spb.Encode(&spb.Payload{Metrics: []spb.Metric{{Name: "bdSeq", Value: spb.Value{Kind: spb.KindLong, Uint: 1}}}})))
 	for _, e := range out {
 		if e.Topic == "spb/g/e/X" && !strings.Contains(string(e.Payload), `"value":10,`) {
 			t.Fatalf("offline value %s", e.Payload)
@@ -561,9 +494,9 @@ func TestHistoricalMetrics(t *testing.T) {
 
 func TestLimits(t *testing.T) {
 	tr, _, _ := newT(config.Sparkplug{})
-	var ms []Metric
+	var ms []spb.Metric
 	for i := 0; i < MaxMetricsPerNode+10; i++ {
-		ms = append(ms, Metric{Name: "m" + strconv.Itoa(i), Datatype: TypeBoolean, Value: Value{Kind: KindBool}})
+		ms = append(ms, spb.Metric{Name: "m" + strconv.Itoa(i), Datatype: spb.TypeBoolean, Value: spb.Value{Kind: spb.KindBool}})
 	}
 	out, _ := tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, ms...)))
 	if len(out) != MaxMetricsPerNode || tr.Stats().Dropped != 1 {
@@ -585,7 +518,7 @@ func TestConcurrentProcessing(t *testing.T) {
 					tr.Process(entry("spBv1.0/g/NBIRTH/"+edge, birthPayload(0, 1, dbl("A", 1, 1))))
 					tr.Process(entry("spBv1.0/g/DBIRTH/"+edge+"/d", devBirthPayload(1, dbl("B", 2, 1))))
 				case 25:
-					tr.Process(entry("spBv1.0/g/NDEATH/"+edge, Encode(&Payload{})))
+					tr.Process(entry("spBv1.0/g/NDEATH/"+edge, spb.Encode(&spb.Payload{})))
 				default:
 					tr.Process(entry("spBv1.0/g/DDATA/"+edge+"/d", dataPayload(uint64(i), byAlias(2, float64(i)))))
 				}
@@ -606,90 +539,87 @@ func TestConcurrentProcessing(t *testing.T) {
 
 func TestValueFromJSONAllTypes(t *testing.T) {
 	ok := []struct {
-		t       uint32
+		t       spb.DataType
 		payload string
-		want    Value
+		want    spb.Value
 	}{
-		{TypeInt8, "-128", Value{Kind: KindInt, U: 0xffffff80}},
-		{TypeInt16, `"-2"`, Value{Kind: KindInt, U: 0xfffffffe}},
-		{TypeInt32, `{"value":-2147483648}`, Value{Kind: KindInt, U: 0x80000000}},
-		{TypeInt64, "-9223372036854775808", Value{Kind: KindLong, U: 1 << 63}},
-		{TypeUInt8, "255", Value{Kind: KindInt, U: 255}},
-		{TypeUInt16, "65535", Value{Kind: KindInt, U: 65535}},
-		{TypeUInt32, "4294967295", Value{Kind: KindInt, U: 4294967295}},
-		{TypeUInt64, "18446744073709551615", Value{Kind: KindLong, U: math.MaxUint64}},
-		{TypeDouble, "-123.25", Value{Kind: KindDouble, F: -123.25}},
-		{TypeBoolean, "1", Value{Kind: KindBool, U: 1}},
-		{TypeBoolean, `"on"`, Value{Kind: KindBool, U: 1}},
-		{TypeBoolean, "false", Value{Kind: KindBool}},
-		{TypeText, `"multi\nline"`, Value{Kind: KindString, S: "multi\nline"}},
-		{TypeUUID, "123e4567-e89b-12d3-a456-426614174000", Value{Kind: KindString, S: "123e4567-e89b-12d3-a456-426614174000"}},
-		{TypeString, `{"a":1}`, Value{Kind: KindString, S: `{"a":1}`}},
-		{TypeDateTime, "1767323045000", Value{Kind: KindLong, U: 1767323045000}},
-		{TypeBytes, `"AAH/"`, Value{Kind: KindBytes, B: []byte{0, 1, 255}}},
-		{TypeFile, `{"value":"aGk="}`, Value{Kind: KindBytes, B: []byte("hi")}},
+		{spb.TypeInt8, "-128", spb.Value{Kind: spb.KindInt, Uint: 0xffffff80}},
+		{spb.TypeInt16, `"-2"`, spb.Value{Kind: spb.KindInt, Uint: 0xfffffffe}},
+		{spb.TypeInt32, `{"value":-2147483648}`, spb.Value{Kind: spb.KindInt, Uint: 0x80000000}},
+		{spb.TypeInt64, "-9223372036854775808", spb.Value{Kind: spb.KindLong, Uint: 1 << 63}},
+		{spb.TypeUInt8, "255", spb.Value{Kind: spb.KindInt, Uint: 255}},
+		{spb.TypeUInt16, "65535", spb.Value{Kind: spb.KindInt, Uint: 65535}},
+		{spb.TypeUInt32, "4294967295", spb.Value{Kind: spb.KindInt, Uint: 4294967295}},
+		{spb.TypeUInt64, "18446744073709551615", spb.Value{Kind: spb.KindLong, Uint: math.MaxUint64}},
+		{spb.TypeDouble, "-123.25", spb.Value{Kind: spb.KindDouble, Float: -123.25}},
+		{spb.TypeBoolean, "1", spb.Value{Kind: spb.KindBool, Bool: true}},
+		{spb.TypeBoolean, `"on"`, spb.Value{Kind: spb.KindBool, Bool: true}},
+		{spb.TypeBoolean, "false", spb.Value{Kind: spb.KindBool}},
+		{spb.TypeText, `"multi\nline"`, spb.Value{Kind: spb.KindString, Str: "multi\nline"}},
+		{spb.TypeUUID, "123e4567-e89b-12d3-a456-426614174000", spb.Value{Kind: spb.KindString, Str: "123e4567-e89b-12d3-a456-426614174000"}},
+		{spb.TypeString, `{"a":1}`, spb.Value{Kind: spb.KindString, Str: `{"a":1}`}},
+		{spb.TypeDateTime, "1767323045000", spb.Value{Kind: spb.KindLong, Uint: 1767323045000}},
+		{spb.TypeBytes, `"AAH/"`, spb.Value{Kind: spb.KindBytes, Bytes: []byte{0, 1, 255}}},
+		{spb.TypeFile, `{"value":"aGk="}`, spb.Value{Kind: spb.KindBytes, Bytes: []byte("hi")}},
 	}
 	for _, c := range ok {
 		got, err := ValueFromJSON(c.t, []byte(c.payload))
 		if err != nil || !reflect.DeepEqual(got, c.want) {
-			t.Errorf("%s %s: %+v %v, want %+v", TypeName(c.t), c.payload, got, err, c.want)
+			t.Errorf("%s %s: %+v %v, want %+v", c.t, c.payload, got, err, c.want)
 		}
 		// What is written reads back as the same JSON value it came from
 		// (numbers and booleans; strings re-quoted).
-		if c.t != TypeString && c.t != TypeBoolean && c.t != TypeDateTime && c.t != TypeBytes && c.t != TypeFile && c.t != TypeText && c.t != TypeUUID {
+		if c.t != spb.TypeString && c.t != spb.TypeBoolean && c.t != spb.TypeDateTime && c.t != spb.TypeBytes && c.t != spb.TypeFile && c.t != spb.TypeText && c.t != spb.TypeUUID {
 			back := string(AppendValue(nil, c.t, got))
 			in := strings.Trim(strings.TrimSuffix(strings.TrimPrefix(c.payload, `{"value":`), "}"), `"`)
 			if back != in {
-				t.Errorf("%s: wrote %s, reads back as %s", TypeName(c.t), in, back)
+				t.Errorf("%s: wrote %s, reads back as %s", c.t, in, back)
 			}
 		}
 	}
 	bad := []struct {
-		t       uint32
+		t       spb.DataType
 		payload string
 		err     string
 	}{
-		{TypeInt8, "128", "out of range"},
-		{TypeUInt8, "-1", "not a number"},
-		{TypeUInt32, "4294967296", "out of range"},
-		{TypeInt32, "1.5", "not a number"},
-		{TypeBoolean, "yes", "true or false"},
-		{TypeDateTime, "tomorrow", "RFC 3339"},
-		{TypeBytes, "12", "base64 string"},
-		{TypeBytes, `"!!!"`, "invalid base64"},
-		{TypeDataSet, "{}", "not supported"},
-		{TypeTemplate, "{}", "not supported"},
-		{TypeInt32Array, "[1]", "not supported"},
+		{spb.TypeInt8, "128", "out of range"},
+		{spb.TypeUInt8, "-1", "not a number"},
+		{spb.TypeUInt32, "4294967296", "out of range"},
+		{spb.TypeInt32, "1.5", "not a number"},
+		{spb.TypeBoolean, "yes", "true or false"},
+		{spb.TypeDateTime, "tomorrow", "RFC 3339"},
+		{spb.TypeBytes, "12", "base64 string"},
+		{spb.TypeBytes, `"!!!"`, "invalid base64"},
+		{spb.TypeDataSet, "{}", "not supported"},
+		{spb.TypeTemplate, "{}", "not supported"},
+		{spb.TypeInt32Array, "[1]", "not supported"},
 	}
 	for _, c := range bad {
 		if _, err := ValueFromJSON(c.t, []byte(c.payload)); err == nil || !strings.Contains(err.Error(), c.err) {
-			t.Errorf("%s %s: %v, want %q", TypeName(c.t), c.payload, err, c.err)
+			t.Errorf("%s %s: %v, want %q", c.t, c.payload, err, c.err)
 		}
 	}
 }
 
 func TestAppendValueFallbacks(t *testing.T) {
 	cases := []struct {
-		t    uint32
-		v    Value
+		t    spb.DataType
+		v    spb.Value
 		want string
 	}{
-		{TypeUnknown, Value{Kind: KindLong, U: 7}, `7`},                  // no type: by wire kind
-		{TypeDouble, Value{Kind: KindFloat, F: 0.5}, `0.5`},              // float sent for a double
-		{TypeFloat, Value{Kind: KindDouble, F: 0.25}, `0.25`},            // and the reverse
-		{TypeInt32Array, Value{Kind: KindBytes, B: []byte{1}}, `"AQ=="`}, // bad array length: raw bytes
-		{TypeBooleanArray, Value{Kind: KindBytes, B: []byte{9, 0, 0, 0, 0}}, `"CQAAAAA="`},
-		{TypeStringArray, Value{Kind: KindBytes, B: []byte("ab")}, `"YWI="`}, // missing terminator
-		{TypeStringArray, Value{Kind: KindBytes, B: nil}, `[]`},
-		{TypeDataSet, Value{Kind: KindNone}, `null`},
-		{TypeUnknown, Value{Kind: KindPropertySet, Set: &PropertySet{Keys: []string{"a"}, Values: []PropertyValue{{IsNull: true}}}}, `{"a":null}`},
+		{spb.TypeUnknown, spb.Value{Kind: spb.KindLong, Uint: 7}, `7`},                   // no type: by wire kind
+		{spb.TypeDouble, spb.Value{Kind: spb.KindFloat, Float: 0.5}, `0.5`},              // float sent for a double
+		{spb.TypeFloat, spb.Value{Kind: spb.KindDouble, Float: 0.25}, `0.25`},            // and the reverse
+		{spb.TypeInt32Array, spb.Value{Kind: spb.KindBytes, Bytes: []byte{1}}, `"AQ=="`}, // bad array length: raw bytes
+		{spb.TypeBooleanArray, spb.Value{Kind: spb.KindBytes, Bytes: []byte{9, 0, 0, 0, 0}}, `"CQAAAAA="`},
+		{spb.TypeStringArray, spb.Value{Kind: spb.KindBytes, Bytes: []byte("ab")}, `"YWI="`}, // missing terminator
+		{spb.TypeStringArray, spb.Value{Kind: spb.KindBytes, Bytes: nil}, `[]`},
+		{spb.TypeDataSet, spb.Value{Kind: spb.KindNone}, `null`},
+		{spb.TypeUnknown, spb.Value{Kind: spb.KindPropertySet, Properties: &spb.PropertySet{Keys: []string{"a"}, Values: []spb.PropertyValue{{IsNull: true}}}}, `{"a":null}`},
 	}
 	for _, c := range cases {
 		if got := string(AppendValue(nil, c.t, c.v)); got != c.want {
-			t.Errorf("%s %+v: %s, want %s", TypeName(c.t), c.v, got, c.want)
+			t.Errorf("%s %+v: %s, want %s", c.t, c.v, got, c.want)
 		}
-	}
-	if TypeName(999) != "Unknown" {
-		t.Error("TypeName out of range")
 	}
 }

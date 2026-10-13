@@ -1,3 +1,8 @@
+// Package sparkplug translates Sparkplug B traffic into plain MQTT topics
+// with JSON values, and writes to those topics into NCMD/DCMD commands. It
+// is mqtt-get's Sparkplug host logic (births, deaths, aliases, sequence
+// numbers, rebirth requests); the payload codec is the public package
+// github.com/tabreu8/mqtt-get/sparkplug.
 package sparkplug
 
 import (
@@ -13,6 +18,7 @@ import (
 	"github.com/tabreu8/mqtt-get/internal/config"
 	"github.com/tabreu8/mqtt-get/internal/store"
 	"github.com/tabreu8/mqtt-get/internal/topic"
+	spb "github.com/tabreu8/mqtt-get/sparkplug"
 )
 
 // Namespace is the Sparkplug B topic namespace.
@@ -45,7 +51,7 @@ const RebirthMetric = "Node Control/Rebirth"
 type metric struct {
 	name     string
 	device   string // "" for node metrics
-	datatype uint32
+	datatype spb.DataType
 	alias    uint64
 	hasAlias bool
 	topic    string // translated topic
@@ -195,7 +201,7 @@ func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
 	if typ == NCMD || typ == DCMD {
 		return nil, true // commands from other hosts are not state
 	}
-	p, err := Decode(e.Payload)
+	p, err := spb.Decode(e.Payload)
 	if err != nil {
 		t.malformed.Add(1)
 		return nil, true
@@ -258,7 +264,7 @@ func (t *Translator) node(group, edge string) *node {
 // checkSeq verifies the message sequence number (0-255, one counter per
 // edge node across all its messages except NDEATH). A gap means messages
 // were lost: values may be stale, so a rebirth is wanted.
-func (t *Translator) checkSeq(n *node, p *Payload) (gap bool) {
+func (t *Translator) checkSeq(n *node, p *spb.Payload) (gap bool) {
 	if !p.HasSeq {
 		return false
 	}
@@ -272,10 +278,10 @@ func (t *Translator) checkSeq(n *node, p *Payload) (gap bool) {
 	return gap
 }
 
-func bdSeqOf(p *Payload) (int64, bool) {
+func bdSeqOf(p *spb.Payload) (int64, bool) {
 	for i := range p.Metrics {
-		if m := &p.Metrics[i]; m.Name == "bdSeq" && (m.Value.Kind == KindLong || m.Value.Kind == KindInt) {
-			return int64(m.Value.U), true
+		if m := &p.Metrics[i]; m.Name == "bdSeq" && (m.Value.Kind == spb.KindLong || m.Value.Kind == spb.KindInt) {
+			return int64(m.Value.Uint), true
 		}
 	}
 	return 0, false
@@ -283,7 +289,7 @@ func bdSeqOf(p *Payload) (int64, bool) {
 
 // register forgets the old metric definitions in defs (and their aliases
 // and topics) and records the ones of a birth certificate.
-func (t *Translator) register(n *node, devID string, defs map[string]*metric, p *Payload) {
+func (t *Translator) register(n *node, devID string, defs map[string]*metric, p *spb.Payload) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for name, m := range defs {
@@ -300,7 +306,7 @@ func (t *Translator) register(n *node, devID string, defs map[string]*metric, p 
 		if pm.Name == "" {
 			continue
 		}
-		if pm.Value.Kind == KindTemplate && pm.Value.Template != nil && pm.Value.Template.IsDefinition {
+		if pm.Value.Kind == spb.KindTemplate && pm.Value.Template != nil && pm.Value.Template.IsDefinition {
 			continue // a template type (e.g. Ignition's "_types_/…"), not a value
 		}
 		if len(defs) >= MaxMetricsPerNode {
@@ -309,11 +315,11 @@ func (t *Translator) register(n *node, devID string, defs map[string]*metric, p 
 		}
 		m := &metric{name: pm.Name, device: devID, datatype: pm.Datatype, alias: pm.Alias, hasAlias: pm.HasAlias,
 			topic: t.metricTopic(n.group, n.edge, devID, pm.Name)}
-		if m.datatype == TypeUnknown {
+		if m.datatype == spb.TypeUnknown {
 			m.datatype = inferType(pm.Value)
 		}
 		for _, k := range []string{"engUnit", "engUnits", "unit", "units"} {
-			if u, ok := pm.Properties.Property(k); ok {
+			if u, ok := property(pm.Properties, k); ok {
 				m.unit = u
 				break
 			}
@@ -329,10 +335,10 @@ func (t *Translator) register(n *node, devID string, defs map[string]*metric, p 
 	}
 }
 
-func (t *Translator) nodeBirth(n *node, p *Payload, e *store.Entry, now time.Time) []store.Entry {
+func (t *Translator) nodeBirth(n *node, p *spb.Payload, e *store.Entry, now time.Time) []store.Entry {
 	// A node birth invalidates every device: they publish new births.
 	for id, d := range n.devices {
-		t.register(n, id, d.metrics, &Payload{})
+		t.register(n, id, d.metrics, &spb.Payload{})
 		delete(n.devices, id)
 	}
 	t.register(n, "", n.metrics, p)
@@ -348,7 +354,7 @@ func (t *Translator) nodeBirth(n *node, p *Payload, e *store.Entry, now time.Tim
 	return t.values(n, "", n.metrics, p, e)
 }
 
-func (t *Translator) nodeDeath(n *node, p *Payload, now time.Time) []store.Entry {
+func (t *Translator) nodeDeath(n *node, p *spb.Payload, now time.Time) []store.Entry {
 	// A death left behind by an older session (its will, delivered late)
 	// has an older bdSeq: ignore it. Deaths carrying a newer bdSeq are
 	// accepted: they can't come from an older session, and some edge nodes
@@ -381,7 +387,7 @@ func staleBdSeq(d, b int64) bool {
 	return diff > 0 && diff < 128
 }
 
-func (t *Translator) deviceBirth(n *node, devID string, p *Payload, e *store.Entry, now time.Time) []store.Entry {
+func (t *Translator) deviceBirth(n *node, devID string, p *spb.Payload, e *store.Entry, now time.Time) []store.Entry {
 	d := n.devices[devID]
 	if d == nil {
 		d = &device{id: devID, metrics: map[string]*metric{}}
@@ -403,7 +409,7 @@ func (t *Translator) deviceDeath(n *node, devID string, now time.Time) []store.E
 
 // data translates NDATA/DDATA. unknown reports metrics that couldn't be
 // resolved (alias without a birth).
-func (t *Translator) data(n *node, devID string, p *Payload, e *store.Entry) (out []store.Entry, unknown bool) {
+func (t *Translator) data(n *node, devID string, p *spb.Payload, e *store.Entry) (out []store.Entry, unknown bool) {
 	var defs map[string]*metric
 	if devID == "" {
 		defs = n.metrics
@@ -430,7 +436,7 @@ func (t *Translator) data(n *node, devID string, p *Payload, e *store.Entry) (ou
 				// No birth seen: translate it anyway, typed by its value.
 				m = &metric{name: pm.Name, device: devID, datatype: pm.Datatype,
 					topic: t.metricTopic(n.group, n.edge, devID, pm.Name)}
-				if m.datatype == TypeUnknown {
+				if m.datatype == spb.TypeUnknown {
 					m.datatype = inferType(pm.Value)
 				}
 				if topic.ValidateName(m.topic) != nil {
@@ -458,7 +464,7 @@ func (t *Translator) data(n *node, devID string, p *Payload, e *store.Entry) (ou
 }
 
 // values translates the metrics of a birth certificate.
-func (t *Translator) values(n *node, devID string, defs map[string]*metric, p *Payload, e *store.Entry) []store.Entry {
+func (t *Translator) values(n *node, devID string, defs map[string]*metric, p *spb.Payload, e *store.Entry) []store.Entry {
 	out := make([]store.Entry, 0, len(p.Metrics))
 	for i := range p.Metrics {
 		pm := &p.Metrics[i]
@@ -476,9 +482,9 @@ func (t *Translator) values(n *node, devID string, defs map[string]*metric, p *P
 // value builds the translated entry of one metric value:
 //
 //	{"value":72.4,"type":"Float","timestamp":"…","unit":"°C","online":true}
-func (t *Translator) value(m *metric, pm *Metric, e *store.Entry, online bool) (store.Entry, bool) {
+func (t *Translator) value(m *metric, pm *spb.Metric, e *store.Entry, online bool) (store.Entry, bool) {
 	dt := pm.Datatype
-	if dt == TypeUnknown {
+	if dt == spb.TypeUnknown {
 		dt = m.datatype
 	}
 	ts := pm.Timestamp
@@ -510,9 +516,9 @@ func (t *Translator) value(m *metric, pm *Metric, e *store.Entry, online bool) (
 // envelopeTail completes {"value":<value> with the metadata:
 //
 //	,"type":"Float","timestamp":"…","unit":"°C","online":true}
-func (t *Translator) envelopeTail(buf []byte, m *metric, dt uint32, ts uint64, online, historical bool, props *PropertySet) []byte {
+func (t *Translator) envelopeTail(buf []byte, m *metric, dt spb.DataType, ts uint64, online, historical bool, props *spb.PropertySet) []byte {
 	buf = append(buf, `,"type":"`...)
-	buf = append(buf, TypeName(dt)...)
+	buf = append(buf, dt.String()...)
 	buf = append(buf, `","timestamp":`...)
 	buf = appendTime(buf, int64(ts))
 	if m.unit != "" {
@@ -546,14 +552,27 @@ func (t *Translator) offline(defs map[string]*metric, out []store.Entry) []store
 	return out
 }
 
+// property returns the string value of property key (case-insensitive).
+func property(ps *spb.PropertySet, key string) (string, bool) {
+	if ps == nil {
+		return "", false
+	}
+	for i, k := range ps.Keys {
+		if strings.EqualFold(k, key) && i < len(ps.Values) && ps.Values[i].Value.Kind == spb.KindString {
+			return ps.Values[i].Value.Str, true
+		}
+	}
+	return "", false
+}
+
 // --- rebirth requests ---
 
 // RebirthPayload is the NCMD payload asking a node to publish its births.
 func RebirthPayload(now time.Time) []byte {
 	ms := uint64(now.UnixMilli())
-	return Encode(&Payload{Timestamp: ms, HasTimestamp: true, Metrics: []Metric{{
-		Name: RebirthMetric, Timestamp: ms, HasTimestamp: true, Datatype: TypeBoolean,
-		Value: Value{Kind: KindBool, U: 1},
+	return spb.Encode(&spb.Payload{Timestamp: ms, HasTimestamp: true, Metrics: []spb.Metric{{
+		Name: RebirthMetric, Timestamp: ms, HasTimestamp: true, Datatype: spb.TypeBoolean,
+		Value: spb.Value{Kind: spb.KindBool, Bool: true},
 	}}})
 }
 
@@ -635,10 +654,10 @@ func (t *Translator) Command(name string, payload []byte) (cmdTopic string, cmd 
 	group, edge := t.nodeOf(m)
 	v, err := ValueFromJSON(m.datatype, payload)
 	if err != nil {
-		return "", nil, fmt.Errorf("%s (%s metric %q): %w", name, TypeName(m.datatype), m.name, err)
+		return "", nil, fmt.Errorf("%s (%s metric %q): %w", name, m.datatype.String(), m.name, err)
 	}
 	ms := uint64(t.now().UnixMilli())
-	cmd = Encode(&Payload{Timestamp: ms, HasTimestamp: true, Metrics: []Metric{{
+	cmd = spb.Encode(&spb.Payload{Timestamp: ms, HasTimestamp: true, Metrics: []spb.Metric{{
 		Name: m.name, Timestamp: ms, HasTimestamp: true, Datatype: m.datatype, Value: v,
 	}}})
 	t.commands.Add(1)
@@ -704,7 +723,7 @@ func tp(t time.Time) *time.Time {
 func metricInfos(defs map[string]*metric) []MetricInfo {
 	out := make([]MetricInfo, 0, len(defs))
 	for _, m := range defs {
-		mi := MetricInfo{Name: m.name, Topic: m.topic, Type: TypeName(m.datatype), Unit: m.unit}
+		mi := MetricInfo{Name: m.name, Topic: m.topic, Type: m.datatype.String(), Unit: m.unit}
 		if m.hasAlias {
 			a := m.alias
 			mi.Alias = &a
