@@ -52,6 +52,10 @@ type metric struct {
 	name     string
 	device   string // "" for node metrics
 	datatype spb.DataType
+	// kind is the protobuf field the edge node used for the value in its
+	// birth (implementations differ for some types, e.g. UInt32 in
+	// int_value or long_value): writes use the same one.
+	kind     spb.Kind
 	alias    uint64
 	hasAlias bool
 	topic    string // translated topic
@@ -89,6 +93,13 @@ type node struct {
 	rebirthAt time.Time
 
 	seqErrors, unknown, rebirths, staleDeaths uint64
+
+	// problems counts protocol violations (payloads failing validation,
+	// NBIRTH seq other than 0, alias conflicts); lastProblem describes
+	// the latest.
+	problems      uint64
+	lastProblem   string
+	lastProblemAt time.Time
 }
 
 // Publisher sends a message to the broker (rebirth requests). It must not
@@ -101,6 +112,7 @@ type Stats struct {
 	Metrics         uint64 `json:"metrics"`          // metric values translated
 	Malformed       uint64 `json:"malformed"`        // payloads that couldn't be decoded
 	Dropped         uint64 `json:"dropped"`          // messages or metrics over the memory limits
+	Problems        uint64 `json:"problems"`         // protocol violations (see NodeInfo.LastProblem)
 	Unknown         uint64 `json:"unknown_metrics"`  // aliases with no birth seen
 	SeqErrors       uint64 `json:"seq_errors"`       // out-of-order sequence numbers
 	RebirthRequests uint64 `json:"rebirth_requests"` // NCMD rebirth requests sent
@@ -120,7 +132,7 @@ type Translator struct {
 	nodes   map[string]*node   // group + "/" + edge
 	byTopic map[string]*metric // translated topic -> metric (commands)
 
-	messages, metrics, malformed, dropped, unknown, seqErrors, rebirths, commands atomic.Uint64
+	messages, metrics, malformed, dropped, problems, unknown, seqErrors, rebirths, commands atomic.Uint64
 }
 
 // New creates a translator. cfg must be normalized and valid.
@@ -214,9 +226,16 @@ func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
 	now := t.now()
 	n.mu.Lock()
 	n.lastMsg = now
+	if err := p.Validate(); err != nil {
+		// Still translated (leniently): the problem is reported per node.
+		t.problem(n, now, "%s: %v", typ, err)
+	}
 	var rebirth bool
 	switch typ {
 	case NBIRTH:
+		if p.HasSeq && p.Seq != 0 {
+			t.problem(n, now, "NBIRTH with seq %d (must be 0)", p.Seq)
+		}
 		out = t.nodeBirth(n, p, &e, now)
 	case NDEATH:
 		out = t.nodeDeath(n, p, now)
@@ -238,6 +257,20 @@ func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
 	n.mu.Unlock()
 	t.metrics.Add(uint64(len(out)))
 	return out, true
+}
+
+// problem records a protocol violation of node n (lock held).
+func (t *Translator) problem(n *node, now time.Time, format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		msg = msg[:i] + " (and more)"
+	}
+	if len(msg) > 300 {
+		msg = msg[:300] + "…"
+	}
+	n.problems++
+	n.lastProblem, n.lastProblemAt = msg, now
+	t.problems.Add(1)
 }
 
 func (t *Translator) node(group, edge string) *node {
@@ -313,7 +346,7 @@ func (t *Translator) register(n *node, devID string, defs map[string]*metric, p 
 			t.dropped.Add(1)
 			break
 		}
-		m := &metric{name: pm.Name, device: devID, datatype: pm.Datatype, alias: pm.Alias, hasAlias: pm.HasAlias,
+		m := &metric{name: pm.Name, device: devID, datatype: pm.Datatype, kind: pm.Value.Kind, alias: pm.Alias, hasAlias: pm.HasAlias,
 			topic: t.metricTopic(n.group, n.edge, devID, pm.Name)}
 		if m.datatype == spb.TypeUnknown {
 			m.datatype = inferType(pm.Value)
@@ -329,6 +362,11 @@ func (t *Translator) register(n *node, devID string, defs map[string]*metric, p 
 		}
 		defs[pm.Name] = m
 		if m.hasAlias {
+			if other := n.aliases[m.alias]; other != nil && other != m {
+				// Aliases must be unique across a node and its devices:
+				// the later birth wins.
+				t.problem(n, t.now(), "alias %d used by %s and %s", m.alias, describe(other), describe(m))
+			}
 			n.aliases[m.alias] = m
 		}
 		t.byTopic[m.topic] = m
@@ -375,6 +413,13 @@ func (t *Translator) nodeDeath(n *node, p *spb.Payload, now time.Time) []store.E
 		}
 	}
 	return out
+}
+
+func describe(m *metric) string {
+	if m.device == "" {
+		return fmt.Sprintf("node metric %q", m.name)
+	}
+	return fmt.Sprintf("%q of device %s", m.name, m.device)
 }
 
 // staleBdSeq reports whether death bdSeq d is older than birth bdSeq b
@@ -506,17 +551,19 @@ func (t *Translator) value(m *metric, pm *spb.Metric, e *store.Entry, online boo
 		buf = AppendValue(buf, dt, pm.Value)
 	}
 	val := buf[start:len(buf):len(buf)] // shared, never modified: entries are immutable
-	buf = t.envelopeTail(buf, m, dt, ts, online, pm.IsHistorical, pm.Properties)
-	if !pm.IsHistorical {
+	buf = t.envelopeTail(buf, m, dt, ts, online, pm)
+	if !pm.IsHistorical && !pm.IsTransient {
 		m.value, m.ts, m.recv, m.qos, m.hasLast = val, ts, recv, e.QoS, true
 	}
-	return store.Entry{Topic: m.topic, Payload: buf, QoS: e.QoS, Time: recv}, true
+	// Transient values are streamed (watchers, webhooks) but not stored.
+	return store.Entry{Topic: m.topic, Payload: buf, QoS: e.QoS, Time: recv, Transient: pm.IsTransient}, true
 }
 
-// envelopeTail completes {"value":<value> with the metadata:
+// envelopeTail completes {"value":<value> with the metadata (pm is the
+// metric as received, nil when republishing the last value):
 //
 //	,"type":"Float","timestamp":"…","unit":"°C","online":true}
-func (t *Translator) envelopeTail(buf []byte, m *metric, dt spb.DataType, ts uint64, online, historical bool, props *spb.PropertySet) []byte {
+func (t *Translator) envelopeTail(buf []byte, m *metric, dt spb.DataType, ts uint64, online bool, pm *spb.Metric) []byte {
 	buf = append(buf, `,"type":"`...)
 	buf = append(buf, dt.String()...)
 	buf = append(buf, `","timestamp":`...)
@@ -525,12 +572,15 @@ func (t *Translator) envelopeTail(buf []byte, m *metric, dt spb.DataType, ts uin
 		buf = append(buf, `,"unit":`...)
 		buf = store.AppendString(buf, m.unit)
 	}
-	if historical {
+	if pm != nil && pm.IsHistorical {
 		buf = append(buf, `,"historical":true`...)
 	}
-	if props != nil && len(props.Keys) > 0 {
+	if pm != nil && pm.IsTransient {
+		buf = append(buf, `,"transient":true`...)
+	}
+	if pm != nil && pm.Properties != nil && len(pm.Properties.Keys) > 0 {
 		buf = append(buf, `,"properties":`...)
-		buf = AppendProperties(buf, props)
+		buf = AppendProperties(buf, pm.Properties)
 	}
 	buf = append(buf, `,"online":`...)
 	buf = strconv.AppendBool(buf, online)
@@ -546,7 +596,7 @@ func (t *Translator) offline(defs map[string]*metric, out []store.Entry) []store
 		}
 		buf := append(make([]byte, 0, len(m.value)+96), `{"value":`...)
 		buf = append(buf, m.value...)
-		buf = t.envelopeTail(buf, m, m.datatype, m.ts, false, false, nil)
+		buf = t.envelopeTail(buf, m, m.datatype, m.ts, false, nil)
 		out = append(out, store.Entry{Topic: m.topic, Payload: buf, QoS: m.qos, Time: m.recv})
 	}
 	return out
@@ -656,12 +706,33 @@ func (t *Translator) Command(name string, payload []byte) (cmdTopic string, cmd 
 	if err != nil {
 		return "", nil, fmt.Errorf("%s (%s metric %q): %w", name, m.datatype.String(), m.name, err)
 	}
+	v = sameKind(v, m.datatype, m.kind)
 	ms := uint64(t.now().UnixMilli())
 	cmd = spb.Encode(&spb.Payload{Timestamp: ms, HasTimestamp: true, Metrics: []spb.Metric{{
 		Name: m.name, Timestamp: ms, HasTimestamp: true, Datatype: m.datatype, Value: v,
 	}}})
 	t.commands.Add(1)
 	return CommandTopic(group, edge, m.device), cmd, nil
+}
+
+// sameKind re-encodes v in the protobuf field the edge node used for the
+// metric in its birth, when both fields can hold the value: integers in
+// int_value or long_value, floating point in float_value or double_value.
+func sameKind(v spb.Value, dt spb.DataType, birth spb.Kind) spb.Value {
+	switch {
+	case v.Kind == spb.KindInt && birth == spb.KindLong:
+		if dt == spb.TypeInt8 || dt == spb.TypeInt16 || dt == spb.TypeInt32 {
+			v.Uint = uint64(int64(int32(uint32(v.Uint)))) // sign-extend to 64 bits
+		}
+		v.Kind = spb.KindLong
+	case v.Kind == spb.KindLong && birth == spb.KindInt && v.Uint <= 1<<32-1:
+		v.Kind = spb.KindInt
+	case v.Kind == spb.KindFloat && birth == spb.KindDouble:
+		v.Kind = spb.KindDouble
+	case v.Kind == spb.KindDouble && birth == spb.KindFloat:
+		v.Kind, v.Float = spb.KindFloat, float64(float32(v.Float))
+	}
+	return v
 }
 
 // nodeOf finds the node of a metric (from its translated topic).
@@ -707,6 +778,9 @@ type NodeInfo struct {
 	Unknown         uint64       `json:"unknown_metrics"`
 	RebirthRequests uint64       `json:"rebirth_requests"`
 	StaleDeaths     uint64       `json:"stale_deaths,omitempty"`
+	Problems        uint64       `json:"problems"`
+	LastProblem     string       `json:"last_problem,omitempty"`
+	LastProblemAt   *time.Time   `json:"last_problem_at,omitempty"`
 	Metrics         []MetricInfo `json:"metrics,omitempty"`
 	Count           int          `json:"metric_count"`
 	Devices         []DeviceInfo `json:"devices"`
@@ -750,7 +824,8 @@ func (t *Translator) Nodes(group string, metrics bool) []NodeInfo {
 		n.mu.Lock()
 		ni := NodeInfo{Group: n.group, Edge: n.edge, Online: n.online, BirthSeen: n.born, BirthAt: tp(n.birthAt),
 			DeathAt: tp(n.deathAt), LastMessage: n.lastMsg.UTC(), SeqErrors: n.seqErrors, Unknown: n.unknown,
-			RebirthRequests: n.rebirths, StaleDeaths: n.staleDeaths, Count: len(n.metrics), Devices: []DeviceInfo{}}
+			RebirthRequests: n.rebirths, StaleDeaths: n.staleDeaths, Problems: n.problems,
+			LastProblem: n.lastProblem, LastProblemAt: tp(n.lastProblemAt), Count: len(n.metrics), Devices: []DeviceInfo{}}
 		if n.bdSeq >= 0 {
 			b := n.bdSeq
 			ni.BdSeq = &b
@@ -780,7 +855,7 @@ func (t *Translator) Nodes(group string, metrics bool) []NodeInfo {
 
 // Stats returns counters.
 func (t *Translator) Stats() Stats {
-	st := Stats{Messages: t.messages.Load(), Metrics: t.metrics.Load(), Malformed: t.malformed.Load(), Dropped: t.dropped.Load(),
+	st := Stats{Messages: t.messages.Load(), Metrics: t.metrics.Load(), Malformed: t.malformed.Load(), Dropped: t.dropped.Load(), Problems: t.problems.Load(),
 		Unknown: t.unknown.Load(), SeqErrors: t.seqErrors.Load(), RebirthRequests: t.rebirths.Load(), Commands: t.commands.Load()}
 	t.mu.RLock()
 	list := make([]*node, 0, len(t.nodes))

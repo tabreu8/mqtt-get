@@ -623,3 +623,80 @@ func TestAppendValueFallbacks(t *testing.T) {
 		}
 	}
 }
+
+func TestTransientMetrics(t *testing.T) {
+	tr, _, _ := newT(config.Sparkplug{})
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, dbl("Live", 1, 1))))
+	m := byAlias(1, 7)
+	m.IsTransient = true
+	out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(1, m)))
+	if len(out) != 1 || !out[0].Transient || !strings.Contains(string(out[0].Payload), `"transient":true`) {
+		t.Fatalf("transient entry %+v", out)
+	}
+	// A death republishes the last stored (non-transient) value.
+	out, _ = tr.Process(entry("spBv1.0/g/NDEATH/e", spb.Encode(&spb.Payload{Metrics: []spb.Metric{{Name: "bdSeq", Value: spb.Value{Kind: spb.KindLong, Uint: 1}}}})))
+	for _, e := range out {
+		if e.Topic == "spb/g/e/Live" && !strings.Contains(string(e.Payload), `"value":1,`) {
+			t.Fatalf("offline value %s", e.Payload)
+		}
+	}
+}
+
+func TestProblemsAreReported(t *testing.T) {
+	tr, _, _ := newT(config.Sparkplug{})
+	// NBIRTH with seq 3 and an Int8 value out of range.
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(3, 1,
+		spb.Metric{Name: "Small", Alias: 1, HasAlias: true, Datatype: spb.TypeInt8, Value: spb.Value{Kind: spb.KindInt, Uint: 300}})))
+	n := tr.Nodes("", false)[0]
+	if n.Problems != 2 || !strings.Contains(n.LastProblem, "NBIRTH with seq 3") || n.LastProblemAt == nil {
+		t.Fatalf("node problems %+v", n)
+	}
+	// An alias reused by a device.
+	tr.Process(entry("spBv1.0/g/DBIRTH/e/d", devBirthPayload(4, dbl("Other", 1, 0))))
+	n = tr.Nodes("", false)[0]
+	if n.Problems != 3 || !strings.Contains(n.LastProblem, `alias 1 used by node metric "Small" and "Other" of device d`) {
+		t.Fatalf("alias conflict %+v", n)
+	}
+	if st := tr.Stats(); st.Problems != 3 {
+		t.Fatalf("stats %+v", st)
+	}
+	// Valid traffic adds none.
+	tr2, _, _ := newT(config.Sparkplug{})
+	tr2.Process(entry("spBv1.0/g/NBIRTH/e", mustHex(t, birthHex)))
+	tr2.Process(entry("spBv1.0/g/NDATA/e", mustHex(t, dataHex)))
+	if st := tr2.Stats(); st.Problems != 0 {
+		t.Fatalf("golden payloads reported as problems: %+v", tr2.Nodes("", false)[0].LastProblem)
+	}
+}
+
+func TestCommandsUseTheBirthEncoding(t *testing.T) {
+	tr, _, _ := newT(config.Sparkplug{Commands: true})
+	// A Tahu-style birth: UInt32 and Int16 carried in long_value, Float in
+	// double_value.
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1,
+		spb.Metric{Name: "Count", Datatype: spb.TypeUInt32, Value: spb.Value{Kind: spb.KindLong, Uint: 7}},
+		spb.Metric{Name: "Offset", Datatype: spb.TypeInt16, Value: spb.Value{Kind: spb.KindLong, Uint: 0}},
+		spb.Metric{Name: "Gain", Datatype: spb.TypeFloat, Value: spb.Value{Kind: spb.KindDouble, Float: 1}},
+		spb.Metric{Name: "Plain", Datatype: spb.TypeUInt32, Value: spb.Value{Kind: spb.KindInt, Uint: 7}})))
+	for _, c := range []struct {
+		metric, payload string
+		want            spb.Value
+	}{
+		{"Count", "4000000000", spb.Value{Kind: spb.KindLong, Uint: 4000000000}},
+		{"Offset", "-3", spb.Value{Kind: spb.KindLong, Uint: 0xfffffffffffffffd}}, // sign-extended to 64 bits
+		{"Gain", "0.5", spb.Value{Kind: spb.KindDouble, Float: 0.5}},
+		{"Plain", "9", spb.Value{Kind: spb.KindInt, Uint: 9}},
+	} {
+		_, cmd, err := tr.Command("spb/g/e/"+c.metric, []byte(c.payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, _ := spb.Decode(cmd)
+		if got := p.Metrics[0].Value; !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: %+v, want %+v", c.metric, got, c.want)
+		}
+		if err := p.Validate(); err != nil {
+			t.Errorf("%s: command fails validation: %v", c.metric, err)
+		}
+	}
+}

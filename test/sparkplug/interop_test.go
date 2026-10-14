@@ -416,8 +416,9 @@ func run(t *testing.T, python, client string, version uint) {
 	_, b := h.get("/api/v1/sparkplug")
 	var view core.SparkplugView
 	_ = json.Unmarshal(b, &view)
-	if view.Stats == nil || view.Stats.SeqErrors != 0 || view.Stats.Malformed != 0 || view.Stats.Unknown != 0 {
-		t.Fatalf("translator counters: %s", b)
+	if view.Stats == nil || view.Stats.SeqErrors != 0 || view.Stats.Malformed != 0 || view.Stats.Unknown != 0 || view.Stats.Problems != 0 {
+		_, nodes := h.get("/api/v1/sparkplug/nodes")
+		t.Fatalf("translator counters: %s\nnodes: %s", b, nodes)
 	}
 
 	// 5. Abrupt loss of the edge node: the broker publishes its will, the

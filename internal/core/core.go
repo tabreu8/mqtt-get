@@ -100,8 +100,10 @@ func (s *Service) Ingest(e store.Entry) {
 }
 
 func (s *Service) ingest(e store.Entry) {
-	s.store.Set(&e)
-	s.hist.Add(&e)
+	if !e.Transient {
+		s.store.Set(&e)
+		s.hist.Add(&e)
+	}
 	s.hooks.Dispatch(e)
 	s.watch.dispatch(e)
 }

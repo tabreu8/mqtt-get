@@ -3,7 +3,6 @@ package sparkplug
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -143,85 +142,53 @@ func appendKind(buf []byte, v spb.Value) []byte {
 	return append(buf, "null"...)
 }
 
-// appendArray decodes a packed array (Sparkplug 3.0: little-endian values
-// in bytes_value). ok is false when the length doesn't fit the type.
+// appendArray renders a packed array value as a JSON array. ok is false
+// when the bytes don't fit the type (spb.UnpackArray fails).
 func appendArray(buf []byte, t spb.DataType, b []byte) ([]byte, bool) {
-	size := map[spb.DataType]int{
-		spb.TypeInt8Array: 1, spb.TypeUInt8Array: 1, spb.TypeInt16Array: 2, spb.TypeUInt16Array: 2,
-		spb.TypeInt32Array: 4, spb.TypeUInt32Array: 4, spb.TypeFloatArray: 4,
-		spb.TypeInt64Array: 8, spb.TypeUInt64Array: 8, spb.TypeDoubleArray: 8, spb.TypeDateTimeArray: 8,
-	}[t]
-	switch t {
-	case spb.TypeBooleanArray:
-		// uint32 count, then the booleans packed MSB first.
-		if len(b) < 4 {
-			return buf, false
-		}
-		n := int(binary.LittleEndian.Uint32(b))
-		bits := b[4:]
-		if n > len(bits)*8 {
-			return buf, false
-		}
-		buf = append(buf, '[')
-		for i := 0; i < n; i++ {
-			if i > 0 {
-				buf = append(buf, ',')
-			}
-			buf = strconv.AppendBool(buf, bits[i/8]&(0x80>>(i%8)) != 0)
-		}
-		return append(buf, ']'), true
-	case spb.TypeStringArray:
-		// NUL-terminated strings.
-		if len(b) > 0 && b[len(b)-1] != 0 {
-			return buf, false
-		}
-		buf = append(buf, '[')
-		for i, s := range bytes.Split(b[:max(len(b)-1, 0)], []byte{0}) {
-			if len(b) == 0 {
-				break
-			}
-			if i > 0 {
-				buf = append(buf, ',')
-			}
-			buf = store.AppendString(buf, string(s))
-		}
-		return append(buf, ']'), true
-	}
-	if size == 0 || len(b)%size != 0 {
+	vals, err := spb.UnpackArray(t, b)
+	if err != nil {
 		return buf, false
 	}
-	le := binary.LittleEndian
 	buf = append(buf, '[')
-	for i := 0; i < len(b); i += size {
+	switch x := vals.(type) {
+	case []int8:
+		buf = appendEach(buf, x, func(b []byte, v int8) []byte { return strconv.AppendInt(b, int64(v), 10) })
+	case []int16:
+		buf = appendEach(buf, x, func(b []byte, v int16) []byte { return strconv.AppendInt(b, int64(v), 10) })
+	case []int32:
+		buf = appendEach(buf, x, func(b []byte, v int32) []byte { return strconv.AppendInt(b, int64(v), 10) })
+	case []int64:
+		buf = appendEach(buf, x, func(b []byte, v int64) []byte { return strconv.AppendInt(b, v, 10) })
+	case []uint8:
+		buf = appendEach(buf, x, func(b []byte, v uint8) []byte { return strconv.AppendUint(b, uint64(v), 10) })
+	case []uint16:
+		buf = appendEach(buf, x, func(b []byte, v uint16) []byte { return strconv.AppendUint(b, uint64(v), 10) })
+	case []uint32:
+		buf = appendEach(buf, x, func(b []byte, v uint32) []byte { return strconv.AppendUint(b, uint64(v), 10) })
+	case []uint64:
+		buf = appendEach(buf, x, func(b []byte, v uint64) []byte { return strconv.AppendUint(b, v, 10) })
+	case []float32:
+		buf = appendEach(buf, x, func(b []byte, v float32) []byte { return appendFloat(b, float64(v), 32) })
+	case []float64:
+		buf = appendEach(buf, x, func(b []byte, v float64) []byte { return appendFloat(b, v, 64) })
+	case []bool:
+		buf = appendEach(buf, x, strconv.AppendBool)
+	case []string:
+		buf = appendEach(buf, x, store.AppendString)
+	case []time.Time:
+		buf = appendEach(buf, x, func(b []byte, v time.Time) []byte { return appendTime(b, v.UnixMilli()) })
+	}
+	return append(buf, ']'), true
+}
+
+func appendEach[T any](buf []byte, vals []T, f func([]byte, T) []byte) []byte {
+	for i, v := range vals {
 		if i > 0 {
 			buf = append(buf, ',')
 		}
-		switch t {
-		case spb.TypeInt8Array:
-			buf = strconv.AppendInt(buf, int64(int8(b[i])), 10)
-		case spb.TypeUInt8Array:
-			buf = strconv.AppendUint(buf, uint64(b[i]), 10)
-		case spb.TypeInt16Array:
-			buf = strconv.AppendInt(buf, int64(int16(le.Uint16(b[i:]))), 10)
-		case spb.TypeUInt16Array:
-			buf = strconv.AppendUint(buf, uint64(le.Uint16(b[i:])), 10)
-		case spb.TypeInt32Array:
-			buf = strconv.AppendInt(buf, int64(int32(le.Uint32(b[i:]))), 10)
-		case spb.TypeUInt32Array:
-			buf = strconv.AppendUint(buf, uint64(le.Uint32(b[i:])), 10)
-		case spb.TypeFloatArray:
-			buf = appendFloat(buf, float64(math.Float32frombits(le.Uint32(b[i:]))), 32)
-		case spb.TypeInt64Array:
-			buf = strconv.AppendInt(buf, int64(le.Uint64(b[i:])), 10)
-		case spb.TypeUInt64Array:
-			buf = strconv.AppendUint(buf, le.Uint64(b[i:]), 10)
-		case spb.TypeDoubleArray:
-			buf = appendFloat(buf, math.Float64frombits(le.Uint64(b[i:])), 64)
-		case spb.TypeDateTimeArray:
-			buf = appendTime(buf, int64(le.Uint64(b[i:])))
-		}
+		buf = f(buf, v)
 	}
-	return append(buf, ']'), true
+	return buf
 }
 
 // appendDataSet renders {"columns":[...],"types":[...],"rows":[[...],...]}.

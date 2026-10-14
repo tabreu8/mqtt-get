@@ -10,6 +10,7 @@ Commands: {"cmd":"update","metric":..,"value":..}, {"cmd":"update_alias_only",..
 {"cmd":"disconnect"} (clean disconnect with an NDEATH).
 """
 import datetime
+import itertools
 import json
 import os
 import sys
@@ -131,6 +132,8 @@ def rebirth(node):
     global births
     bd = session_bd[-2]  # the will registered for this connection
     client = node._client
+    # A birth restarts the sequence at 0 (Sparkplug 3.0).
+    node._EdgeNode__seq_cycler = itertools.cycle(range(256))
     client.publish(psp.Message(
         topic=psp.Topic(message_type=psp.MessageType.NBIRTH, group_id=group, edge_node_id=edge),
         payload=psp.NBirth(timestamp=now(), seq=node._seq, metrics=(*node.metrics.values(), bd)),

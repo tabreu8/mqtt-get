@@ -41,6 +41,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		metric("mqttget_sparkplug_metrics_total", "counter", "Sparkplug metric values translated to topics.", sp.Metrics)
 		metric("mqttget_sparkplug_malformed_total", "counter", "Sparkplug payloads that could not be decoded.", sp.Malformed)
 		metric("mqttget_sparkplug_dropped_total", "counter", "Sparkplug messages or metrics dropped by the memory limits.", sp.Dropped)
+		metric("mqttget_sparkplug_problems_total", "counter", "Sparkplug protocol violations (invalid payloads, NBIRTH seq other than 0, alias conflicts).", sp.Problems)
 		metric("mqttget_sparkplug_unknown_metrics_total", "counter", "Sparkplug metrics dropped: alias without a birth certificate.", sp.Unknown)
 		metric("mqttget_sparkplug_seq_errors_total", "counter", "Sparkplug sequence number gaps (lost messages).", sp.SeqErrors)
 		metric("mqttget_sparkplug_rebirth_requests_total", "counter", "Rebirth requests sent to edge nodes.", sp.RebirthRequests)

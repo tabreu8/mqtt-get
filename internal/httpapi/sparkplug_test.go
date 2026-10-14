@@ -437,3 +437,35 @@ func TestSparkplugWithHistoryRawAndPrefix(t *testing.T) {
 		t.Fatalf("publish to an unknown metric: %v", err)
 	}
 }
+
+func TestSparkplugTransientIsStreamedNotStored(t *testing.T) {
+	e := newWSEnv(t, config.Server{})
+	if _, err := e.svc.PutHistoryRule(config.HistoryRule{ID: "all", Topics: []string{"spb/#"}}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.SetSparkplug(config.Sparkplug{Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan string, 1)
+	cancel, err := e.svc.Watch("spb/#", func(en *store.Entry) { got <- string(en.Payload) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	e.svc.Ingest(store.Entry{Topic: "spBv1.0/g/NDATA/e", Time: time.Now().UnixNano(), Payload: spb.Encode(&spb.Payload{Metrics: []spb.Metric{
+		{Name: "Pulse", Datatype: spb.TypeBoolean, IsTransient: true, Value: spb.Value{Kind: spb.KindBool, Bool: true}}}})})
+	select {
+	case p := <-got:
+		if !strings.Contains(p, `"transient":true`) {
+			t.Fatalf("streamed %s", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transient value not delivered to watchers")
+	}
+	if _, err := e.svc.Latest("spb/g/e/Pulse"); core.KindOf(err) != core.NotFound {
+		t.Fatalf("transient value stored: %v", err)
+	}
+	if _, err := e.svc.History("spb/g/e/Pulse", core.HistoryQuery{}); core.KindOf(err) != core.NotFound {
+		t.Fatalf("transient value recorded in history: %v", err)
+	}
+}

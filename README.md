@@ -251,9 +251,11 @@ curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/spb/plant1/pre
 - **Sequence numbers** are checked for each edge node; gaps (lost messages) are counted.
 - **Joining late.** Data from a node whose birth mqtt-get missed: metrics that carry names are still translated (typed by their value), and metrics sent only as aliases are counted as unknown. With `rebirth` on, mqtt-get then asks the node to publish its births again (an `NCMD` with `Node Control/Rebirth`), at most once per `rebirth_interval_sec`. The same happens after a sequence gap.
 - **Template definitions** in births (such as Ignition's `_types_/…`) describe types and are not translated; template instances are.
+- **Transient** metrics (`is_transient`) are delivered to waits, webhooks and the WebSocket stream (flagged `"transient":true`), but not stored as the latest value or in history.
 - **Historical** metrics (`is_historical`) keep their own timestamp, so they never replace a newer value, and they land at the right place in [history](#history).
 - **Passive.** mqtt-get never claims to be the primary host application (it doesn't publish `STATE`). Other hosts' `NCMD`/`DCMD` messages are not translated. `STATE` messages are stored as-is.
 - **Raw messages** under `spBv1.0/…` aren't stored, unless `keep_raw` is set.
+- **Protocol problems** are counted per node and shown with the latest one (`problems`, `last_problem` in `/api/v1/sparkplug/nodes` and the UI). Problems include payloads that fail validation (for example an Int8 of 300, or a value in the wrong field for its type), an NBIRTH whose `seq` isn't 0, and an alias used by two metrics. The values are still translated as well as possible.
 - **The prefix belongs to the translator.** While Sparkplug is on, publishing under `spb/…` is treated as a metric write (see below), and turning Sparkplug off or changing the prefix forgets the translated values.
 - **Limits:** up to 100,000 edge nodes and 100,000 metrics per node or device; beyond that, messages are dropped and counted. Translated topics also count toward `MAX_TOPICS`.
 
@@ -265,7 +267,16 @@ With `commands` on, publishing to a translated metric topic sends the write to t
 curl -X POST -H "Authorization: Bearer $KEY" --data 61.5 localhost:8080/api/v1/publish/spb/plant1/press-gw/Press3/Setpoint
 ```
 
-The payload is the value (`61.5`, `true`, `"text"`) or `{"value": …}`. It is checked against the metric's type: a range error or a non-number for a Float is rejected with `400`, and a metric with no birth seen gives `404`. Agents use `publish` or `publish_and_wait` the same way. `publish_and_wait` on the metric's own topic returns the device's confirmation (its next data message for that metric).
+The payload is the value (`61.5`, `true`, `"text"`) or `{"value": …}`. The write is encoded the way the edge node encoded that metric in its birth: implementations differ on which protobuf field carries some types (for example UInt32 in `int_value` or `long_value`), and mqtt-get follows the device. It is checked against the metric's type: a range error or a non-number for a Float is rejected with `400`, and a metric with no birth seen gives `404`. Agents use `publish` or `publish_and_wait` the same way. `publish_and_wait` on the metric's own topic returns the device's confirmation (its next data message for that metric).
+
+### Conformance
+
+mqtt-get acts as a Sparkplug 3.0 host application that **observes**: it decodes and tracks every edge node, but it is not a *primary* host application. The places where it deliberately differs from, or doesn't cover, the specification:
+
+- **No `STATE`.** It doesn't publish `STATE` messages, so edge nodes that wait for a primary host won't treat it as one. The Eclipse Sparkplug TCK's host application tests assume a primary host, so they don't apply as they are.
+- **Lenient `bdSeq` on death.** An NDEATH with a *newer* `bdSeq` than the birth is accepted (the specification asks for an exact match), because some edge nodes send the next session's `bdSeq` when they disconnect cleanly. Older ones (late wills) are ignored as specified.
+- **Lenient on bad payloads.** Payloads that break the value rules are translated as well as possible and reported as problems, rather than rejected.
+- **Not covered:** reassembly of multi-part File values (`MetaData.is_multi_part`), and preserving protobuf extensions (they are skipped).
 
 ### Settings
 
@@ -304,9 +315,9 @@ cmd := sparkplug.Encode(&sparkplug.Payload{Metrics: []sparkplug.Metric{{
 	Value: sparkplug.Value{Kind: sparkplug.KindBool, Bool: true}}}})
 ```
 
-It encodes and decodes every message of the Sparkplug 3.0 payload schema: metrics with metadata, property sets, data sets and templates. Its output is byte-identical to the reference protobuf implementation, and the decoder is fuzzed. See the [package documentation](https://pkg.go.dev/github.com/tabreu8/mqtt-get/sparkplug) for how each data type is represented.
+It encodes and decodes every message of the Sparkplug 3.0 payload schema: metrics with metadata, property sets, data sets and templates. `Payload.Validate` checks a payload against the specification's value rules (each value in the field its data type uses, integer ranges, array encodings, data set shape, `seq` ≤ 255). `UnpackArray` and `PackArray` convert array values to and from Go slices. Its output is byte-identical to the reference protobuf implementation, and the decoder is fuzzed. See the [package documentation](https://pkg.go.dev/github.com/tabreu8/mqtt-get/sparkplug) for how each data type is represented.
 
-What it is **not**: not an edge node, not a host application, and not an MQTT client. It doesn't connect to brokers, build topics, track births and deaths, resolve aliases or check sequence numbers, and it doesn't unpack array values (they stay packed bytes). mqtt-get's own host logic, built on this codec, stays internal.
+What it is **not**: not an edge node, not a host application, and not an MQTT client. It doesn't connect to brokers, build topics, track births and deaths, resolve aliases or check sequence numbers, and it doesn't check rules that depend on the message type (for example that births carry names, data types and a `bdSeq`). mqtt-get's own host logic, built on this codec, stays internal.
 
 ## Live stream (WebSocket)
 
@@ -1022,7 +1033,7 @@ Metrics:
 | `mqttget_history_topics` / `mqttget_history_points` / `mqttget_history_bytes` | gauge | [History](#history) in memory (bytes approximate) |
 | `mqttget_history_max_bytes` | gauge | `HISTORY_MAX_BYTES` |
 | `mqttget_history_dropped_total` | counter | Messages not recorded because a history byte budget was full |
-| `mqttget_sparkplug_{messages,metrics,malformed,dropped,unknown_metrics,seq_errors,rebirth_requests,commands}_total` | counter | [Sparkplug B](#sparkplug-b) translation (when enabled) |
+| `mqttget_sparkplug_{messages,metrics,malformed,dropped,problems,unknown_metrics,seq_errors,rebirth_requests,commands}_total` | counter | [Sparkplug B](#sparkplug-b) translation (when enabled) |
 | `mqttget_sparkplug_nodes` / `mqttget_sparkplug_nodes_online` | gauge | Sparkplug edge nodes seen / online |
 | `mqttget_webhook_{delivered,failed,dropped,requests}_total{webhook="id"}` | counter | Per webhook |
 | `mqttget_webhook_queue_length{webhook="id"}` | gauge | Rising steadily means the endpoint can't keep up |

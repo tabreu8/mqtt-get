@@ -208,7 +208,7 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
       <div class="err" id="spbErr"></div>
       <div class="actions"><button class="btn" type="submit">Save</button><span class="muted" id="spbStats"></span></div>
     </form>
-    <div style="overflow:auto;margin-top:10px"><table><thead><tr><th>Group / edge node</th><th>State</th><th>Devices</th><th>Metrics</th><th>Seq errors</th><th></th></tr></thead><tbody id="spbNodes"></tbody></table></div>
+    <div style="overflow:auto;margin-top:10px"><table><thead><tr><th>Group / edge node</th><th>State</th><th>Devices</th><th>Metrics</th><th>Seq errors</th><th>Problems</th><th></th></tr></thead><tbody id="spbNodes"></tbody></table></div>
   </div>
 </section>
 
@@ -606,15 +606,16 @@ async function loadSparkplug() {
   $('#spbHint').textContent = v.hint || '';
   const st = v.stats;
   $('#spbStats').textContent = st ? `${fmtN(st.metrics)} values from ${fmtN(st.messages)} messages · ${st.nodes_online}/${st.nodes} nodes online` +
-    (st.unknown_metrics ? ` · ${fmtN(st.unknown_metrics)} undecodable` : '') + (st.malformed ? ` · ${fmtN(st.malformed)} malformed` : '') + ` · settings: ${v.source}` : `settings: ${v.source}`;
-  if (!c.enabled) { $('#spbNodes').innerHTML = '<tr><td colspan=6 class="muted">Disabled</td></tr>'; return; }
+    (st.unknown_metrics ? ` · ${fmtN(st.unknown_metrics)} undecodable` : '') + (st.malformed ? ` · ${fmtN(st.malformed)} malformed` : '') + (st.problems ? ` · ${fmtN(st.problems)} protocol problems` : '') + ` · settings: ${v.source}` : `settings: ${v.source}`;
+  if (!c.enabled) { $('#spbNodes').innerHTML = '<tr><td colspan=7 class="muted">Disabled</td></tr>'; return; }
   const r = await api('GET', '/api/v1/sparkplug/nodes').catch(() => ({ nodes: [] }));
   const on = x => `<span class="pill ${x ? 'ok' : 'bad'}">${x ? 'online' : 'offline'}</span>`;
   $('#spbNodes').innerHTML = r.nodes.map(n => `<tr><td class="mono">${esc(n.group)} / ${esc(n.edge_node)}${n.birth_seen ? '' : ' <span class="pill" title="no birth seen yet: aliases unknown">no birth</span>'}</td>
     <td>${on(n.online)}</td><td>${n.devices.map(d => `<span class="mono">${esc(d.id)}</span> ${on(d.online)}`).join('<br>') || '—'}</td>
     <td>${n.metric_count + n.devices.reduce((a, d) => a + d.metric_count, 0)}</td><td>${n.seq_errors}</td>
+    <td>${n.problems ? `<span class="err" title="${esc(n.last_problem)}">${n.problems}</span><div class="muted mono" style="max-width:260px">${esc(n.last_problem)}</div>` : '0'}</td>
     <td><button class="btn small secondary" data-g="${esc(n.group)}" data-e="${esc(n.edge_node)}">Rebirth</button></td></tr>`).join('') ||
-    '<tr><td colspan=6 class="muted">No Sparkplug messages received yet</td></tr>';
+    '<tr><td colspan=7 class="muted">No Sparkplug messages received yet</td></tr>';
   $$('#spbNodes button').forEach(b => b.onclick = async () => {
     try { await api('POST', `/api/v1/sparkplug/nodes/${encodeURIComponent(b.dataset.g)}/${encodeURIComponent(b.dataset.e)}/rebirth`); toast('Rebirth requested'); setTimeout(loadSparkplug, 1000); }
     catch (err) { toast(err.message) }

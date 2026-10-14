@@ -24,8 +24,11 @@ type Entry struct {
 	Payload  []byte
 	QoS      byte
 	Retained bool
-	Time     int64  // unix nanoseconds when received
-	Props    *Props // MQTT 5 properties (nil for MQTT 3.1.1 or none)
+	// Transient entries are delivered to watchers and webhooks but not
+	// stored (latest value, history): Sparkplug B is_transient metrics.
+	Transient bool
+	Time      int64  // unix nanoseconds when received
+	Props     *Props // MQTT 5 properties (nil for MQTT 3.1.1 or none)
 }
 
 // slot holds the latest value of one topic. It is allocated once per topic
