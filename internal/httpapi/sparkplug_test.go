@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	"github.com/tabreu8/mqtt-get/internal/core"
 	"github.com/tabreu8/mqtt-get/internal/mqttc"
 	"github.com/tabreu8/mqtt-get/internal/sparkplug"
+	"github.com/tabreu8/mqtt-get/internal/state"
 	"github.com/tabreu8/mqtt-get/internal/store"
 	spb "github.com/tabreu8/mqtt-get/sparkplug"
 )
@@ -505,5 +508,37 @@ func TestSparkplugReorderTimeoutFlushes(t *testing.T) {
 	})
 	if st := e.svc.Sparkplug().Stats; st.SeqErrors != 1 {
 		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestSparkplugDefinitionsSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	start := func() *core.Service {
+		st, err := state.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		svc := core.New(config.Server{DataDir: dir, MaxTopics: 100}, log, st)
+		if err := svc.Start(config.Broker{}, false); err != nil {
+			t.Fatal(err)
+		}
+		return svc
+	}
+	svc := start()
+	if _, err := svc.SetSparkplug(config.Sparkplug{Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	svc.Ingest(store.Entry{Topic: "spBv1.0/g/NBIRTH/e", Time: time.Now().UnixNano(), Payload: spb.Encode(&spb.Payload{Seq: 0, HasSeq: true,
+		Metrics: []spb.Metric{{Name: "Level", Alias: 4, HasAlias: true, Datatype: spb.TypeFloat, Value: spb.Value{Kind: spb.KindFloat, Float: 1}}}})})
+	svc.Close() // saves the definitions
+
+	svc = start()
+	defer svc.Close()
+	svc.Ingest(store.Entry{Topic: "spBv1.0/g/NDATA/e", Time: time.Now().UnixNano(), Payload: spb.Encode(&spb.Payload{Seq: 1, HasSeq: true,
+		Metrics: []spb.Metric{{Alias: 4, HasAlias: true, Value: spb.Value{Kind: spb.KindFloat, Float: 2.5}}}})})
+	v, err := svc.Latest("spb/g/e/Level")
+	if err != nil || !strings.Contains(string(v.Payload), `"value":2.5`) || !strings.Contains(string(v.Payload), `"type":"Float"`) {
+		t.Fatalf("alias-only data after a restart: %v %s", err, v.Payload)
 	}
 }

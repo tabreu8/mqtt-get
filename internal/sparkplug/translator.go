@@ -82,6 +82,7 @@ type node struct {
 	edge      string
 	online    bool
 	born      bool  // a birth has been seen (aliases and types are known)
+	restored  bool  // the definitions came from disk, not from a birth yet
 	bdSeq     int64 // -1 = unknown
 	seq       int   // last seq, -1 = unknown
 	birthAt   time.Time
@@ -141,6 +142,7 @@ type Translator struct {
 
 	messages, metrics, malformed, dropped, problems, unknown, seqErrors, rebirths, commands atomic.Uint64
 	pendingNodes                                                                            atomic.Int64 // nodes holding messages
+	dirty                                                                                   atomic.Bool  // definitions changed since the last Save
 }
 
 // New creates a translator. cfg must be normalized and valid.
@@ -276,6 +278,15 @@ func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
 // handle translates a DBIRTH, DDEATH, NDATA or DDATA message (lock held).
 func (t *Translator) handle(n *node, typ, dev string, p *spb.Payload, e *store.Entry, now time.Time) (out []store.Entry) {
 	rebirth := t.checkSeq(n, p)
+	if n.restored && (typ == NDATA || typ == DDATA) && t.checkRestored(n, dev, p) {
+		// Back after a restart: the node is evidently online. A rebirth
+		// confirms the definitions and refreshes every value.
+		n.online = true
+		if d := n.devices[dev]; d != nil {
+			d.online = true
+		}
+		rebirth = true
+	}
 	switch typ {
 	case DBIRTH:
 		out = t.deviceBirth(n, dev, p, e, now)
@@ -489,6 +500,7 @@ func bdSeqOf(p *spb.Payload) (int64, bool) {
 func (t *Translator) register(n *node, devID string, defs map[string]*metric, p *spb.Payload) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.dirty.Store(true)
 	for name, m := range defs {
 		if m.hasAlias && n.aliases[m.alias] == m {
 			delete(n.aliases, m.alias)
@@ -544,7 +556,7 @@ func (t *Translator) nodeBirth(n *node, p *spb.Payload, e *store.Entry, now time
 		delete(n.devices, id)
 	}
 	t.register(n, "", n.metrics, p)
-	n.online, n.born, n.birthAt = true, true, now
+	n.online, n.born, n.restored, n.birthAt = true, true, false, now
 	n.bdSeq = -1
 	if bd, ok := bdSeqOf(p); ok {
 		n.bdSeq = bd
@@ -962,6 +974,7 @@ type NodeInfo struct {
 	Edge            string       `json:"edge_node"`
 	Online          bool         `json:"online"`
 	BirthSeen       bool         `json:"birth_seen"`
+	Restored        bool         `json:"restored,omitempty"` // definitions restored from disk, no birth since
 	BdSeq           *int64       `json:"bd_seq,omitempty"`
 	BirthAt         *time.Time   `json:"birth_at,omitempty"`
 	DeathAt         *time.Time   `json:"death_at,omitempty"`
@@ -1014,7 +1027,7 @@ func (t *Translator) Nodes(group string, metrics bool) []NodeInfo {
 	out := make([]NodeInfo, 0, len(list))
 	for _, n := range list {
 		n.mu.Lock()
-		ni := NodeInfo{Group: n.group, Edge: n.edge, Online: n.online, BirthSeen: n.born, BirthAt: tp(n.birthAt),
+		ni := NodeInfo{Group: n.group, Edge: n.edge, Online: n.online, BirthSeen: n.born, Restored: n.restored, BirthAt: tp(n.birthAt),
 			DeathAt: tp(n.deathAt), LastMessage: n.lastMsg.UTC(), SeqErrors: n.seqErrors, Unknown: n.unknown,
 			RebirthRequests: n.rebirths, StaleDeaths: n.staleDeaths, Problems: n.problems,
 			LastProblem: n.lastProblem, LastProblemAt: tp(n.lastProblemAt), Count: len(n.metrics), Devices: []DeviceInfo{}}

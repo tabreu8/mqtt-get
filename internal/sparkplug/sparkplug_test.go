@@ -808,3 +808,71 @@ func TestReorderWindow(t *testing.T) {
 		t.Fatalf("held messages survived a birth: %v", got(out))
 	}
 }
+
+func TestPersistDefinitions(t *testing.T) {
+	path := t.TempDir() + "/sparkplug.json"
+	tr, _, _ := newT(config.Sparkplug{})
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 7, dbl("Level", 1, 3),
+		spb.Metric{Name: "Count", Alias: 2, HasAlias: true, Datatype: spb.TypeUInt32, Value: spb.Value{Kind: spb.KindLong, Uint: 5},
+			Properties: &spb.PropertySet{Keys: []string{"engUnit"}, Values: []spb.PropertyValue{{Type: spb.TypeString, Value: spb.Value{Kind: spb.KindString, Str: "pcs"}}}}})))
+	tr.Process(entry("spBv1.0/g/DBIRTH/e/d", devBirthPayload(1, dbl("Temp", 3, 20))))
+	tr.Process(entry("spBv1.0/g/NDATA/x", dataPayload(0, byAlias(9, 1)))) // never born: not saved
+	if !tr.Dirty() || tr.Dirty() {
+		t.Fatal("dirty flag")
+	}
+	if err := tr.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// After a restart, alias-only data decodes at once, and a rebirth is
+	// requested to confirm the definitions.
+	tr2, fb, _ := newT(config.Sparkplug{Rebirth: true})
+	if n, err := tr2.Load(path); n != 1 || err != nil {
+		t.Fatalf("load: %d %v", n, err)
+	}
+	if ns := tr2.Nodes("", true); len(ns) != 1 || !ns[0].Restored || ns[0].Online || *ns[0].BdSeq != 7 || ns[0].Metrics[0].Unit != "pcs" {
+		t.Fatalf("restored nodes %+v", ns)
+	}
+	out, _ := tr2.Process(entry("spBv1.0/g/NDATA/e", dataPayload(5, byAlias(1, 4.5),
+		spb.Metric{Alias: 2, HasAlias: true, Value: spb.Value{Kind: spb.KindInt, Uint: 6}})))
+	v := values(t, out)
+	if len(v) != 2 || v["spb/g/e/Level"]["value"] != 4.5 || v["spb/g/e/Count"]["value"] != 6.0 || v["spb/g/e/Count"]["unit"] != "pcs" {
+		t.Fatalf("decoded with restored definitions: %v", v)
+	}
+	out, _ = tr2.Process(entry("spBv1.0/g/DDATA/e/d", dataPayload(6, byAlias(3, 21))))
+	if v := values(t, out); v["spb/g/e/d/Temp"]["value"] != 21.0 {
+		t.Fatalf("device metric: %v", v)
+	}
+	if fb.count() != 1 || tr2.Stats().NodesOnline != 1 || tr2.Stats().Problems != 0 {
+		t.Fatalf("%d rebirth requests, %+v", fb.count(), tr2.Stats())
+	}
+	if _, _, err := tr2.Command("spb/g/e/Level", []byte("1")); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("restored metric not known for commands: %v", err)
+	}
+
+	// Definitions that contradict the data are dropped.
+	tr3, _, _ := newT(config.Sparkplug{})
+	tr3.Load(path)
+	out, _ = tr3.Process(entry("spBv1.0/g/NDATA/e", dataPayload(0, spb.Metric{Alias: 1, HasAlias: true, Value: spb.Value{Kind: spb.KindString, Str: "x"}})))
+	if len(out) != 0 || tr3.Nodes("", false)[0].BirthSeen || !strings.Contains(tr3.Nodes("", false)[0].LastProblem, "restored from disk") {
+		t.Fatalf("contradicting data: %v %+v", values(t, out), tr3.Nodes("", false))
+	}
+	if tr3.IsMetricTopic("spb/g/e/d/Temp") {
+		t.Fatal("contradicted definitions kept")
+	}
+
+	// A node heard from before the load keeps its own state; another
+	// prefix ignores the file; a missing file is fine.
+	tr4, _, _ := newT(config.Sparkplug{})
+	tr4.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 9, dbl("Other", 1, 0))))
+	if n, _ := tr4.Load(path); n != 0 || tr4.IsMetricTopic("spb/g/e/Level") {
+		t.Fatal("restored over a live node")
+	}
+	tr5, _, _ := newT(config.Sparkplug{Prefix: "uns"})
+	if n, err := tr5.Load(path); n != 0 || err != nil {
+		t.Fatalf("other prefix: %d %v", n, err)
+	}
+	if n, err := tr5.Load(path + ".missing"); n != 0 || err != nil {
+		t.Fatalf("missing file: %d %v", n, err)
+	}
+}

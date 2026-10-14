@@ -498,6 +498,10 @@ type Sparkplug struct {
 	// gaps are counted immediately). When it expires, the held messages
 	// are translated and a rebirth is requested (with Rebirth).
 	ReorderTimeoutMs *int `json:"reorder_timeout_ms,omitempty"`
+	// Persist saves the metric definitions learned from births (names,
+	// aliases, types) to DATA_DIR/sparkplug.json, so that after a restart
+	// alias-only data is decoded before the next birth (default true).
+	Persist *bool `json:"persist,omitempty"`
 }
 
 // DefaultReorderTimeoutMs is the default Sparkplug reorder timeout.
@@ -511,6 +515,10 @@ func (s *Sparkplug) Normalize() {
 	}
 	if s.RebirthIntervalSec <= 0 {
 		s.RebirthIntervalSec = 30
+	}
+	if s.Persist == nil {
+		on := true
+		s.Persist = &on
 	}
 	if s.ReorderTimeoutMs == nil {
 		ms := DefaultReorderTimeoutMs
@@ -664,6 +672,10 @@ func SparkplugFromEnv() (s Sparkplug, ok bool, err error) {
 		RebirthIntervalSec: envInt("SPARKPLUG_REBIRTH_INTERVAL_SEC", 0),
 		Commands:           envBool("SPARKPLUG_COMMANDS", false),
 		CommandsFilter:     envList("SPARKPLUG_COMMANDS_FILTER"),
+	}
+	if Env("SPARKPLUG_PERSIST") != "" {
+		on := envBool("SPARKPLUG_PERSIST", true)
+		s.Persist = &on
 	}
 	if Env("SPARKPLUG_REORDER_TIMEOUT_MS") != "" {
 		ms := envInt("SPARKPLUG_REORDER_TIMEOUT_MS", DefaultReorderTimeoutMs)

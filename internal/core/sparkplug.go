@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"time"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
@@ -44,15 +45,60 @@ func (s *Service) applySparkplug(c config.Sparkplug) {
 	if old := s.spb.Load(); old != nil && old.SetConfig(c) {
 		return // same prefix: keep the births, aliases and node states
 	}
-	s.spb.Store(sparkplug.New(c, s.sparkplugPublish))
+	sp := sparkplug.New(c, s.sparkplugPublish)
+	s.loadSparkplug(sp)
+	s.spb.Store(sp)
+}
+
+// sparkplugPath is where the metric definitions are saved ("" = not
+// persisted).
+func (s *Service) sparkplugPath(c config.Sparkplug) string {
+	if c.Persist == nil || !*c.Persist || s.cfg.DataDir == "" || s.state.Path() == "" {
+		return ""
+	}
+	return filepath.Join(s.cfg.DataDir, "sparkplug.json")
+}
+
+// loadSparkplug restores the saved metric definitions into sp.
+func (s *Service) loadSparkplug(sp *sparkplug.Translator) {
+	p := s.sparkplugPath(sp.Config())
+	if p == "" {
+		return
+	}
+	n, err := sp.Load(p)
+	switch {
+	case err != nil:
+		s.log.Error("sparkplug: could not restore the metric definitions", "file", p, "err", err)
+	case n > 0:
+		s.log.Info("sparkplug: metric definitions restored", "file", p, "nodes", n)
+	}
+	sp.Dirty() // what was just loaded needs no saving
+}
+
+// saveSparkplug saves the metric definitions if they changed.
+func (s *Service) saveSparkplug() {
+	sp := s.spb.Load()
+	if sp == nil {
+		return
+	}
+	p := s.sparkplugPath(sp.Config())
+	if p == "" || !sp.Dirty() {
+		return
+	}
+	if err := sp.Save(p); err != nil {
+		s.log.Error("sparkplug: could not save the metric definitions", "file", p, "err", err)
+	}
 }
 
 // sparkplugLoop translates the Sparkplug messages held for reordering once
-// their timeout expires.
+// their timeout expires, and saves the metric definitions when they change
+// (at most every 10 seconds, and on shutdown).
 func (s *Service) sparkplugLoop() {
 	defer s.bg.Done()
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
+	save := time.NewTicker(10 * time.Second)
+	defer save.Stop()
 	for {
 		select {
 		case <-t.C:
@@ -61,7 +107,10 @@ func (s *Service) sparkplugLoop() {
 					s.ingest(e)
 				}
 			}
+		case <-save.C:
+			s.saveSparkplug()
 		case <-s.stop:
+			s.saveSparkplug()
 			return
 		}
 	}

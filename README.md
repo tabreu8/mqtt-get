@@ -130,7 +130,7 @@ flowchart LR
 3. The message is matched, using lock-free topic tries, against webhook filters (each webhook has its own bounded queue) and against active watchers (agents waiting for events, resource subscriptions).
 4. **REST and MCP are two thin interfaces over the same core.** Every operation, validation rule, scope check and error is implemented once, so both behave the same way. The interfaces only differ in presentation: REST speaks HTTP and JSON for systems, while MCP adds what agents need (discovery, events, safety hints).
 
-Values live in memory. After a restart they are rebuilt as messages arrive, and **retained** messages are replayed by the broker immediately on subscribe. Configuration (broker settings, webhooks, history rules, API keys) is persisted to `DATA_DIR/state.json`. [History](#history), when enabled, is kept in memory too and saved to `DATA_DIR/history.bin` periodically and on shutdown.
+Values live in memory. After a restart they are rebuilt as messages arrive, and **retained** messages are replayed by the broker immediately on subscribe. Configuration (broker settings, webhooks, history rules, API keys) is persisted to `DATA_DIR/state.json`. [History](#history), when enabled, is kept in memory too and saved to `DATA_DIR/history.bin` periodically and on shutdown. [Sparkplug B](#sparkplug-b) metric definitions are saved to `DATA_DIR/sparkplug.json`.
 
 ## Reading values (GET)
 
@@ -250,6 +250,7 @@ curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/spb/plant1/pre
 - **Deaths.** `NDEATH` and `DDEATH` republish the metrics with `"online":false`, keeping the last value and its age. A death left over from an older session (an older `bdSeq`, e.g. a will delivered late) is ignored. A death with a *newer* `bdSeq` is accepted, because some edge nodes send the next session's `bdSeq` when they disconnect cleanly.
 - **Sequence numbers** are checked for each edge node. A message that arrives ahead of its turn is held for up to `reorder_timeout_ms` (default 2 s) for the missing ones, then everything is translated in order. If they don't arrive in time, the held messages are translated anyway, the gap is counted as a sequence error and, with `rebirth` on, a rebirth is requested. A message that arrives after that (late, or a duplicate) is dropped, since newer values were already translated. With `reorder_timeout_ms` set to 0, gaps are counted immediately and nothing is held.
 - **Joining late.** Data from a node whose birth mqtt-get missed: metrics that carry names are still translated (typed by their value), and metrics sent only as aliases are counted as unknown. With `rebirth` on, mqtt-get then asks the node to publish its births again (an `NCMD` with `Node Control/Rebirth`), at most once per `rebirth_interval_sec`. The same happens after a sequence gap.
+- **Restarts.** What births told about each node (metric names, aliases, types, units, `bdSeq`) is saved to `DATA_DIR/sparkplug.json` when it changes (at most every 10 s, and on shutdown). After a restart, data messages that carry only aliases are decoded right away instead of waiting for the next birth; with `rebirth` on, mqtt-get also asks each node for a birth on its first message, to confirm the definitions and refresh every value. Restored nodes show `"restored":true` until then. If a message contradicts a restored definition (a different type), the node's definitions are dropped and it is treated as never born. Set `persist` to `false` to keep them in memory only.
 - **Template definitions** in births (such as Ignition's `_types_/…`) describe types and are not translated; template instances are.
 - **Transient** metrics (`is_transient`) are delivered to waits, webhooks and the WebSocket stream (flagged `"transient":true`), but not stored as the latest value or in history.
 - **Historical** metrics (`is_historical`) keep their own timestamp, so they never replace a newer value, and they land at the right place in [history](#history).
@@ -289,6 +290,7 @@ mqtt-get acts as a Sparkplug 3.0 host application that **observes**: it decodes 
 | `rebirth` | `SPARKPLUG_REBIRTH` | `false` | Request births from nodes that can't be decoded or lost messages (publishes `NCMD`) |
 | `rebirth_interval_sec` | `SPARKPLUG_REBIRTH_INTERVAL_SEC` | `30` | Minimum time between rebirth requests to one node |
 | `reorder_timeout_ms` | `SPARKPLUG_REORDER_TIMEOUT_MS` | `2000` | How long to wait for missing messages before treating the gap as lost (0: don't wait) |
+| `persist` | `SPARKPLUG_PERSIST` | `true` | Save the metric definitions to `DATA_DIR/sparkplug.json` |
 | `commands` | `SPARKPLUG_COMMANDS` | `false` | Allow writes through publish (needs the `publish` scope) |
 | `commands_filter` | `SPARKPLUG_COMMANDS_FILTER` (comma-separated) | all | Topic filters of the metrics that may be written |
 | `keep_raw` | `SPARKPLUG_KEEP_RAW` | `false` | Also store the raw protobuf messages |
@@ -815,7 +817,7 @@ mqtt-get reads **environment variables** at startup. Broker settings can also be
 | `API_KEYS_PUBLISH` | – | Read + publish keys |
 | `AUTH_DISABLED` | `false` | Turn off API authentication (trusted networks only) |
 | `ALLOW_QUERY_API_KEY` | `false` | Also accept `?api_key=` (for clients that can't set headers) |
-| `DATA_DIR` | `./data` | Where `state.json` (and `history.bin`) is kept (`/data` in the Docker image) |
+| `DATA_DIR` | `./data` | Where `state.json` (and `history.bin`, `sparkplug.json`) is kept (`/data` in the Docker image) |
 | `HISTORY_*` | – | History memory budget, persistence and an optional environment rule: see [History](#history) |
 | `SPARKPLUG_*` | – | Sparkplug B support: see [Sparkplug B](#sparkplug-b) |
 | `MAX_TOPICS` | `1000000` | Memory guard: new topics beyond this are not stored (counted in metrics) |
