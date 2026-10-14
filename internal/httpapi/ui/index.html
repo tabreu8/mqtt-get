@@ -204,6 +204,7 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
       </div>
       <label><input type="checkbox" name="rebirth">Request a rebirth when a node's metrics can't be decoded or messages were lost</label>
       <label><input type="checkbox" name="commands">Allow writes: publishing to a metric topic sends an NCMD/DCMD to the device</label>
+      <label>Writable metrics (topic filters, one per line; empty = all)</label><textarea name="commands_filter" rows="2" placeholder="spb/plant1/+/+/Setpoints/#"></textarea>
       <label><input type="checkbox" name="keep_raw">Also keep the raw protobuf messages</label>
       <div class="err" id="spbErr"></div>
       <div class="actions"><button class="btn" type="submit">Save</button><span class="muted" id="spbStats"></span></div>
@@ -603,6 +604,7 @@ async function loadSparkplug() {
   const c = v.config, e = $('#spbForm').elements;
   e.enabled.checked = c.enabled; e.prefix.value = c.prefix || ''; e.rebirth_interval_sec.value = c.rebirth_interval_sec || 30;
   e.rebirth.checked = !!c.rebirth; e.commands.checked = !!c.commands; e.keep_raw.checked = !!c.keep_raw;
+  e.commands_filter.value = (c.commands_filter || []).join('\n');
   $('#spbHint').textContent = v.hint || '';
   const st = v.stats;
   $('#spbStats').textContent = st ? `${fmtN(st.metrics)} values from ${fmtN(st.messages)} messages · ${st.nodes_online}/${st.nodes} nodes online` +
@@ -625,7 +627,8 @@ $('#spbForm').onsubmit = async ev => {
   ev.preventDefault();
   const e = ev.target.elements;
   const body = { enabled: e.enabled.checked, prefix: e.prefix.value.trim(), rebirth_interval_sec: parseInt(e.rebirth_interval_sec.value) || 0,
-    rebirth: e.rebirth.checked, commands: e.commands.checked, keep_raw: e.keep_raw.checked };
+    rebirth: e.rebirth.checked, commands: e.commands.checked, keep_raw: e.keep_raw.checked,
+    commands_filter: e.commands_filter.value.split(/[\n,]/).map(x => x.trim()).filter(Boolean) };
   try { await api('PUT', '/api/v1/sparkplug', body); $('#spbErr').textContent = ''; toast('Sparkplug settings saved'); loadSparkplug(); }
   catch (err) { $('#spbErr').textContent = err.message; }
 };

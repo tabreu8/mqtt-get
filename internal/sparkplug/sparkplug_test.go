@@ -3,6 +3,7 @@ package sparkplug
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"math"
 	"reflect"
 	"strconv"
@@ -698,5 +699,36 @@ func TestCommandsUseTheBirthEncoding(t *testing.T) {
 		if err := p.Validate(); err != nil {
 			t.Errorf("%s: command fails validation: %v", c.metric, err)
 		}
+	}
+}
+
+func TestCommandsFilter(t *testing.T) {
+	tr, _, _ := newT(config.Sparkplug{Commands: true, CommandsFilter: []string{"spb/g/e/Setpoints/#", "spb/g/+/valve/Open"}})
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, dbl("Setpoints/Temp", 1, 20), dbl("Level", 2, 3))))
+	tr.Process(entry("spBv1.0/g/DBIRTH/e/valve", devBirthPayload(1,
+		spb.Metric{Name: "Open", Datatype: spb.TypeBoolean, Value: spb.Value{Kind: spb.KindBool}},
+		spb.Metric{Name: "Offset", Datatype: spb.TypeInt16, Value: spb.Value{Kind: spb.KindInt}})))
+	for topic, ok := range map[string]bool{
+		"spb/g/e/Setpoints/Temp": true, "spb/g/e/valve/Open": true,
+		"spb/g/e/Level": false, "spb/g/e/valve/Offset": false,
+	} {
+		_, _, err := tr.Command(topic, []byte("1"))
+		if ok != (err == nil) || (!ok && !errors.Is(err, ErrNotWritable)) {
+			t.Errorf("%s: %v (writable %v)", topic, err, ok)
+		}
+	}
+	writable := map[string]bool{}
+	for _, n := range tr.Nodes("", true) {
+		for _, m := range n.Metrics {
+			writable[m.Topic] = m.Writable
+		}
+		for _, d := range n.Devices {
+			for _, m := range d.Metrics {
+				writable[m.Topic] = m.Writable
+			}
+		}
+	}
+	if !writable["spb/g/e/Setpoints/Temp"] || writable["spb/g/e/Level"] || !writable["spb/g/e/valve/Open"] || writable["spb/g/e/valve/Offset"] {
+		t.Fatalf("writable flags: %v", writable)
 	}
 }

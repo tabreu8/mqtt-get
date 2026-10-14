@@ -71,7 +71,7 @@ var sparkplugAdminTools = []*tool{
 	{
 		Name: "configure_sparkplug",
 		Description: "Change Sparkplug B support (only the given fields change; saved). When enabled, spBv1.0 messages are decoded into plain topics with JSON values. " +
-			"rebirth lets mqtt-get request births from nodes it can't decode; commands lets publish write to Sparkplug metrics (sent as NCMD/DCMD, typed by the metric's birth).",
+			"rebirth lets mqtt-get request births from nodes it can't decode; commands lets publish write to Sparkplug metrics (sent as NCMD/DCMD, typed by the metric's birth), limited to commands_filter when set.",
 		InputSchema: object(map[string]any{
 			"enabled":              boolean("Decode Sparkplug B messages"),
 			"prefix":               str(`Prefix of the translated topics (default "spb")`),
@@ -79,6 +79,7 @@ var sparkplugAdminTools = []*tool{
 			"rebirth":              boolean("Request a rebirth when a node's metrics can't be decoded or messages were lost (default false)"),
 			"rebirth_interval_sec": integer("Minimum seconds between rebirth requests per node (default 30)", 1, 86400),
 			"commands":             boolean("Allow writes to Sparkplug metrics through publish (default false)"),
+			"commands_filter":      strList("Only metrics whose translated topic matches one of these topic filters are writable (e.g. [\"spb/plant1/+/+/Setpoints/#\"]); empty: all"),
 		}),
 		Annotations: annotations("Configure Sparkplug B", false, true, true, true),
 		scope:       config.ScopeAdmin,

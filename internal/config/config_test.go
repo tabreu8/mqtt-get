@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -178,6 +179,15 @@ func TestSparkplugFromEnv(t *testing.T) {
 	if !ok || err != nil || !s.Enabled || s.Prefix != "uns/sparkplug" || !s.Commands || s.Rebirth || s.RebirthIntervalSec != 30 {
 		t.Fatalf("%+v %v", s, err)
 	}
+	env["SPARKPLUG_COMMANDS_FILTER"] = " spb/a/#, ,spb/+/e/X "
+	if s, _, err := SparkplugFromEnv(); err != nil || !reflect.DeepEqual(s.CommandsFilter, []string{"spb/a/#", "spb/+/e/X"}) {
+		t.Fatalf("commands filter: %q %v", s.CommandsFilter, err)
+	}
+	env["SPARKPLUG_COMMANDS_FILTER"] = "spb/#/x"
+	if _, _, err := SparkplugFromEnv(); err == nil {
+		t.Fatal("invalid commands filter accepted")
+	}
+	delete(env, "SPARKPLUG_COMMANDS_FILTER")
 	env["SPARKPLUG_PREFIX"] = "a/+/b"
 	if _, _, err := SparkplugFromEnv(); err == nil {
 		t.Fatal("wildcard prefix accepted")

@@ -41,6 +41,9 @@ func (s *Service) applySparkplug(c config.Sparkplug) {
 		s.spb.Store(nil)
 		return
 	}
+	if old := s.spb.Load(); old != nil && old.SetConfig(c) {
+		return // same prefix: keep the births, aliases and node states
+	}
 	s.spb.Store(sparkplug.New(c, s.sparkplugPublish))
 }
 
@@ -80,6 +83,9 @@ func (s *Service) sparkplugCommands(msgs []mqttc.Message) ([]mqttc.Message, erro
 		if err != nil {
 			if errors.Is(err, sparkplug.ErrNotMetric) {
 				return nil, &Error{Kind: NotFound, Msg: err.Error()}
+			}
+			if errors.Is(err, sparkplug.ErrNotWritable) {
+				return nil, &Error{Kind: Forbidden, Msg: err.Error()}
 			}
 			return nil, Invalidf("%s", err.Error())
 		}

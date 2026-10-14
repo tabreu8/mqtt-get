@@ -205,6 +205,17 @@ func TestSparkplugEndToEnd(t *testing.T) {
 		}
 	}
 
+	// commands_filter limits which metrics are writable.
+	if code, out, _ := e.do("PUT", "/api/v1/sparkplug", e.admin, `{"enabled":true,"rebirth":true,"rebirth_interval_sec":1,"commands":true,"commands_filter":["spb/+/+/+/Other/#"]}`); code != 200 {
+		t.Fatalf("commands_filter: %d %s", code, out)
+	}
+	if code, out, _ := e.do("POST", "/api/v1/publish/spb/plant/gw1/press/Setpoint", e.admin, "62"); code != 403 || !strings.Contains(out, "commands_filter") {
+		t.Fatalf("write outside commands_filter: %d %s", code, out)
+	}
+	if code, _, _ := e.do("PUT", "/api/v1/sparkplug", e.admin, `{"enabled":true,"commands":true,"commands_filter":["a/#/b"]}`); code != 400 {
+		t.Fatal("invalid commands_filter accepted")
+	}
+
 	// Manual rebirth, rate limited per node.
 	time.Sleep(1100 * time.Millisecond)
 	if code, out, _ := e.do("POST", "/api/v1/sparkplug/nodes/plant/gw1/rebirth", e.admin, ""); code != 200 {

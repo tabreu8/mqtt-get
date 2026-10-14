@@ -489,6 +489,10 @@ type Sparkplug struct {
 	// Commands lets publishes to translated metric topics be sent to the
 	// edge node as NCMD/DCMD writes.
 	Commands bool `json:"commands,omitempty"`
+	// CommandsFilter limits writes to the translated metric topics matching
+	// one of these topic filters (e.g. "spb/plant1/+/+/Setpoints/#").
+	// Empty: every metric is writable when Commands is on.
+	CommandsFilter []string `json:"commands_filter,omitempty"`
 }
 
 // Normalize fills defaults.
@@ -500,6 +504,13 @@ func (s *Sparkplug) Normalize() {
 	if s.RebirthIntervalSec <= 0 {
 		s.RebirthIntervalSec = 30
 	}
+	var filters []string
+	for _, f := range s.CommandsFilter {
+		if f = strings.TrimSpace(f); f != "" {
+			filters = append(filters, f)
+		}
+	}
+	s.CommandsFilter = filters
 }
 
 // Validate checks the settings.
@@ -512,6 +523,14 @@ func (s *Sparkplug) Validate() error {
 	}
 	if s.RebirthIntervalSec > 86400 {
 		return errors.New("rebirth_interval_sec must be <= 86400")
+	}
+	if len(s.CommandsFilter) > 1000 {
+		return errors.New("commands_filter: at most 1000 filters")
+	}
+	for _, f := range s.CommandsFilter {
+		if err := topic.ValidateFilter(f); err != nil {
+			return fmt.Errorf("commands_filter %q: %w", f, err)
+		}
 	}
 	return nil
 }
@@ -629,6 +648,7 @@ func SparkplugFromEnv() (s Sparkplug, ok bool, err error) {
 		Rebirth:            envBool("SPARKPLUG_REBIRTH", false),
 		RebirthIntervalSec: envInt("SPARKPLUG_REBIRTH_INTERVAL_SEC", 0),
 		Commands:           envBool("SPARKPLUG_COMMANDS", false),
+		CommandsFilter:     envList("SPARKPLUG_COMMANDS_FILTER"),
 	}
 	s.Normalize()
 	return s, true, s.Validate()

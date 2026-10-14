@@ -269,6 +269,8 @@ curl -X POST -H "Authorization: Bearer $KEY" --data 61.5 localhost:8080/api/v1/p
 
 The payload is the value (`61.5`, `true`, `"text"`) or `{"value": …}`. The write is encoded the way the edge node encoded that metric in its birth: implementations differ on which protobuf field carries some types (for example UInt32 in `int_value` or `long_value`), and mqtt-get follows the device. It is checked against the metric's type: a range error or a non-number for a Float is rejected with `400`, and a metric with no birth seen gives `404`. Agents use `publish` or `publish_and_wait` the same way. `publish_and_wait` on the metric's own topic returns the device's confirmation (its next data message for that metric).
 
+To make only some metrics writable, set `commands_filter` to topic filters of translated topics, for example `["spb/plant1/+/+/Setpoints/#", "spb/plant1/press-gw/Press3/Mode"]`. Writes to other metrics are rejected with `403`, and `/api/v1/sparkplug/nodes?metrics=true` marks each writable metric with `"writable":true`.
+
 ### Conformance
 
 mqtt-get acts as a Sparkplug 3.0 host application that **observes**: it decodes and tracks every edge node, but it is not a *primary* host application. The places where it deliberately differs from, or doesn't cover, the specification:
@@ -287,9 +289,10 @@ mqtt-get acts as a Sparkplug 3.0 host application that **observes**: it decodes 
 | `rebirth` | `SPARKPLUG_REBIRTH` | `false` | Request births from nodes that can't be decoded or lost messages (publishes `NCMD`) |
 | `rebirth_interval_sec` | `SPARKPLUG_REBIRTH_INTERVAL_SEC` | `30` | Minimum time between rebirth requests to one node |
 | `commands` | `SPARKPLUG_COMMANDS` | `false` | Allow writes through publish (needs the `publish` scope) |
+| `commands_filter` | `SPARKPLUG_COMMANDS_FILTER` (comma-separated) | all | Topic filters of the metrics that may be written |
 | `keep_raw` | `SPARKPLUG_KEEP_RAW` | `false` | Also store the raw protobuf messages |
 
-Settings saved through the API, MCP (`configure_sparkplug`) or the web UI (Broker tab) take precedence over the environment. The broker subscriptions must include `spBv1.0/#` (the default `#` does); `GET /api/v1/sparkplug` warns when they don't.
+Settings saved through the API, MCP (`configure_sparkplug`) or the web UI (Broker tab) take precedence over the environment. Changing them keeps what mqtt-get knows about the edge nodes, except a prefix change, which starts over. The broker subscriptions must include `spBv1.0/#` (the default `#` does); `GET /api/v1/sparkplug` warns when they don't.
 
 `GET /api/v1/sparkplug/nodes?metrics=true` (MCP: `list_sparkplug_nodes`) lists edge nodes and devices with their online state, `bdSeq`, sequence errors and every metric with its type, unit and topic. `POST /api/v1/sparkplug/nodes/{group}/{edge_node}/rebirth` (MCP: `request_sparkplug_rebirth`) asks a node for a rebirth.
 

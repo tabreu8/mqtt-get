@@ -124,7 +124,8 @@ type Stats struct {
 // Translator turns Sparkplug B messages into plain topics with JSON values
 // and translates writes to those topics into NCMD/DCMD commands.
 type Translator struct {
-	cfg     config.Sparkplug
+	cfg     atomic.Pointer[config.Sparkplug]
+	prefix  string // fixed for the translator's life
 	publish Publisher
 	now     func() time.Time
 
@@ -137,12 +138,25 @@ type Translator struct {
 
 // New creates a translator. cfg must be normalized and valid.
 func New(cfg config.Sparkplug, publish Publisher) *Translator {
-	return &Translator{cfg: cfg, publish: publish, now: time.Now,
+	t := &Translator{prefix: cfg.Prefix, publish: publish, now: time.Now,
 		nodes: map[string]*node{}, byTopic: map[string]*metric{}}
+	t.cfg.Store(&cfg)
+	return t
 }
 
 // Config returns the translator's settings.
-func (t *Translator) Config() config.Sparkplug { return t.cfg }
+func (t *Translator) Config() config.Sparkplug { return *t.cfg.Load() }
+
+// SetConfig changes the settings, keeping what the translator knows about
+// the edge nodes. It returns false (and changes nothing) when the prefix
+// differs: that needs a new translator.
+func (t *Translator) SetConfig(cfg config.Sparkplug) bool {
+	if cfg.Prefix != t.prefix {
+		return false
+	}
+	t.cfg.Store(&cfg)
+	return true
+}
 
 // IsSparkplug reports whether name is in the Sparkplug B namespace.
 func IsSparkplug(name string) bool {
@@ -186,7 +200,7 @@ func sanitize(s string) string {
 
 func (t *Translator) metricTopic(group, edge, dev, name string) string {
 	var b strings.Builder
-	b.WriteString(t.cfg.Prefix)
+	b.WriteString(t.prefix)
 	b.WriteByte('/')
 	b.WriteString(group)
 	b.WriteByte('/')
@@ -637,10 +651,11 @@ func CommandTopic(group, edge, dev string) string {
 // requestRebirthLocked sends a rebirth request when automatic requests are
 // enabled (or force), at most once per interval per node.
 func (t *Translator) requestRebirthLocked(n *node, now time.Time, force bool) bool {
-	if (!t.cfg.Rebirth && !force) || t.publish == nil {
+	cfg := t.cfg.Load()
+	if (!cfg.Rebirth && !force) || t.publish == nil {
 		return false
 	}
-	if !n.rebirthAt.IsZero() && now.Sub(n.rebirthAt) < time.Duration(t.cfg.RebirthIntervalSec)*time.Second {
+	if !n.rebirthAt.IsZero() && now.Sub(n.rebirthAt) < time.Duration(cfg.RebirthIntervalSec)*time.Second {
 		return false
 	}
 	n.rebirthAt = now
@@ -677,6 +692,27 @@ func (t *Translator) RequestRebirth(group, edge string) (bool, error) {
 // Sparkplug metric.
 var ErrNotMetric = errors.New("not a known Sparkplug metric")
 
+// ErrNotWritable is returned when writing to a metric that commands_filter
+// doesn't allow.
+var ErrNotWritable = errors.New("writing to this Sparkplug metric is not allowed")
+
+// writable reports whether commands may write to the metric topic name.
+func (t *Translator) writable(name string) bool {
+	cfg := t.cfg.Load()
+	if !cfg.Commands {
+		return false
+	}
+	if len(cfg.CommandsFilter) == 0 {
+		return true
+	}
+	for _, f := range cfg.CommandsFilter {
+		if topic.Match(f, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsMetricTopic reports whether name is the translated topic of a metric.
 func (t *Translator) IsMetricTopic(name string) bool {
 	t.mu.RLock()
@@ -686,13 +722,13 @@ func (t *Translator) IsMetricTopic(name string) bool {
 
 // InPrefix reports whether name is under the translated topic prefix.
 func (t *Translator) InPrefix(name string) bool {
-	return strings.HasPrefix(name, t.cfg.Prefix+"/")
+	return strings.HasPrefix(name, t.prefix+"/")
 }
 
 // Command converts a write to a translated metric topic into an NCMD or
 // DCMD message (topic and Sparkplug payload), typed by the metric's birth.
 func (t *Translator) Command(name string, payload []byte) (cmdTopic string, cmd []byte, err error) {
-	if !t.cfg.Commands {
+	if !t.cfg.Load().Commands {
 		return "", nil, errors.New("writing to Sparkplug metrics is disabled (enable sparkplug commands)")
 	}
 	t.mu.RLock()
@@ -700,6 +736,9 @@ func (t *Translator) Command(name string, payload []byte) (cmdTopic string, cmd 
 	t.mu.RUnlock()
 	if m == nil {
 		return "", nil, fmt.Errorf("%w: %q (no birth certificate seen for it; the edge node must publish its births first)", ErrNotMetric, name)
+	}
+	if !t.writable(name) {
+		return "", nil, fmt.Errorf("%w: %q is not in sparkplug commands_filter", ErrNotWritable, name)
 	}
 	group, edge := t.nodeOf(m)
 	v, err := ValueFromJSON(m.datatype, payload)
@@ -737,7 +776,7 @@ func sameKind(v spb.Value, dt spb.DataType, birth spb.Kind) spb.Value {
 
 // nodeOf finds the node of a metric (from its translated topic).
 func (t *Translator) nodeOf(m *metric) (group, edge string) {
-	rest := strings.TrimPrefix(m.topic, t.cfg.Prefix+"/")
+	rest := strings.TrimPrefix(m.topic, t.prefix+"/")
 	group, rest, _ = strings.Cut(rest, "/")
 	edge, _, _ = strings.Cut(rest, "/")
 	return group, edge
@@ -752,6 +791,9 @@ type MetricInfo struct {
 	Type  string  `json:"type"`
 	Alias *uint64 `json:"alias,omitempty"`
 	Unit  string  `json:"unit,omitempty"`
+	// Writable: publishing to Topic sends a command (commands enabled and
+	// allowed by commands_filter).
+	Writable bool `json:"writable,omitempty"`
 }
 
 // DeviceInfo describes a device.
@@ -794,10 +836,10 @@ func tp(t time.Time) *time.Time {
 	return &u
 }
 
-func metricInfos(defs map[string]*metric) []MetricInfo {
+func (t *Translator) metricInfos(defs map[string]*metric) []MetricInfo {
 	out := make([]MetricInfo, 0, len(defs))
 	for _, m := range defs {
-		mi := MetricInfo{Name: m.name, Topic: m.topic, Type: m.datatype.String(), Unit: m.unit}
+		mi := MetricInfo{Name: m.name, Topic: m.topic, Type: m.datatype.String(), Unit: m.unit, Writable: t.writable(m.topic)}
 		if m.hasAlias {
 			a := m.alias
 			mi.Alias = &a
@@ -831,12 +873,12 @@ func (t *Translator) Nodes(group string, metrics bool) []NodeInfo {
 			ni.BdSeq = &b
 		}
 		if metrics {
-			ni.Metrics = metricInfos(n.metrics)
+			ni.Metrics = t.metricInfos(n.metrics)
 		}
 		for _, d := range n.devices {
 			di := DeviceInfo{ID: d.id, Online: d.online && n.online, BirthAt: tp(d.birthAt), DeathAt: tp(d.deathAt), Count: len(d.metrics)}
 			if metrics {
-				di.Metrics = metricInfos(d.metrics)
+				di.Metrics = t.metricInfos(d.metrics)
 			}
 			ni.Devices = append(ni.Devices, di)
 		}
