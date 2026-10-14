@@ -101,7 +101,7 @@ func (s *Service) Ingest(e store.Entry) {
 		s.hostState(sp, &e)
 		if out, handled := sp.ProcessAppend(e, nil); handled {
 			for i := range out {
-				s.ingestRef(out[i].Entry, out[i].Ref)
+				s.ingestRef(out[i].Entry, out[i].Ref, out[i].History)
 			}
 			if !sp.Config().KeepRaw {
 				return
@@ -111,13 +111,14 @@ func (s *Service) Ingest(e store.Entry) {
 	s.ingest(e)
 }
 
-func (s *Service) ingest(e store.Entry) { s.ingestRef(e, nil) }
+func (s *Service) ingest(e store.Entry) { s.ingestRef(e, nil, nil) }
 
-// ingestRef is ingest storing through ref (see store.SetRef).
-func (s *Service) ingestRef(e store.Entry, ref *store.Ref) {
+// ingestRef is ingest storing and recording through refs (see
+// store.SetRef and history.AddRef).
+func (s *Service) ingestRef(e store.Entry, ref *store.Ref, hist *history.Ref) {
 	if !e.Transient {
 		s.store.SetRef(&e, ref)
-		s.hist.Add(&e)
+		s.hist.AddRef(&e, hist)
 	}
 	s.hooks.Dispatch(e)
 	s.watch.dispatch(e)

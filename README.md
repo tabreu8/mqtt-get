@@ -329,6 +329,8 @@ Measured on a 4-vCPU VM with `cmd/floodbroker -sparkplug 1000 -metrics K`, a fak
 
 Plain MQTT messages on the same machine: about 4.1M messages/s. A Sparkplug message carries several values, and each one becomes its own topic with a JSON value, so messages/s depends on the message size. Counted in values, Sparkplug matches plain ingest from about 10 metrics per message. A one-metric message costs about twice a plain one, for the protobuf decoding, the node state and the JSON. Plain MQTT traffic is unaffected by Sparkplug support: it costs one prefix check.
 
+Recording every Sparkplug value in [history](#history) as well (`HISTORY_TOPICS=spb/#`) gives 313k messages/s (3.1M values/s) with 10 metrics per message.
+
 On one core, a 10-metric message takes about 7 µs (`go test -run '^$' -bench Ingest ./test/sparkplug` measures it without a broker or network, also through the workers).
 
 A load test (`test/sparkplug/load_test.go`) runs mqtt-get as primary host against 2,000 simulated edge nodes (one device each, 106,000 metrics) on an embedded broker in the same process, and checks every translated value:

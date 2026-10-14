@@ -77,14 +77,15 @@ type rule struct {
 	maxBytes    int64 // 0 = none
 
 	topics  atomic.Int64
-	points  atomic.Int64
-	bytes   atomic.Int64
+	points  counter
+	bytes   counter
 	dropped atomic.Uint64
 }
 
 func newRule(c config.HistoryRule, order int) *rule {
 	c.Normalize()
 	return &rule{
+		points: counter{fold: pointsFold}, bytes: counter{fold: foldFor(c.MaxBytes)},
 		cfg: c, order: order, maxPoints: c.MaxPoints,
 		maxAge:      int64(c.MaxAgeSec) * int64(time.Second),
 		minInterval: int64(c.MinIntervalMs) * int64(time.Millisecond),
@@ -125,6 +126,7 @@ type series struct {
 	bytes   int64 // points only
 	nameLen int64 // topic name length, accounted in every point
 	dead    bool  // removed from the map: ignore late writes
+	stripe  uint8 // counter stripe its changes go to
 }
 
 func (s *series) at(i int) *point { return &s.buf[(s.head+i)%len(s.buf)] }
@@ -153,14 +155,64 @@ type History struct {
 	now      func() time.Time
 
 	topics  atomic.Int64
-	points  atomic.Int64
-	bytes   atomic.Int64
+	points  counter
+	bytes   counter
 	dropped atomic.Uint64
+}
+
+// counter is a total updated from many cores. Changes go to one of its
+// stripes and are folded into the total once they exceed fold, so
+// concurrent writers rarely touch the same cache line. Approx misses at
+// most counterStripes*fold; Load is exact.
+type counter struct {
+	total   atomic.Int64
+	fold    int64
+	stripes [counterStripes]struct {
+		v atomic.Int64
+		_ [56]byte
+	}
+}
+
+const (
+	counterStripes = 64
+	pointsFold     = 256
+)
+
+// foldFor is the fold of a byte counter with budget max: a budget can be
+// exceeded by at most 1% (64 stripes × max/6400), and by 1 MiB at most.
+func foldFor(max int64) int64 {
+	if max <= 0 {
+		return 16 << 10
+	}
+	return min(16<<10, max/6400)
+}
+
+// Add adds d to the total (rare changes).
+func (c *counter) Add(d int64) { c.total.Add(d) }
+
+// AddStriped adds d through a stripe (frequent changes).
+func (c *counter) AddStriped(stripe uint8, d int64) {
+	st := &c.stripes[stripe%counterStripes]
+	if v := st.v.Add(d); v > c.fold || v < -c.fold {
+		c.total.Add(st.v.Swap(0))
+	}
+}
+
+// Approx returns the total without the changes still in the stripes.
+func (c *counter) Approx() int64 { return c.total.Load() }
+
+// Load returns the exact total.
+func (c *counter) Load() int64 {
+	n := c.total.Load()
+	for i := range c.stripes {
+		n += c.stripes[i].v.Load()
+	}
+	return n
 }
 
 // New creates an empty history with no rules.
 func New(o Options) *History {
-	h := &History{maxBytes: o.MaxBytes, now: o.Now}
+	h := &History{maxBytes: o.MaxBytes, now: o.Now, points: counter{fold: pointsFold}, bytes: counter{fold: foldFor(o.MaxBytes)}}
 	if h.now == nil {
 		h.now = time.Now
 	}
@@ -178,10 +230,23 @@ func (h *History) shard(key string) *shard {
 }
 
 // Add records e if a rule matches its topic. It never blocks on other topics.
-func (h *History) Add(e *store.Entry) {
+func (h *History) Add(e *store.Entry) { h.AddRef(e, nil) }
+
+// Ref caches the series of a topic for AddRef. The zero value is ready to
+// use. Use one Ref for one topic only.
+type Ref struct{ s atomic.Pointer[series] }
+
+// AddRef is Add through ref (nil: none), which caches e.Topic's series so
+// that recording it again skips looking it up.
+func (h *History) AddRef(e *store.Entry, ref *Ref) {
 	rs := h.rules.Load()
 	if rs.trie.Len() == 0 {
 		return
+	}
+	if ref != nil {
+		if s := ref.s.Load(); s != nil && h.add(s, e) {
+			return
+		}
 	}
 	// Recorded topics skip the trie: their series knows its rule.
 	sh := h.shard(e.Topic)
@@ -195,6 +260,9 @@ func (h *History) Add(e *store.Entry) {
 		if s = h.create(sh, e.Topic); s == nil {
 			return
 		}
+	}
+	if ref != nil {
+		ref.s.Store(s)
 	}
 	h.add(s, e)
 }
@@ -217,7 +285,7 @@ func (h *History) create(sh *shard, name string) *series {
 		h.dropped.Add(1)
 		return nil
 	}
-	s := &series{rule: r, nameLen: int64(len(name))}
+	s := &series{rule: r, nameLen: int64(len(name)), stripe: uint8(maphash.String(shardSeed, name) >> 56)}
 	sh.m[strings.Clone(name)] = s
 	h.topics.Add(1)
 	h.bytes.Add(cost)
@@ -227,25 +295,27 @@ func (h *History) create(sh *shard, name string) *series {
 }
 
 func (h *History) over(r *rule, size int64) bool {
-	return (h.maxBytes > 0 && h.bytes.Load()+size > h.maxBytes) ||
-		(r.maxBytes > 0 && r.bytes.Load()+size > r.maxBytes)
+	return (h.maxBytes > 0 && h.bytes.Approx()+size > h.maxBytes) ||
+		(r.maxBytes > 0 && r.bytes.Approx()+size > r.maxBytes)
 }
 
-func (h *History) add(s *series, e *store.Entry) {
+// add records e in s. It returns false when s was removed (the topic
+// must be looked up again).
+func (h *History) add(s *series, e *store.Entry) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.dead {
-		return
+		return false
 	}
 	r := s.rule
 	if s.n > 0 {
 		last := s.at(s.n - 1)
 		// Time going backwards (out-of-order delivery) is not downsampled.
 		if r.minInterval > 0 && e.Time >= last.time && e.Time-last.time < r.minInterval {
-			return
+			return true
 		}
 		if r.cfg.OnChange && bytes.Equal(last.bytes(), e.Payload) {
-			return
+			return true
 		}
 	}
 	// Changes are accounted once at the end: in the steady state (a full
@@ -264,10 +334,10 @@ func (h *History) add(s *series, e *store.Entry) {
 			dPoints--
 		}
 		if h.over(r, size+dBytes) {
-			h.account(r, dPoints, dBytes)
+			h.account(s, r, dPoints, dBytes)
 			r.dropped.Add(1)
 			h.dropped.Add(1)
-			return
+			return true
 		}
 	}
 	if s.n == r.maxPoints {
@@ -280,17 +350,18 @@ func (h *History) add(s *series, e *store.Entry) {
 	*s.at(s.n) = point{payload: unsafe.SliceData(e.Payload), n: uint32(len(e.Payload)), qos: e.QoS, retained: e.Retained, time: e.Time}
 	s.n++
 	s.bytes += size
-	h.account(r, dPoints+1, dBytes+size)
+	h.account(s, r, dPoints+1, dBytes+size)
+	return true
 }
 
-func (h *History) account(r *rule, points, size int64) {
+func (h *History) account(s *series, r *rule, points, size int64) {
 	if points != 0 {
-		h.points.Add(points)
-		r.points.Add(points)
+		h.points.AddStriped(s.stripe, points)
+		r.points.AddStriped(s.stripe, points)
 	}
 	if size != 0 {
-		h.bytes.Add(size)
-		r.bytes.Add(size)
+		h.bytes.AddStriped(s.stripe, size)
+		r.bytes.AddStriped(s.stripe, size)
 	}
 }
 
@@ -341,7 +412,7 @@ func (s *series) trimOlder(cutoff int64) (dPoints, dBytes int64) {
 // dropOlder is trimOlder with accounting.
 func (h *History) dropOlder(s *series, cutoff int64) {
 	dp, db := s.trimOlder(cutoff)
-	h.account(s.rule, dp, db)
+	h.account(s, s.rule, dp, db)
 }
 
 // dropOldest drops points until at most keep remain, with accounting.
@@ -351,7 +422,7 @@ func (h *History) dropOldest(s *series, keep int) {
 		db -= s.pop()
 		dp--
 	}
-	h.account(s.rule, dp, db)
+	h.account(s, s.rule, dp, db)
 }
 
 // RuleStats are per-rule counters.

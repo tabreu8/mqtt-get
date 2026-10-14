@@ -153,7 +153,7 @@ func (r *receiver) Receive(e store.Entry) {
 	s := r.s
 	sp := s.spb.Load()
 	if sp == nil || !sparkplug.IsSparkplug(e.Topic) {
-		s.ingestRef(e, nil) // plain MQTT: nothing else to decide
+		s.ingestRef(e, nil, nil) // plain MQTT: nothing else to decide
 		return
 	}
 	{
@@ -247,7 +247,7 @@ func (s *Service) worker(ch chan []store.Entry) {
 			var handled bool
 			out, handled = sp.ProcessAppend(e, out[:0])
 			for i := range out {
-				s.ingestRef(out[i].Entry, out[i].Ref)
+				s.ingestRef(out[i].Entry, out[i].Ref, out[i].History)
 			}
 			clear(out) // don't keep the payloads alive until the next message
 			if !handled || sp.Config().KeepRaw {
@@ -314,7 +314,7 @@ func (s *Service) sparkplugLoop() {
 		case <-t.C:
 			if sp := s.spb.Load(); sp != nil {
 				for _, tr := range sp.FlushTranslated() {
-					s.ingestRef(tr.Entry, tr.Ref)
+					s.ingestRef(tr.Entry, tr.Ref, tr.History)
 				}
 			}
 		case <-save.C:

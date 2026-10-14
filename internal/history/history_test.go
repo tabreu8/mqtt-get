@@ -395,3 +395,37 @@ func BenchmarkAddUnmatched(b *testing.B) {
 		h.Add(&store.Entry{Topic: "devices/1/state", Payload: p, Time: int64(i)})
 	}
 }
+
+func TestAddRef(t *testing.T) {
+	h, _ := newTest(0, config.HistoryRule{ID: "a", Topics: []string{"x/#"}, MaxPoints: 10})
+	var ref Ref
+	addRef := func(v string, ts int64) {
+		h.AddRef(&store.Entry{Topic: "x/1", Payload: []byte(v), Time: ts}, &ref)
+	}
+	get := func() []string {
+		pts, _, _, _ := h.Get("x/1", 0, 0, 0)
+		return payloads(pts)
+	}
+	addRef("1", 1*sec)
+	addRef("2", 2*sec)
+	eq(t, get(), "1", "2")
+	if ref.s.Load() == nil {
+		t.Fatal("series not cached")
+	}
+	// Removed (delete, rule change): looked up again.
+	h.Delete("x/1")
+	addRef("3", 3*sec)
+	eq(t, get(), "3")
+	h.SetRules([]config.HistoryRule{{ID: "b", Topics: []string{"y/#"}}})
+	addRef("4", 4*sec)
+	if _, _, _, ok := h.Get("x/1", 0, 0, 0); ok {
+		t.Fatal("recorded without a matching rule")
+	}
+	h.SetRules([]config.HistoryRule{{ID: "c", Topics: []string{"x/1"}, MaxPoints: 3}})
+	addRef("5", 5*sec)
+	addRef("6", 6*sec)
+	eq(t, get(), "5", "6")
+	if st := h.Stats(); st.Points != 2 || st.Topics != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}

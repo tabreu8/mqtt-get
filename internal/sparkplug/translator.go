@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
+	"github.com/tabreu8/mqtt-get/internal/history"
 	"github.com/tabreu8/mqtt-get/internal/store"
 	"github.com/tabreu8/mqtt-get/internal/topic"
 	spb "github.com/tabreu8/mqtt-get/sparkplug"
@@ -63,8 +64,9 @@ type metric struct {
 	hasAlias bool
 	topic    string // translated topic
 	unit     string
-	unitJSON string    // `,"unit":"…"`, built on first use
-	ref      store.Ref // where topic is stored
+	unitJSON string      // `,"unit":"…"`, built on first use
+	ref      store.Ref   // where topic is stored
+	hist     history.Ref // where topic is recorded
 	// last value, to re-publish it marked offline on death
 	value   []byte // JSON
 	ts      uint64 // metric timestamp (ms)
@@ -405,10 +407,12 @@ func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
 }
 
 // Translated is a translated metric value: the entry to store, and the
-// reference to store it through (store.SetRef).
+// references to store and record it through (store.SetRef,
+// history.AddRef).
 type Translated struct {
-	Entry store.Entry
-	Ref   *store.Ref
+	Entry   store.Entry
+	Ref     *store.Ref
+	History *history.Ref
 }
 
 func entries(tr []Translated) []store.Entry {
@@ -984,7 +988,7 @@ func (t *Translator) value(em *emit, m *metric, pm *spb.Metric, e *store.Entry, 
 		m.value, m.ts, m.recv, m.qos, m.hasLast = payload[vstart:vend:vend], ts, recv, e.QoS, true
 	}
 	// Transient values are streamed (watchers, webhooks) but not stored.
-	em.out = append(em.out, Translated{store.Entry{Topic: m.topic, Payload: payload, QoS: e.QoS, Time: recv, Transient: pm.IsTransient}, &m.ref})
+	em.out = append(em.out, Translated{store.Entry{Topic: m.topic, Payload: payload, QoS: e.QoS, Time: recv, Transient: pm.IsTransient}, &m.ref, &m.hist})
 }
 
 // envelopeTail completes {"value":<value> with the metadata (pm is the
@@ -1102,7 +1106,7 @@ func (t *Translator) offline(em *emit, defs map[string]*metric) {
 		block = append(block, `{"value":`...)
 		block = append(block, m.value...)
 		block = t.envelopeTail(em, block, m, m.datatype, m.ts, false, nil)
-		em.out = append(em.out, Translated{store.Entry{Topic: m.topic, Payload: block[start:len(block):len(block)], QoS: m.qos, Time: m.recv}, &m.ref})
+		em.out = append(em.out, Translated{store.Entry{Topic: m.topic, Payload: block[start:len(block):len(block)], QoS: m.qos, Time: m.recv}, &m.ref, &m.hist})
 	}
 }
 
