@@ -286,6 +286,9 @@ Edge nodes that track a primary host then publish their births when they see it 
 
 ### Conformance
 
+**Eclipse Sparkplug TCK.** CI runs the host application tests of the official [Sparkplug TCK](https://sparkplug.eclipse.org/) 3.0.0 against mqtt-get as primary host application (`test/tck`): session establishment, session termination, sending commands, edge node session termination and message ordering, each with the lean and paho clients over MQTT 3.1.1 and MQTT 5. All of the TCK's checks pass, except two that can't apply to these runs: the clean-session check for the other MQTT version, and the will a broker publishes when a host disconnects without a DISCONNECT packet (mqtt-get shuts down cleanly). The TCK asks an operator to act and to confirm what the host shows; the test does this through the REST API (rebirth requests, writes to metric topics, node and device state, `online:false` values). The TCK itself (EPL-2.0) is downloaded from eclipse.org when the test runs, not stored in this repository. Run it locally with `test/tck/run.sh` (needs Java 11+, Maven and port 1883). This is not a Sparkplug compatibility listing, which is a separate process run by the Eclipse Foundation.
+
+
 mqtt-get is a Sparkplug 3.0 host application: by default one that **observes** (it decodes and tracks every edge node), and with `host_id` the *primary* host application. The places where it deliberately differs from, or doesn't cover, the specification:
 
 - **`STATE` only as a primary host.** Without `host_id` it publishes no `STATE`, so edge nodes that wait for a primary host won't treat it as one.
@@ -1300,6 +1303,7 @@ Sparkplug B is also tested against an independent implementation: `test/sparkplu
 python3 -m venv /tmp/spb && /tmp/spb/bin/pip install pysparkplug==0.6.1
 SPARKPLUG_INTEROP_PYTHON=/tmp/spb/bin/python go test -v ./test/sparkplug
 go test -run '^$' -fuzz FuzzDecode -fuzztime 1m ./sparkplug
+test/tck/run.sh   # Eclipse Sparkplug TCK host tests: needs Java 11+, Maven, port 1883
 ```
 
 The regular tests need nothing installed. They start embedded MQTT brokers (plain, TLS, mTLS, WS and WSS, with generated certificates) and cover auth, TLS verification, SNI, password-file rotation, the REST API, webhooks and MCP.
@@ -1314,7 +1318,7 @@ internal/mcp        MCP interface for agents: tools, resources, prompts, complet
 internal/mqttc      broker connections: auth, TLS, dialing, publish, reconnect
 internal/store      sharded latest-value store + JSON encoding
 internal/history    bounded per-topic history: ring buffers, rules, budgets, aggregation, snapshots
-internal/sparkplug  Sparkplug B translator: births, deaths, aliases, rebirths, commands
+internal/sparkplug  Sparkplug B host: births, deaths, aliases, reordering, rebirths, commands, STATE
 sparkplug           public Sparkplug B payload codec (hand-written, fuzzed, standard library only)
 internal/topic      MQTT topic validation, matching, filter trie
 internal/webhook    webhook queues, batching, retries, signatures
@@ -1322,6 +1326,7 @@ internal/state      persisted settings, webhooks, history rules and API keys
 internal/config     configuration model and environment parsing
 test/interop        real-broker interoperability suite + docker-compose
 test/sparkplug      Sparkplug B interop with pysparkplug (independent implementation)
+test/tck            Eclipse Sparkplug TCK host application tests (downloads the TCK; run.sh)
 ```
 
 **Limitations** (by design, for now): enhanced authentication supports SCRAM only; values, history and webhook queues live in memory (history is snapshotted to disk, not written per message); history is short-term context, not a time-series database.

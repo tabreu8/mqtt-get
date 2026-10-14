@@ -105,7 +105,9 @@ func (s *Service) hostPresence(id string) *mqttc.Presence {
 // publishing our online STATE again.
 func (s *Service) hostState(sp *sparkplug.Translator, e *store.Entry) {
 	id := sp.Config().HostID
-	if id == "" || e.Topic != sparkplug.StateTopic(id) || !s.hostOnline.Load() {
+	// Not gated on hostOnline: the offline message can arrive right after
+	// our birth, before the broker's acknowledgement of it.
+	if id == "" || e.Topic != sparkplug.StateTopic(id) || !s.hostMode.Load() {
 		return
 	}
 	online, ts, ok := sparkplug.ParseState(e.Payload)

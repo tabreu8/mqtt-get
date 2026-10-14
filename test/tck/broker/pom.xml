@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Runs HiveMQ Community Edition (Apache-2.0) embedded, with the Sparkplug
+     TCK extension that run.sh downloads. Used only by test/tck. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.github.tabreu8.mqttget</groupId>
+  <artifactId>tck-broker</artifactId>
+  <version>1</version>
+  <properties>
+    <maven.compiler.release>11</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.hivemq</groupId>
+      <artifactId>hivemq-community-edition-embedded</artifactId>
+      <version>2022.1</version>
+    </dependency>
+  </dependencies>
+</project>

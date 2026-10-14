@@ -3,3 +3,4 @@
 /mqtt-get
 *.test
 *.out
+/test/tck/broker/target/

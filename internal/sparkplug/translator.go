@@ -299,7 +299,12 @@ func (t *Translator) handle(n *node, typ, dev string, p *spb.Payload, e *store.E
 	case DBIRTH:
 		out = t.deviceBirth(n, dev, p, e, now)
 	case DDEATH:
-		out = t.deviceDeath(n, dev, now)
+		// The device is offline as of the DDEATH's own timestamp.
+		at := now
+		if p.HasTimestamp {
+			at = time.UnixMilli(int64(p.Timestamp))
+		}
+		out = t.deviceDeath(n, dev, at)
 	case NDATA, DDATA:
 		var unknown bool
 		out, unknown = t.data(n, dev, p, e)

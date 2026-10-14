@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<!-- The TCK's own clients connect to localhost:1883. -->
+<hivemq>
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>127.0.0.1</bind-address>
+        </tcp-listener>
+    </listeners>
+    <anonymous-usage-statistics>
+        <enabled>false</enabled>
+    </anonymous-usage-statistics>
+</hivemq>
