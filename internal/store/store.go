@@ -6,6 +6,7 @@
 package store
 
 import (
+	"hash/maphash"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +30,17 @@ type Entry struct {
 	Transient bool
 	Time      int64  // unix nanoseconds when received
 	Props     *Props // MQTT 5 properties (nil for MQTT 3.1.1 or none)
+	// Ref optionally caches where Topic is stored, for a producer that
+	// sets the same topics over and over (the Sparkplug translator): Set
+	// then skips looking the topic up.
+	Ref *Ref
+}
+
+// Ref caches the slot of a topic for Set. The zero value is ready to use.
+// Use one Ref for one topic only.
+type Ref struct {
+	sl atomic.Pointer[slot]
+	sh atomic.Pointer[shard] // stored before sl, so set whenever sl is
 }
 
 // slot holds the latest value of one topic. It is allocated once per topic
@@ -43,6 +55,7 @@ type slot struct {
 	n        uint32
 	qos      byte
 	retained bool
+	dead     bool // deleted: a Ref pointing here must look the topic up again
 	time     int64
 	props    *Props
 }
@@ -90,52 +103,73 @@ func New(maxTopics int) *Store {
 	return s
 }
 
+// shardSeed seeds the shard hash: the runtime's hardware-accelerated string
+// hash, several times faster than a byte-by-byte hash on topic names.
+var shardSeed = maphash.MakeSeed()
+
 func (s *Store) shard(key string) *shard {
-	// FNV-1a, inlined to avoid allocations.
-	h := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
-		h ^= uint32(key[i])
-		h *= 16777619
-	}
-	return &s.shards[h%shardCount]
+	return &s.shards[maphash.String(shardSeed, key)%shardCount]
 }
 
 // Set stores e as the latest value of e.Topic. It returns false if the value
 // was rejected because the topic limit was reached.
 func (s *Store) Set(e *Entry) bool {
-	sh := s.shard(e.Topic)
-	sh.mu.Lock()
-	old, ok := sh.m[e.Topic]
-	if !ok {
-		if s.maxTopics > 0 && s.count.Load() >= s.maxTopics {
-			sh.mu.Unlock()
-			s.dropped.Add(1)
-			return false
+	var sh *shard
+	old := (*slot)(nil)
+	if e.Ref != nil {
+		if sl := e.Ref.sl.Load(); sl != nil {
+			sh = e.Ref.sh.Load()
+			sh.mu.Lock()
+			if !sl.dead {
+				old = sl
+			}
 		}
-		s.count.Add(1)
-	} else if old.time > e.Time {
+	}
+	if sh == nil {
+		sh = s.shard(e.Topic)
+		sh.mu.Lock()
+	}
+	if old == nil {
+		var ok bool
+		if old, ok = sh.m[e.Topic]; !ok {
+			if s.maxTopics > 0 && s.count.Load() >= s.maxTopics {
+				sh.mu.Unlock()
+				s.dropped.Add(1)
+				return false
+			}
+			s.count.Add(1)
+			// Copy the name: the caller's string may point into a larger
+			// buffer (the lean MQTT reader's topic is a view into the
+			// packet), which the map key would otherwise keep alive.
+			sl := newSlot(e)
+			sh.m[strings.Clone(e.Topic)] = &sl
+			if e.Ref != nil {
+				e.Ref.sh.Store(sh)
+				e.Ref.sl.Store(&sl)
+			}
+			sh.mu.Unlock()
+			return true
+		}
+		if e.Ref != nil {
+			e.Ref.sh.Store(sh)
+			e.Ref.sl.Store(old)
+		}
+	}
+	if old.time > e.Time {
 		// Out-of-order delivery (possible with several shared-subscription
 		// connections): keep the newer value.
 		sh.mu.Unlock()
 		return true
 	}
-	if ok {
-		// In place: no allocation, and the caller's copy of the topic name
-		// is not retained. Fields are written one by one so pointer writes
-		// (which cost a GC write barrier while the collector runs) happen
-		// only when needed: props is nil for all MQTT 3.1.1 traffic.
-		old.payload = unsafe.SliceData(e.Payload)
-		old.n = uint32(len(e.Payload))
-		old.qos, old.retained, old.time = e.QoS, e.Retained, e.Time
-		if old.props != e.Props {
-			old.props = e.Props
-		}
-	} else {
-		// Copy the name: the caller's string may point into a larger
-		// buffer (the lean MQTT reader's topic is a view into the packet),
-		// which the map key would otherwise keep alive forever.
-		sl := newSlot(e)
-		sh.m[strings.Clone(e.Topic)] = &sl
+	// In place: no allocation, and the caller's copy of the topic name is
+	// not retained. Fields are written one by one so pointer writes (which
+	// cost a GC write barrier while the collector runs) happen only when
+	// needed: props is nil for all MQTT 3.1.1 traffic.
+	old.payload = unsafe.SliceData(e.Payload)
+	old.n = uint32(len(e.Payload))
+	old.qos, old.retained, old.time = e.QoS, e.Retained, e.Time
+	if old.props != e.Props {
+		old.props = e.Props
 	}
 	sh.mu.Unlock()
 	return true
@@ -159,8 +193,9 @@ func (s *Store) Get(name string) (*Entry, bool) {
 func (s *Store) Delete(name string) bool {
 	sh := s.shard(name)
 	sh.mu.Lock()
-	_, ok := sh.m[name]
+	sl, ok := sh.m[name]
 	if ok {
+		sl.dead = true
 		delete(sh.m, name)
 		s.count.Add(-1)
 	}
@@ -174,6 +209,9 @@ func (s *Store) Clear() {
 		sh := &s.shards[i]
 		sh.mu.Lock()
 		s.count.Add(-int64(len(sh.m)))
+		for _, sl := range sh.m {
+			sl.dead = true
+		}
 		sh.m = make(map[string]*slot)
 		sh.mu.Unlock()
 	}

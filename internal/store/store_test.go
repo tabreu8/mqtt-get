@@ -131,3 +131,41 @@ func TestPropsJSONAndExpiry(t *testing.T) {
 		t.Fatal("props not stored")
 	}
 }
+
+func TestSetWithRef(t *testing.T) {
+	s := New(0)
+	var ref Ref
+	set := func(v string, ts int64) { s.Set(&Entry{Topic: "a/b", Payload: []byte(v), Time: ts, Ref: &ref}) }
+	get := func() string {
+		e, ok := s.Get("a/b")
+		if !ok {
+			return ""
+		}
+		return string(e.Payload)
+	}
+	set("1", 1)
+	set("2", 2)
+	if get() != "2" || s.Len() != 1 || ref.sl.Load() == nil {
+		t.Fatalf("set through ref: %q", get())
+	}
+	set("old", 1) // older: kept the newer value
+	if get() != "2" {
+		t.Fatal("older value replaced a newer one")
+	}
+	s.Delete("a/b")
+	set("3", 3) // the cached slot is gone: stored again
+	if get() != "3" || s.Len() != 1 {
+		t.Fatalf("after delete: %q, %d topics", get(), s.Len())
+	}
+	s.Clear()
+	set("4", 4)
+	if get() != "4" || s.Len() != 1 {
+		t.Fatalf("after clear: %q, %d topics", get(), s.Len())
+	}
+	// A plain Set and a Ref agree on the same slot.
+	s.Set(&Entry{Topic: "a/b", Payload: []byte("5"), Time: 5})
+	set("6", 6)
+	if get() != "6" || s.Len() != 1 {
+		t.Fatalf("mixed: %q", get())
+	}
+}

@@ -15,6 +15,7 @@ package history
 
 import (
 	"bytes"
+	"hash/maphash"
 	"sort"
 	"strings"
 	"sync"
@@ -170,13 +171,10 @@ func New(o Options) *History {
 	return h
 }
 
+var shardSeed = maphash.MakeSeed()
+
 func (h *History) shard(key string) *shard {
-	x := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
-		x ^= uint32(key[i])
-		x *= 16777619
-	}
-	return &h.shards[x%shardCount]
+	return &h.shards[maphash.String(shardSeed, key)%shardCount]
 }
 
 // Add records e if a rule matches its topic. It never blocks on other topics.
