@@ -201,6 +201,7 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
       <div class="row">
         <div><label>Topic prefix</label><input name="prefix" placeholder="spb"></div>
         <div><label>Minimum seconds between rebirth requests</label><input name="rebirth_interval_sec" type="number" min="1" value="30"></div>
+        <div><label>Primary host id (publishes STATE; empty = observe only)</label><input name="host_id" placeholder="mqtt-get"></div>
         <div><label>Reorder timeout (ms, 0 = off)</label><input name="reorder_timeout_ms" type="number" min="0" max="60000" value="2000"></div>
       </div>
       <label><input type="checkbox" name="rebirth">Request a rebirth when a node's metrics can't be decoded or messages were lost</label>
@@ -605,13 +606,13 @@ async function loadSparkplug() {
   try { v = await api('GET', '/api/v1/sparkplug'); } catch (e) { return; }
   const c = v.config, e = $('#spbForm').elements;
   e.enabled.checked = c.enabled; e.prefix.value = c.prefix || ''; e.rebirth_interval_sec.value = c.rebirth_interval_sec || 30;
-  e.reorder_timeout_ms.value = c.reorder_timeout_ms ?? 2000;
+  e.reorder_timeout_ms.value = c.reorder_timeout_ms ?? 2000; e.host_id.value = c.host_id || '';
   e.rebirth.checked = !!c.rebirth; e.commands.checked = !!c.commands; e.keep_raw.checked = !!c.keep_raw;
   e.commands_filter.value = (c.commands_filter || []).join('\n'); e.persist.checked = c.persist !== false;
   $('#spbHint').textContent = v.hint || '';
   const st = v.stats;
   $('#spbStats').textContent = st ? `${fmtN(st.metrics)} values from ${fmtN(st.messages)} messages · ${st.nodes_online}/${st.nodes} nodes online` +
-    (st.unknown_metrics ? ` · ${fmtN(st.unknown_metrics)} undecodable` : '') + (st.malformed ? ` · ${fmtN(st.malformed)} malformed` : '') + (st.problems ? ` · ${fmtN(st.problems)} protocol problems` : '') + ` · settings: ${v.source}` : `settings: ${v.source}`;
+    (st.unknown_metrics ? ` · ${fmtN(st.unknown_metrics)} undecodable` : '') + (st.malformed ? ` · ${fmtN(st.malformed)} malformed` : '') + (st.problems ? ` · ${fmtN(st.problems)} protocol problems` : '') + (v.host_online === undefined ? '' : ` · primary host ${v.host_online ? 'online' : 'not online yet'}`) + ` · settings: ${v.source}` : `settings: ${v.source}`;
   if (!c.enabled) { $('#spbNodes').innerHTML = '<tr><td colspan=7 class="muted">Disabled</td></tr>'; return; }
   const r = await api('GET', '/api/v1/sparkplug/nodes').catch(() => ({ nodes: [] }));
   const on = x => `<span class="pill ${x ? 'ok' : 'bad'}">${x ? 'online' : 'offline'}</span>`;
@@ -630,7 +631,7 @@ $('#spbForm').onsubmit = async ev => {
   ev.preventDefault();
   const e = ev.target.elements;
   const body = { enabled: e.enabled.checked, prefix: e.prefix.value.trim(), rebirth_interval_sec: parseInt(e.rebirth_interval_sec.value) || 0,
-    reorder_timeout_ms: Math.max(0, parseInt(e.reorder_timeout_ms.value) || 0),
+    reorder_timeout_ms: Math.max(0, parseInt(e.reorder_timeout_ms.value) || 0), host_id: e.host_id.value.trim(),
     rebirth: e.rebirth.checked, commands: e.commands.checked, keep_raw: e.keep_raw.checked, persist: e.persist.checked,
     commands_filter: e.commands_filter.value.split(/[\n,]/).map(x => x.trim()).filter(Boolean) };
   try { await api('PUT', '/api/v1/sparkplug', body); $('#spbErr').textContent = ''; toast('Sparkplug settings saved'); loadSparkplug(); }

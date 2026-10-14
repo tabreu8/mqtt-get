@@ -52,8 +52,14 @@ type Service struct {
 	spb          atomic.Pointer[sparkplug.Translator]
 	spbMu        sync.Mutex
 	envSparkplug *config.Sparkplug
-	stop         chan struct{}
-	bg           sync.WaitGroup
+	// Sparkplug primary host: the host id announced (under spbMu), whether
+	// the current connection's STATE is published, and its timestamp.
+	hostID     string
+	hostMode   atomic.Bool // hostID != ""
+	hostOnline atomic.Bool
+	hostTS     atomic.Int64
+	stop       chan struct{}
+	bg         sync.WaitGroup
 	// brokerSource tells where the active broker config came from
 	// ("saved", "env" or "none").
 	brokerSource atomic.Value
@@ -87,6 +93,7 @@ func New(cfg config.Server, log *slog.Logger, st *state.State) *Service {
 // metric, each going through the same path as a plain message.
 func (s *Service) Ingest(e store.Entry) {
 	if sp := s.spb.Load(); sp != nil && sparkplug.IsSparkplug(e.Topic) {
+		s.hostState(sp, &e)
 		if out, handled := sp.Process(e); handled {
 			for i := range out {
 				s.ingest(out[i])

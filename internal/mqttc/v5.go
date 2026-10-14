@@ -105,7 +105,7 @@ func (l *v5link) start() {
 	if cfg.TopicAliasMaximum != nil {
 		aliasMax = *cfg.TopicAliasMaximum
 	}
-	subs := cfg.SubscriptionsFor(l.idx)
+	subs := l.m.subscriptionsFor(cfg, l.idx)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	l.cancel = cancel
@@ -145,7 +145,7 @@ func (l *v5link) start() {
 			cp.Properties.ReceiveMaximum = &receiveMax
 			cp.Properties.TopicAliasMaximum = &aliasMax
 			cp.Properties.RequestProblemInfo = true
-			if w := cfg.Will; w != nil && l.idx == 0 {
+			if w := l.m.connectWill(cfg, l.idx); w != nil {
 				cp.WillMessage = &paho.WillMessage{Topic: w.Topic, Payload: []byte(w.Payload), QoS: w.QoS, Retain: w.Retain}
 				if w.DelaySec > 0 {
 					d := w.DelaySec
@@ -169,7 +169,7 @@ func (l *v5link) start() {
 			}
 			l.up.Store(true)
 			l.m.linkUp(l.clientID)
-			if w := cfg.Will; w != nil && w.OnlinePayload != "" && l.idx == 0 {
+			if w := cfg.Will; w != nil && w.OnlinePayload != "" && l.idx == 0 && l.m.pres.Load() == nil {
 				go func() { // cm, not l.cm: this may run before NewConnection returns
 					pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 					defer cancel()
@@ -247,6 +247,7 @@ func (l *v5link) subscribe(ctx context.Context, cm *autopaho.ConnectionManager, 
 				l.m.subscriptionRejected(subs[i].Filter, reasonText(code, reason))
 			}
 		}
+		l.m.subscribed(l.idx, l)
 		return
 	}
 	if err != nil && ctx.Err() == nil {

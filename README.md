@@ -255,7 +255,7 @@ curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/spb/plant1/pre
 - **Template definitions** in births (such as Ignition's `_types_/…`) describe types and are not translated; template instances are.
 - **Transient** metrics (`is_transient`) are delivered to waits, webhooks and the WebSocket stream (flagged `"transient":true`), but not stored as the latest value or in history.
 - **Historical** metrics (`is_historical`) keep their own timestamp, so they never replace a newer value, and they land at the right place in [history](#history).
-- **Passive.** mqtt-get never claims to be the primary host application (it doesn't publish `STATE`). Other hosts' `NCMD`/`DCMD` messages are not translated. `STATE` messages are stored as-is.
+- **Observer or primary host.** By default mqtt-get observes: it publishes no `STATE`, so edge nodes configured to wait for a primary host won't publish to it. With `host_id` set it is a [primary host application](#primary-host-application). Other hosts' `NCMD`/`DCMD` messages are not translated. `STATE` messages are stored as-is.
 - **Raw messages** under `spBv1.0/…` aren't stored, unless `keep_raw` is set.
 - **Protocol problems** are counted per node and shown with the latest one (`problems`, `last_problem` in `/api/v1/sparkplug/nodes` and the UI). Problems include payloads that fail validation (for example an Int8 of 300, or a value in the wrong field for its type), an NBIRTH whose `seq` isn't 0, and an alias used by two metrics. The values are still translated as well as possible.
 - **The prefix belongs to the translator.** While Sparkplug is on, publishing under `spb/…` is treated as a metric write (see below), and turning Sparkplug off or changing the prefix forgets the translated values.
@@ -273,11 +273,22 @@ The payload is the value (`61.5`, `true`, `"text"`) or `{"value": …}`. The wri
 
 To make only some metrics writable, set `commands_filter` to topic filters of translated topics, for example `["spb/plant1/+/+/Setpoints/#", "spb/plant1/press-gw/Press3/Mode"]`. Writes to other metrics are rejected with `403`, and `/api/v1/sparkplug/nodes?metrics=true` marks each writable metric with `"writable":true`.
 
+### Primary host application
+
+With `host_id` set (`SPARKPLUG_HOST_ID`), mqtt-get is a Sparkplug 3.0 primary host application with that id:
+
+- Its first connection registers the will `spBv1.0/STATE/<host_id>` = `{"online":false,"timestamp":T}` (QoS 1, retained), subscribes to `spBv1.0/#` and its own `STATE` topic, and once the broker has acknowledged the subscriptions publishes `{"online":true,"timestamp":T}` with the same `T`, before anything else. Every new connection uses a new `T`.
+- If it sees an offline `STATE` for its own id from the current session (another client, or a stale will), it publishes its online `STATE` again. On a graceful shutdown it publishes the offline `STATE` before disconnecting.
+- Rebirth requests wait until the online `STATE` is out.
+- It needs a clean session (`clean_session` true, `session_expiry_sec` 0); `GET /api/v1/sparkplug` warns otherwise, and shows `host_online`. The STATE will replaces the broker `will` setting.
+
+Edge nodes that track a primary host then publish their births when they see it online, and go offline when it does. Changing `host_id` reconnects to the broker.
+
 ### Conformance
 
-mqtt-get acts as a Sparkplug 3.0 host application that **observes**: it decodes and tracks every edge node, but it is not a *primary* host application. The places where it deliberately differs from, or doesn't cover, the specification:
+mqtt-get is a Sparkplug 3.0 host application: by default one that **observes** (it decodes and tracks every edge node), and with `host_id` the *primary* host application. The places where it deliberately differs from, or doesn't cover, the specification:
 
-- **No `STATE`.** It doesn't publish `STATE` messages, so edge nodes that wait for a primary host won't treat it as one. The Eclipse Sparkplug TCK's host application tests assume a primary host, so they don't apply as they are.
+- **`STATE` only as a primary host.** Without `host_id` it publishes no `STATE`, so edge nodes that wait for a primary host won't treat it as one.
 - **Lenient `bdSeq` on death.** An NDEATH with a *newer* `bdSeq` than the birth is accepted (the specification asks for an exact match), because some edge nodes send the next session's `bdSeq` when they disconnect cleanly. Older ones (late wills) are ignored as specified.
 - **Lenient on bad payloads.** Payloads that break the value rules are translated as well as possible and reported as problems, rather than rejected.
 - **Not covered:** reassembly of multi-part File values. Each part is translated on its own, with its `metadata` (`is_multi_part`, `seq`), so a consumer can reassemble them.
@@ -291,6 +302,7 @@ mqtt-get acts as a Sparkplug 3.0 host application that **observes**: it decodes 
 | `rebirth` | `SPARKPLUG_REBIRTH` | `false` | Request births from nodes that can't be decoded or lost messages (publishes `NCMD`) |
 | `rebirth_interval_sec` | `SPARKPLUG_REBIRTH_INTERVAL_SEC` | `30` | Minimum time between rebirth requests to one node |
 | `reorder_timeout_ms` | `SPARKPLUG_REORDER_TIMEOUT_MS` | `2000` | How long to wait for missing messages before treating the gap as lost (0: don't wait) |
+| `host_id` | `SPARKPLUG_HOST_ID` | (none) | Act as the [primary host application](#primary-host-application) with this id |
 | `persist` | `SPARKPLUG_PERSIST` | `true` | Save the metric definitions to `DATA_DIR/sparkplug.json` |
 | `commands` | `SPARKPLUG_COMMANDS` | `false` | Allow writes through publish (needs the `publish` scope) |
 | `commands_filter` | `SPARKPLUG_COMMANDS_FILTER` (comma-separated) | all | Topic filters of the metrics that may be written |

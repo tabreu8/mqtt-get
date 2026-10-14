@@ -6,6 +6,7 @@
 package sparkplug
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -81,10 +82,11 @@ type node struct {
 	group     string
 	edge      string
 	online    bool
-	born      bool  // a birth has been seen (aliases and types are known)
-	restored  bool  // the definitions came from disk, not from a birth yet
-	bdSeq     int64 // -1 = unknown
-	seq       int   // last seq, -1 = unknown
+	born      bool   // a birth has been seen (aliases and types are known)
+	restored  bool   // the definitions came from disk, not from a birth yet
+	birthTS   uint64 // payload timestamp of the last NBIRTH
+	bdSeq     int64  // -1 = unknown
+	seq       int    // last seq, -1 = unknown
 	birthAt   time.Time
 	deathAt   time.Time
 	lastMsg   time.Time
@@ -255,6 +257,12 @@ func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
 	}
 	switch typ {
 	case NBIRTH:
+		if bd, ok := bdSeqOf(p); ok && n.online && n.born && !n.restored && n.bdSeq == bd && n.seq == 0 && p.HasSeq && p.Seq == 0 && p.HasTimestamp && p.Timestamp == n.birthTS {
+			// The same birth again, with nothing in between: a duplicate
+			// delivery (overlapping subscriptions, QoS 1 resend).
+			n.mu.Unlock()
+			return nil, true
+		}
 		if p.HasSeq && p.Seq != 0 {
 			t.problem(n, now, "NBIRTH with seq %d (must be 0)", p.Seq)
 		}
@@ -315,6 +323,9 @@ type pending struct {
 // sequence) is held until the missing ones arrive, or until the timeout
 // expires (see Flush).
 func (t *Translator) sequenced(n *node, typ, dev string, p *spb.Payload, e *store.Entry, now time.Time) []store.Entry {
+	if p.HasSeq && n.seq >= 0 && int(p.Seq%256) == n.seq {
+		return nil // the last message again: a duplicate delivery
+	}
 	timeout := t.reorderTimeout()
 	if !p.HasSeq || timeout <= 0 || n.seq < 0 {
 		return t.handle(n, typ, dev, p, e, now)
@@ -556,7 +567,7 @@ func (t *Translator) nodeBirth(n *node, p *spb.Payload, e *store.Entry, now time
 		delete(n.devices, id)
 	}
 	t.register(n, "", n.metrics, p)
-	n.online, n.born, n.restored, n.birthAt = true, true, false, now
+	n.online, n.born, n.restored, n.birthAt, n.birthTS = true, true, false, now, p.Timestamp
 	n.bdSeq = -1
 	if bd, ok := bdSeqOf(p); ok {
 		n.bdSeq = bd
@@ -850,6 +861,30 @@ func RebirthPayload(now time.Time) []byte {
 		Name: RebirthMetric, Timestamp: ms, HasTimestamp: true, Datatype: spb.TypeBoolean,
 		Value: spb.Value{Kind: spb.KindBool, Bool: true},
 	}}})
+}
+
+// StateTopic returns spBv1.0/STATE/<hostID>, the topic of a primary host
+// application's STATE.
+func StateTopic(hostID string) string { return Namespace + "/STATE/" + hostID }
+
+// StatePayload returns a STATE payload: {"online":true,"timestamp":1760000000000}.
+func StatePayload(online bool, ts int64) []byte {
+	b := strconv.AppendBool([]byte(`{"online":`), online)
+	b = append(b, `,"timestamp":`...)
+	b = strconv.AppendInt(b, ts, 10)
+	return append(b, '}')
+}
+
+// ParseState decodes a STATE payload.
+func ParseState(b []byte) (online bool, ts int64, ok bool) {
+	var st struct {
+		Online    *bool  `json:"online"`
+		Timestamp *int64 `json:"timestamp"`
+	}
+	if json.Unmarshal(b, &st) != nil || st.Online == nil || st.Timestamp == nil {
+		return false, 0, false
+	}
+	return *st.Online, *st.Timestamp, true
 }
 
 // CommandTopic returns spBv1.0/group/NCMD/edge or .../DCMD/edge/device.

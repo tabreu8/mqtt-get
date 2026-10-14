@@ -78,6 +78,14 @@ type Manager struct {
 	cfg   config.Broker
 	links []link
 
+	// pres is the dynamic status of the first connection (nil: the
+	// configured Will, if any); presOnline/presOffline are the messages
+	// matching the will of the current connection.
+	pres        atomic.Pointer[Presence]
+	presMu      sync.Mutex
+	presOnline  *Message
+	presOffline *Message
+
 	rr        atomic.Uint64
 	retired   counters // totals of links replaced by Apply/Reconnect
 	sent      atomic.Uint64
@@ -181,7 +189,17 @@ func (m *Manager) Close() {
 }
 
 func (m *Manager) disconnectLocked() {
-	if w := m.cfg.Will; w != nil && w.OnlinePayload != "" && len(m.links) > 0 && m.links[0].isUp() {
+	m.presMu.Lock()
+	offline := m.presOffline
+	m.presOnline, m.presOffline = nil, nil
+	m.presMu.Unlock()
+	if offline != nil && len(m.links) > 0 && m.links[0].isUp() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := m.links[0].send(ctx, *offline)(); err != nil {
+			m.log.Warn("mqtt: publishing the offline status failed", "err", err)
+		}
+		cancel()
+	} else if w := m.cfg.Will; w != nil && w.OnlinePayload != "" && len(m.links) > 0 && m.links[0].isUp() {
 		// Status topic: say we are going offline (the broker only publishes
 		// the will after an unexpected disconnect).
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -199,6 +217,91 @@ func (m *Manager) disconnectLocked() {
 	m.links = nil
 }
 
+// Presence is a status announced by the first connection, such as a
+// Sparkplug primary host application's STATE. It replaces the configured
+// Will: Build is called for every new connection and returns the will to
+// register and the matching online and offline messages. The online
+// message is published once the connection's subscriptions (including
+// Subscriptions) are acknowledged, and nothing else should be published
+// before it: Online is called after it was published. The offline message
+// is published on a graceful disconnect.
+type Presence struct {
+	Build         func() (will, online, offline Message)
+	Subscriptions []config.Subscription
+	Online        func()
+}
+
+// SetPresence sets (or with nil removes) the presence. It takes effect
+// on the next Apply or Reconnect.
+func (m *Manager) SetPresence(p *Presence) { m.pres.Store(p) }
+
+// AnnouncePresence publishes the presence's online message again (for
+// example when another client published our offline status).
+func (m *Manager) AnnouncePresence(ctx context.Context) error {
+	m.presMu.Lock()
+	online := m.presOnline
+	m.presMu.Unlock()
+	m.mu.Lock()
+	var l link
+	if len(m.links) > 0 {
+		l = m.links[0]
+	}
+	m.mu.Unlock()
+	if online == nil || l == nil || !l.isUp() {
+		return ErrNotConnected
+	}
+	return l.send(ctx, *online)()
+}
+
+// connectWill returns the will connection idx registers.
+func (m *Manager) connectWill(cfg config.Broker, idx int) *config.Will {
+	if idx != 0 {
+		return nil // one will per service, on the first connection
+	}
+	p := m.pres.Load()
+	if p == nil {
+		return cfg.Will
+	}
+	will, online, offline := p.Build()
+	m.presMu.Lock()
+	m.presOnline, m.presOffline = &online, &offline
+	m.presMu.Unlock()
+	return &config.Will{Topic: will.Topic, Payload: string(will.Payload), QoS: will.QoS, Retain: will.Retain}
+}
+
+// subscriptionsFor returns what connection idx subscribes to.
+func (m *Manager) subscriptionsFor(cfg config.Broker, idx int) []config.Subscription {
+	subs := cfg.SubscriptionsFor(idx)
+	if p := m.pres.Load(); p != nil && idx == 0 {
+		subs = append(subs[:len(subs):len(subs)], p.Subscriptions...)
+	}
+	return subs
+}
+
+// subscribed runs once connection idx's subscriptions are acknowledged:
+// the first connection announces the presence.
+func (m *Manager) subscribed(idx int, l link) {
+	p := m.pres.Load()
+	if p == nil || idx != 0 {
+		return
+	}
+	m.presMu.Lock()
+	online := m.presOnline
+	m.presMu.Unlock()
+	if online == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := l.send(ctx, *online)(); err != nil {
+		m.setErr("publishing the online status to " + online.Topic + " failed: " + err.Error())
+		return
+	}
+	if p.Online != nil {
+		p.Online()
+	}
+}
+
 func willMessage(w *config.Will, payload string) Message {
 	return Message{Topic: w.Topic, Payload: []byte(payload), QoS: w.QoS, Retain: w.Retain}
 }
@@ -207,7 +310,7 @@ func willMessage(w *config.Will, payload string) Message {
 // connection after it connects (status topics), after delay.
 func (m *Manager) announceOnline(cfg config.Broker, idx int, l link, delay time.Duration) {
 	w := cfg.Will
-	if w == nil || w.OnlinePayload == "" || idx != 0 {
+	if w == nil || w.OnlinePayload == "" || idx != 0 || m.pres.Load() != nil {
 		return
 	}
 	go func() {
@@ -374,7 +477,7 @@ func (m *Manager) Status() Status {
 		st.ReceivedPerConnection = perConn
 		for i := range perConn {
 			var fs []string
-			for _, sub := range cfg.SubscriptionsFor(i) {
+			for _, sub := range m.subscriptionsFor(cfg, i) {
 				fs = append(fs, sub.Filter)
 			}
 			st.FiltersPerConnection = append(st.FiltersPerConnection, fs)

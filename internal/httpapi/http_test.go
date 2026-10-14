@@ -64,6 +64,10 @@ type env struct {
 func setup(t *testing.T, password string) *env { return setupVersion(t, password, 4) }
 
 func setupVersion(t *testing.T, password string, version uint) *env {
+	return setupClient(t, password, version, "")
+}
+
+func setupClient(t *testing.T, password string, version uint, client string) *env {
 	t.Helper()
 	broker, addr := startBroker(t)
 	cfg := config.Server{MaxTopics: 1000, MaxBodyBytes: 1 << 20, UIEnabled: true, MCPEnabled: true, PublishTimeout: 5 * time.Second}
@@ -74,7 +78,7 @@ func setupVersion(t *testing.T, password string, version uint) *env {
 	st.SetEnvKeys([]string{"admin-key"}, []string{"read-key"}, nil)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := core.New(cfg, log, st)
-	b := config.Broker{URLs: []string{"tcp://" + addr}, Username: "user", Password: password, ClientID: "test", ProtocolVersion: version}
+	b := config.Broker{URLs: []string{"tcp://" + addr}, Username: "user", Password: password, ClientID: "test", ProtocolVersion: version, Client: client}
 	if err := svc.Start(b, true); err != nil {
 		t.Fatal(err)
 	}

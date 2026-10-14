@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -540,5 +541,159 @@ func TestSparkplugDefinitionsSurviveRestart(t *testing.T) {
 	v, err := svc.Latest("spb/g/e/Level")
 	if err != nil || !strings.Contains(string(v.Payload), `"value":2.5`) || !strings.Contains(string(v.Payload), `"type":"Float"`) {
 		t.Fatalf("alias-only data after a restart: %v %s", err, v.Payload)
+	}
+}
+
+// hostRecorder records what client "test" (mqtt-get) sends: its will, then
+// "sub <filter>" and "pub <topic> <payload>" in order.
+type hostRecorder struct {
+	mochi.HookBase
+	mu     sync.Mutex
+	events []string
+	will   packets.Packet
+}
+
+func (h *hostRecorder) ID() string { return "host-recorder" }
+func (h *hostRecorder) Provides(b byte) bool {
+	return b == mochi.OnConnect || b == mochi.OnSubscribe || b == mochi.OnPublish
+}
+func (h *hostRecorder) OnConnect(cl *mochi.Client, pk packets.Packet) error {
+	if cl.ID == "test" {
+		h.mu.Lock()
+		h.events = append(h.events, "connect")
+		h.will = pk
+		h.mu.Unlock()
+	}
+	return nil
+}
+func (h *hostRecorder) OnSubscribe(cl *mochi.Client, pk packets.Packet) packets.Packet {
+	if cl.ID == "test" {
+		h.mu.Lock()
+		for _, f := range pk.Filters {
+			h.events = append(h.events, "sub "+f.Filter)
+		}
+		h.mu.Unlock()
+	}
+	return pk
+}
+func (h *hostRecorder) OnPublish(cl *mochi.Client, pk packets.Packet) (packets.Packet, error) {
+	if cl.ID == "test" {
+		h.mu.Lock()
+		h.events = append(h.events, "pub "+pk.TopicName+" "+string(pk.Payload))
+		h.mu.Unlock()
+	}
+	return pk, nil
+}
+func (h *hostRecorder) snapshot() ([]string, packets.Packet) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.events...), h.will
+}
+
+func TestSparkplugPrimaryHost(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		version uint
+		client  string
+	}{{"lean 3.1.1", 4, ""}, {"lean 5", 5, ""}, {"paho 3.1.1", 4, "paho"}, {"paho 5", 5, "paho"}} {
+		t.Run(c.name, func(t *testing.T) { testPrimaryHost(t, setupClient(t, "secret", c.version, c.client)) })
+	}
+}
+
+func testPrimaryHost(t *testing.T, e *env) {
+	rec := &hostRecorder{}
+	if err := e.broker.AddHook(rec, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.waitConnected()
+	if code, _, _ := e.do("PUT", "/api/v1/sparkplug", e.admin, `{"enabled":true,"host_id":"a/b"}`); code != 400 {
+		t.Fatal("host_id with a slash accepted")
+	}
+	if code, out, _ := e.do("PUT", "/api/v1/sparkplug", e.admin, `{"enabled":true,"rebirth":true,"host_id":"mqttget"}`); code != 200 {
+		t.Fatalf("host mode: %d %s", code, out)
+	}
+	// It reconnects with a STATE will, subscribes, then publishes its
+	// STATE birth (same timestamp, QoS 1, retained) before anything else.
+	var ts int64
+	eventually(t, func() bool {
+		ev, will := rec.snapshot()
+		for _, s := range ev {
+			if strings.HasPrefix(s, "pub spBv1.0/STATE/mqttget ") {
+				online, t0, ok := sparkplug.ParseState([]byte(strings.TrimPrefix(s, "pub spBv1.0/STATE/mqttget ")))
+				wOnline, wts, wok := sparkplug.ParseState(will.Connect.WillPayload)
+				if !ok || !online || !wok || wOnline || wts != t0 {
+					t.Fatalf("birth %q, will %q", s, will.Connect.WillPayload)
+				}
+				ts = t0
+				return true
+			}
+		}
+		return false
+	})
+	ev, will := rec.snapshot()
+	if !will.Connect.WillFlag || will.Connect.WillTopic != "spBv1.0/STATE/mqttget" || will.Connect.WillQos != 1 || !will.Connect.WillRetain || !will.Connect.Clean {
+		t.Fatalf("will %+v", will.Connect)
+	}
+	// Events of the last connection: subscriptions, then the STATE birth.
+	last := 0
+	for i, s := range ev {
+		if s == "connect" {
+			last = i
+		}
+	}
+	ev = ev[last:]
+	subs := map[string]bool{}
+	for _, s := range ev[1:] {
+		if strings.HasPrefix(s, "pub ") {
+			if !strings.HasPrefix(s, "pub spBv1.0/STATE/mqttget ") {
+				t.Fatalf("published %q before its STATE birth: %v", s, ev)
+			}
+			break
+		}
+		subs[strings.TrimPrefix(s, "sub ")] = true
+	}
+	if !subs["spBv1.0/#"] || !subs["spBv1.0/STATE/mqttget"] {
+		t.Fatalf("subscriptions before the STATE birth: %v", ev)
+	}
+
+	// Someone says we're offline: it answers with its birth again.
+	births := func() int {
+		n := 0
+		ev, _ := rec.snapshot()
+		for _, s := range ev {
+			if s == "pub spBv1.0/STATE/mqttget "+string(sparkplug.StatePayload(true, ts)) {
+				n++
+			}
+		}
+		return n
+	}
+	before := births()
+	_ = e.broker.Publish("spBv1.0/STATE/mqttget", sparkplug.StatePayload(false, ts-1000), false, 1) // an older session: ignored
+	_ = e.broker.Publish("spBv1.0/STATE/mqttget", sparkplug.StatePayload(false, ts), false, 1)
+	eventually(t, func() bool { return births() == before+1 })
+	time.Sleep(100 * time.Millisecond)
+	if births() != before+1 {
+		t.Fatal("answered the death of an older session")
+	}
+
+	// After losing the connection: a new will and birth, with a new
+	// timestamp.
+	time.Sleep(5 * time.Millisecond)
+	if cl, ok := e.broker.Clients.Get("test"); ok {
+		cl.Stop(errors.New("kicked"))
+	}
+	eventually(t, func() bool {
+		ev, will := rec.snapshot()
+		_, wts, _ := sparkplug.ParseState(will.Connect.WillPayload)
+		return wts != ts && ev[len(ev)-1] == "pub spBv1.0/STATE/mqttget "+string(sparkplug.StatePayload(true, wts))
+	})
+	_, will = rec.snapshot()
+	_, ts, _ = sparkplug.ParseState(will.Connect.WillPayload)
+
+	// A graceful shutdown publishes the STATE death.
+	e.svc.Close()
+	ev, _ = rec.snapshot()
+	if ev[len(ev)-1] != "pub spBv1.0/STATE/mqttget "+string(sparkplug.StatePayload(false, ts)) {
+		t.Fatalf("shutdown: %v", ev[len(ev)-3:])
 	}
 }

@@ -111,7 +111,7 @@ var connackErrors = map[byte]string{
 }
 
 func newLean(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *leanlink {
-	l := &leanlink{m: m, cfg: cfg, tlsCfg: tlsCfg, clientID: clientIDFor(cfg, idx), idx: idx, subs: cfg.SubscriptionsFor(idx),
+	l := &leanlink{m: m, cfg: cfg, tlsCfg: tlsCfg, clientID: clientIDFor(cfg, idx), idx: idx, subs: m.subscriptionsFor(cfg, idx),
 		quit: make(chan struct{}), done: make(chan struct{}), v5: cfg.ProtocolVersion == 5, aliasMax: defaultTopicAliasMaximum}
 	if cfg.TopicAliasMaximum != nil {
 		l.aliasMax = *cfg.TopicAliasMaximum
@@ -382,10 +382,7 @@ func (l *leanlink) connectPacket() []byte {
 	if pass != "" {
 		flags |= 0x40
 	}
-	will := l.cfg.Will
-	if l.idx != 0 {
-		will = nil // one will per service, on the first connection
-	}
+	will := l.m.connectWill(l.cfg, l.idx)
 	if will != nil {
 		flags |= 0x04 | will.QoS<<3
 		if will.Retain {
@@ -467,6 +464,7 @@ func (l *leanlink) subscribe() error {
 					l.m.subscriptionRejected(l.subs[i].Filter, reason)
 				}
 			}
+			l.m.subscribed(l.idx, l)
 		case <-time.After(30 * time.Second):
 			l.m.setErr("subscribe timed out")
 		case <-l.quit:

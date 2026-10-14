@@ -502,6 +502,11 @@ type Sparkplug struct {
 	// aliases, types) to DATA_DIR/sparkplug.json, so that after a restart
 	// alias-only data is decoded before the next birth (default true).
 	Persist *bool `json:"persist,omitempty"`
+	// HostID makes mqtt-get a Sparkplug primary host application with
+	// this id: it publishes its STATE (spBv1.0/STATE/<host_id>, online
+	// with a will for offline) so that edge nodes waiting for a primary
+	// host publish to it. Empty: an observing host that publishes no STATE.
+	HostID string `json:"host_id,omitempty"`
 }
 
 // DefaultReorderTimeoutMs is the default Sparkplug reorder timeout.
@@ -531,6 +536,7 @@ func (s *Sparkplug) Normalize() {
 		}
 	}
 	s.CommandsFilter = filters
+	s.HostID = strings.TrimSpace(s.HostID)
 }
 
 // Validate checks the settings.
@@ -543,6 +549,9 @@ func (s *Sparkplug) Validate() error {
 	}
 	if s.RebirthIntervalSec > 86400 {
 		return errors.New("rebirth_interval_sec must be <= 86400")
+	}
+	if s.HostID != "" && (strings.ContainsAny(s.HostID, "/+#") || topic.ValidateName(s.HostID) != nil) {
+		return errors.New("host_id must be a single topic level (no '/', '+' or '#')")
 	}
 	if ms := s.ReorderTimeoutMs; ms != nil && (*ms < 0 || *ms > 60000) {
 		return errors.New("reorder_timeout_ms must be between 0 and 60000")
@@ -672,6 +681,7 @@ func SparkplugFromEnv() (s Sparkplug, ok bool, err error) {
 		RebirthIntervalSec: envInt("SPARKPLUG_REBIRTH_INTERVAL_SEC", 0),
 		Commands:           envBool("SPARKPLUG_COMMANDS", false),
 		CommandsFilter:     envList("SPARKPLUG_COMMANDS_FILTER"),
+		HostID:             envStr("SPARKPLUG_HOST_ID", ""),
 	}
 	if Env("SPARKPLUG_PERSIST") != "" {
 		on := envBool("SPARKPLUG_PERSIST", true)

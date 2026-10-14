@@ -79,6 +79,7 @@ var sparkplugAdminTools = []*tool{
 			"rebirth":              boolean("Request a rebirth when a node's metrics can't be decoded or messages were lost (default false)"),
 			"rebirth_interval_sec": integer("Minimum seconds between rebirth requests per node (default 30)", 1, 86400),
 			"reorder_timeout_ms":   integer("How long to hold a message that arrives out of sequence for the missing ones; when it expires, a rebirth is requested (with rebirth). 0 disables (default 2000)", 0, 60000),
+			"host_id":              str("Act as the Sparkplug primary host application with this id: publish STATE on spBv1.0/STATE/<host_id> (edge nodes waiting for a primary host then publish). Empty: observe only (default)"),
 			"persist":              boolean("Save the metric definitions learned from births to disk, to decode alias-only data right after a restart (default true)"),
 			"commands":             boolean("Allow writes to Sparkplug metrics through publish (default false)"),
 			"commands_filter":      strList("Only metrics whose translated topic matches one of these topic filters are writable (e.g. [\"spb/plant1/+/+/Setpoints/#\"]); empty: all"),

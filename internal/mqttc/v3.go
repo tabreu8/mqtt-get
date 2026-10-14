@@ -57,7 +57,7 @@ func newV3(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *v3link {
 		o.SetCredentialsProvider(func() (string, string) { return m.credentials(cfg) })
 	}
 	filters := map[string]byte{}
-	for _, s := range cfg.SubscriptionsFor(idx) {
+	for _, s := range m.subscriptionsFor(cfg, idx) {
 		filters[s.Filter] = s.QoS
 	}
 	o.SetDefaultPublishHandler(func(_ mqtt.Client, msg mqtt.Message) {
@@ -69,8 +69,16 @@ func newV3(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *v3link {
 			Time:     time.Now().UnixNano(),
 		})
 	})
-	if w := cfg.Will; w != nil && idx == 0 {
+	if w := m.connectWill(cfg, idx); w != nil {
 		o.SetBinaryWill(w.Topic, []byte(w.Payload), w.QoS, w.Retain)
+	}
+	if m.pres.Load() != nil && idx == 0 {
+		// A fresh status will for every reconnect.
+		o.SetReconnectingHandler(func(_ mqtt.Client, opts *mqtt.ClientOptions) {
+			if w := m.connectWill(cfg, idx); w != nil {
+				opts.SetBinaryWill(w.Topic, []byte(w.Payload), w.QoS, w.Retain)
+			}
+		})
 	}
 	o.SetOnConnectHandler(func(cl mqtt.Client) {
 		l.up.Store(true)
@@ -100,6 +108,7 @@ func newV3(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *v3link {
 					}
 				}
 			}
+			m.subscribed(idx, l)
 		}()
 	})
 	o.SetConnectionLostHandler(func(_ mqtt.Client, err error) {

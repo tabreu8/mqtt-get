@@ -893,3 +893,24 @@ func TestFileMetadata(t *testing.T) {
 		t.Fatal("empty metadata included")
 	}
 }
+
+func TestDuplicateDeliveries(t *testing.T) {
+	// Overlapping subscriptions (a primary host subscribes to spBv1.0/#
+	// besides #) can deliver each message twice.
+	tr, fb, _ := newT(config.Sparkplug{Rebirth: true, ReorderTimeoutMs: ms(2000)})
+	birth := entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, dbl("A", 1, 0)))
+	data := entry("spBv1.0/g/NDATA/e", dataPayload(1, byAlias(1, 1)))
+	for _, e := range []store.Entry{birth, birth, data, data} {
+		tr.Process(e)
+	}
+	if st := tr.Stats(); st.Metrics != 3 || st.SeqErrors != 0 || fb.count() != 0 {
+		t.Fatalf("duplicates: %+v, %d rebirths", st, fb.count())
+	}
+	// A real rebirth (new timestamp) right after a birth is not a duplicate.
+	rebirth := spb.Encode(&spb.Payload{Timestamp: 99, HasTimestamp: true, Seq: 0, HasSeq: true, Metrics: []spb.Metric{
+		{Name: "bdSeq", Datatype: spb.TypeUInt64, Value: spb.Value{Kind: spb.KindLong, Uint: 1}}, dbl("A", 1, 5)}})
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", rebirth))
+	if out, _ := tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, dbl("A", 1, 7)))); len(out) != 2 {
+		t.Fatalf("rebirth after a birth dropped: %v", values(t, out))
+	}
+}
