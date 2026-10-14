@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
@@ -121,6 +122,80 @@ func (s *Service) hostState(sp *sparkplug.Translator, e *store.Entry) {
 			s.log.Warn("sparkplug: republishing the primary host STATE failed", "err", err)
 		}
 	}()
+}
+
+// Receive takes a message from the broker. Sparkplug messages are handed to
+// a pool of workers, one per CPU, each edge node always to the same worker:
+// translation, which costs far more than storing a plain message, runs on
+// every core while each node's messages stay in order. A full worker queue
+// blocks the caller (the connection's reader), which slows the broker down
+// rather than dropping messages, as plain ingest does. Everything else is
+// ingested at once, as by Ingest.
+func (s *Service) Receive(e store.Entry) {
+	if s.spb.Load() != nil {
+		if h, ok := sparkplug.Route(e.Topic); ok {
+			s.workersMu.RLock()
+			if w := s.workers; w != nil {
+				w[h%uint32(len(w))] <- e
+				s.workersMu.RUnlock()
+				return
+			}
+			s.workersMu.RUnlock()
+		}
+	}
+	s.Ingest(e)
+}
+
+// workerQueue is the length of each worker's queue.
+const workerQueue = 4096
+
+func (s *Service) startWorkers() {
+	n := min(max(runtime.GOMAXPROCS(0), 1), 64)
+	s.workersMu.Lock()
+	defer s.workersMu.Unlock()
+	if s.workers != nil {
+		return
+	}
+	s.workers = make([]chan store.Entry, n)
+	for i := range s.workers {
+		ch := make(chan store.Entry, workerQueue)
+		s.workers[i] = ch
+		s.workersWG.Add(1)
+		go s.worker(ch)
+	}
+}
+
+// stopWorkers lets the workers finish what is queued and stops them.
+func (s *Service) stopWorkers() {
+	s.workersMu.Lock() // waits for senders in Receive
+	w := s.workers
+	s.workers = nil
+	s.workersMu.Unlock()
+	for _, ch := range w {
+		close(ch)
+	}
+	s.workersWG.Wait()
+}
+
+func (s *Service) worker(ch chan store.Entry) {
+	defer s.workersWG.Done()
+	var out []store.Entry // reused: ingest copies what it keeps
+	for e := range ch {
+		sp := s.spb.Load()
+		if sp == nil {
+			s.Ingest(e)
+			continue
+		}
+		var handled bool
+		out, handled = sp.ProcessAppend(e, out[:0])
+		for i := range out {
+			s.ingest(out[i])
+		}
+		clear(out) // don't keep the payloads alive until the next message
+		if !handled || sp.Config().KeepRaw {
+			s.ingest(e)
+		}
+	}
 }
 
 // sparkplugPath is where the metric definitions are saved ("" = not

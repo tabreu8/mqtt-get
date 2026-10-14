@@ -50,13 +50,7 @@ func (t *Translator) Dirty() bool { return t.dirty.Swap(false) }
 // (atomically).
 func (t *Translator) Save(path string) error {
 	snap := snapshot{Version: snapshotVersion, Prefix: t.prefix, Nodes: []snapshotNode{}}
-	t.mu.RLock()
-	list := make([]*node, 0, len(t.nodes))
-	for _, n := range t.nodes {
-		list = append(list, n)
-	}
-	t.mu.RUnlock()
-	for _, n := range list {
+	for _, n := range t.allNodes() {
 		n.mu.Lock()
 		if n.born {
 			sn := snapshotNode{Group: n.group, Edge: n.edge, BdSeq: n.bdSeq}
@@ -160,7 +154,7 @@ func (t *Translator) Load(path string) (int, error) {
 			}
 			if sm.Alias != nil {
 				m.alias, m.hasAlias = *sm.Alias, true
-				n.aliases[m.alias] = m
+				n.aliases.set(m.alias, m)
 			}
 			defs[sm.Name] = m
 			t.byTopic[m.topic] = m
@@ -208,16 +202,17 @@ func (t *Translator) checkRestored(n *node, devID string, p *spb.Payload) bool {
 		case pm.Name != "":
 			m = defs[pm.Name]
 		case pm.HasAlias:
-			if m = n.aliases[pm.Alias]; m != nil && m.device != devID {
+			if m = n.aliases.get(pm.Alias); m != nil && m.device != devID {
 				m = nil
 			}
 		}
 		if m != nil && !compatible(m, pm) {
-			t.problem(n, t.now(), "metric definitions restored from disk don't match %s (%s, %s): waiting for a rebirth",
+			t.problem(n, t.clock(), "metric definitions restored from disk don't match %s (%s, %s): waiting for a rebirth",
 				describe(m), pm.Datatype, pm.Value.Kind)
 			for id, d := range n.devices {
 				t.register(n, id, d.metrics, &spb.Payload{})
 				delete(n.devices, id)
+				n.lastDev = nil
 			}
 			t.register(n, "", n.metrics, &spb.Payload{})
 			n.born, n.restored, n.bdSeq = false, false, -1

@@ -914,3 +914,52 @@ func TestDuplicateDeliveries(t *testing.T) {
 		t.Fatalf("rebirth after a birth dropped: %v", values(t, out))
 	}
 }
+
+func TestAppendTimeMatchesTimePackage(t *testing.T) {
+	check := func(ms int64) {
+		want := `"` + time.UnixMilli(ms).UTC().Format(time.RFC3339Nano) + `"`
+		if got := string(appendTime(nil, ms)); got != want {
+			t.Fatalf("%d: %s, want %s", ms, got, want)
+		}
+	}
+	for _, ms := range []int64{0, 1, 10, 100, 999, 1000, -1, -999, -1000, -86_400_000, 951_782_400_000, 1_760_000_000_311,
+		253_402_300_799_999, -62_135_596_800_000, 253_402_300_800_000, -62_135_596_800_001} {
+		check(ms)
+	}
+	r := uint64(1)
+	for i := 0; i < 200_000; i++ {
+		r = r*6364136223846793005 + 1442695040888963407
+		check(int64(r>>1)%(400*365*86_400_000) - 100*365*86_400_000)
+	}
+}
+
+func TestParseTopic(t *testing.T) {
+	for name, want := range map[string]string{
+		"spBv1.0/g/NDATA/e":      "g NDATA e ",
+		"spBv1.0/g/DDATA/e/d":    "g DDATA e d",
+		"spBv1.0/g/NDATA/e/d":    "",
+		"spBv1.0/g/DDATA/e":      "",
+		"spBv1.0/g/DDATA/e/d/x":  "",
+		"spBv1.0//NDATA/e":       "",
+		"spBv1.0/g/NDATA/":       "",
+		"spBv1.0/g/DDATA/e/":     "",
+		"spBv1.0/g/BOGUS/e":      "",
+		"spBv1.0/STATE/host":     "",
+		"spBv1.0/g/NDATA":        "",
+		"spBv1.0":                "",
+		"other/g/NDATA/e":        "",
+		"spBv1.0/g/NCMD/e":       "g NCMD e ",
+		"spBv1.0/g/DCMD/e/d":     "g DCMD e d",
+		"spBv1.0/g/DBIRTH/e/d/":  "",
+		"spBv1.0/g/NBIRTH/e/d/x": "",
+	} {
+		g, typ, e, d, ok := parseTopic(name)
+		got := ""
+		if ok {
+			got = g + " " + typ + " " + e + " " + d
+		}
+		if got != want {
+			t.Errorf("%q: %q, want %q", name, got, want)
+		}
+	}
+}

@@ -47,10 +47,76 @@ func appendFloat(buf []byte, f float64, bits int) []byte {
 	return strconv.AppendFloat(buf, f, 'g', -1, bits)
 }
 
+// appendTime writes ms (milliseconds since the Unix epoch) as a quoted
+// RFC 3339 time in UTC, exactly as time.RFC3339Nano formats it
+// ("2026-10-13T09:15:02.311Z", trailing zeros of the fraction dropped),
+// several times faster than the time package.
 func appendTime(buf []byte, ms int64) []byte {
-	buf = append(buf, '"')
-	buf = time.UnixMilli(ms).UTC().AppendFormat(buf, time.RFC3339Nano)
-	return append(buf, '"')
+	days, msOfDay := ms/86_400_000, ms%86_400_000
+	if msOfDay < 0 {
+		days, msOfDay = days-1, msOfDay+86_400_000
+	}
+	y, m, d := civil(days)
+	if y < 0 || y > 9999 {
+		buf = append(buf, '"')
+		buf = time.UnixMilli(ms).UTC().AppendFormat(buf, time.RFC3339Nano)
+		return append(buf, '"')
+	}
+	sec := msOfDay / 1000
+	var b [26]byte
+	b[0] = '"'
+	put4(b[1:], y)
+	b[5] = '-'
+	put2(b[6:], m)
+	b[8] = '-'
+	put2(b[9:], d)
+	b[11] = 'T'
+	put2(b[12:], int(sec/3600))
+	b[14] = ':'
+	put2(b[15:], int(sec/60%60))
+	b[17] = ':'
+	put2(b[18:], int(sec%60))
+	n := 20
+	if frac := int(msOfDay % 1000); frac != 0 {
+		b[20] = '.'
+		b[21], b[22], b[23] = byte('0'+frac/100), byte('0'+frac/10%10), byte('0'+frac%10)
+		n = 24
+		for b[n-1] == '0' {
+			n--
+		}
+	}
+	b[n], b[n+1] = 'Z', '"'
+	return append(buf, b[:n+2]...)
+}
+
+// civil converts days since 1970-01-01 to a proleptic Gregorian date
+// (Howard Hinnant's algorithm).
+func civil(days int64) (y, m, d int) {
+	z := days + 719468
+	era := z / 146097
+	if z < 0 && z%146097 != 0 {
+		era--
+	}
+	doe := z - era*146097
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365
+	doy := doe - (365*yoe + yoe/4 - yoe/100)
+	mp := (5*doy + 2) / 153
+	d = int(doy - (153*mp+2)/5 + 1)
+	m = int(mp + 3)
+	if m > 12 {
+		m -= 12
+	}
+	y = int(yoe + era*400)
+	if m <= 2 {
+		y++
+	}
+	return y, m, d
+}
+
+func put2(b []byte, v int) { b[0], b[1] = byte('0'+v/10), byte('0'+v%10) }
+
+func put4(b []byte, v int) {
+	b[0], b[1], b[2], b[3] = byte('0'+v/1000), byte('0'+v/100%10), byte('0'+v/10%10), byte('0'+v%10)
 }
 
 // AppendValue appends v, interpreted as data type t, as JSON.

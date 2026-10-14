@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/maphash"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,12 +63,56 @@ type metric struct {
 	hasAlias bool
 	topic    string // translated topic
 	unit     string
+	unitJSON string    // `,"unit":"…"`, built on first use
+	ref      store.Ref // where topic is stored
 	// last value, to re-publish it marked offline on death
 	value   []byte // JSON
 	ts      uint64 // metric timestamp (ms)
 	recv    int64  // receive time (ns), the entry time
 	qos     byte
 	hasLast bool
+}
+
+// aliasTable maps aliases to metrics: small aliases (edge nodes number
+// them from 0 or 1) index a slice, which is faster than a map; others use a
+// map.
+type aliasTable struct {
+	small []*metric
+	big   map[uint64]*metric
+}
+
+const maxSmallAlias = 1 << 16
+
+func (a *aliasTable) get(alias uint64) *metric {
+	if alias < uint64(len(a.small)) {
+		return a.small[alias]
+	}
+	if a.big != nil && alias >= maxSmallAlias {
+		return a.big[alias]
+	}
+	return nil
+}
+
+// set records m for alias (nil removes it).
+func (a *aliasTable) set(alias uint64, m *metric) {
+	if alias < maxSmallAlias {
+		if alias >= uint64(len(a.small)) {
+			if m == nil {
+				return
+			}
+			a.small = append(a.small, make([]*metric, int(alias)+1-len(a.small))...)
+		}
+		a.small[alias] = m
+		return
+	}
+	if m == nil {
+		delete(a.big, alias)
+		return
+	}
+	if a.big == nil {
+		a.big = map[uint64]*metric{}
+	}
+	a.big[alias] = m
 }
 
 type device struct {
@@ -79,6 +125,8 @@ type device struct {
 
 type node struct {
 	mu        sync.Mutex
+	shard     uint32 // index into Translator.shards and .ctr
+	next      *node  // next node with the same hash
 	group     string
 	edge      string
 	online    bool
@@ -91,8 +139,9 @@ type node struct {
 	deathAt   time.Time
 	lastMsg   time.Time
 	metrics   map[string]*metric // node metrics by name
-	aliases   map[uint64]*metric // node and device metrics
+	aliases   aliasTable         // node and device metrics
 	devices   map[string]*device
+	lastDev   *device // the device of the last device message
 	rebirthAt time.Time
 
 	seqErrors, unknown, rebirths, staleDeaths uint64
@@ -136,23 +185,123 @@ type Translator struct {
 	cfg     atomic.Pointer[config.Sparkplug]
 	prefix  string // fixed for the translator's life
 	publish Publisher
-	now     func() time.Time
+	now     func() time.Time // nil: the real clock (tests set it)
 
-	mu      sync.RWMutex
-	nodes   map[string]*node   // group + "/" + edge
+	// Nodes are spread over shards, so that ingest workers looking up
+	// different nodes don't contend on one lock.
+	shards    [nodeShards]nodeShard
+	nodeCount atomic.Int64
+	// ctr counts messages and values per shard: one counter shared by
+	// all ingest workers would bounce between their cores.
+	ctr [nodeShards]shardCounters
+	// payloads recycles decoded payloads, scratch the buffers values are
+	// written in.
+	payloads, scratch sync.Pool
+
+	mu      sync.RWMutex       // byTopic and metric registration
 	byTopic map[string]*metric // translated topic -> metric (commands)
 
-	messages, metrics, malformed, dropped, problems, unknown, seqErrors, rebirths, commands atomic.Uint64
-	pendingNodes                                                                            atomic.Int64 // nodes holding messages
-	dirty                                                                                   atomic.Bool  // definitions changed since the last Save
+	malformed, dropped, problems, unknown, seqErrors, rebirths, commands atomic.Uint64
+	pendingNodes                                                         atomic.Int64 // nodes holding messages
+	dirty                                                                atomic.Bool  // definitions changed since the last Save
 }
 
 // New creates a translator. cfg must be normalized and valid.
 func New(cfg config.Sparkplug, publish Publisher) *Translator {
-	t := &Translator{prefix: cfg.Prefix, publish: publish, now: time.Now,
-		nodes: map[string]*node{}, byTopic: map[string]*metric{}}
+	t := &Translator{prefix: cfg.Prefix, publish: publish, byTopic: map[string]*metric{}}
+	for i := range t.shards {
+		t.shards[i].m = map[uint64]*node{}
+	}
+	t.payloads.New = func() any { return new(spb.Payload) }
+	t.scratch.New = func() any { b := make([]byte, 0, 1024); return &b }
 	t.cfg.Store(&cfg)
 	return t
+}
+
+const nodeShards = 64
+
+type nodeShard struct {
+	mu sync.RWMutex
+	m  map[uint64]*node // by nodeHash; colliding nodes chain through next
+	_  [40]byte         // keep shards on separate cache lines
+}
+
+type shardCounters struct {
+	messages, metrics atomic.Uint64
+	_                 [48]byte
+}
+
+// nodeHash identifies an edge node (the runtime's string hash); the low
+// bits pick its shard.
+func nodeHash(group, edge string) uint64 {
+	return maphash.String(nodeSeed, group)*31 + maphash.String(nodeSeed, edge)
+}
+
+// find returns node group/edge of chain n.
+func (n *node) find(group, edge string) *node {
+	for ; n != nil; n = n.next {
+		if n.group == group && n.edge == edge {
+			return n
+		}
+	}
+	return nil
+}
+
+var nodeSeed = maphash.MakeSeed()
+
+// Route returns a number identifying the edge node of a node or device
+// message (NBIRTH … DCMD), the same for every message of the node, so that
+// a caller can spread nodes over workers while keeping each node's
+// messages in order. ok is false for other topics (STATE, …).
+func Route(topic string) (h uint32, ok bool) {
+	group, _, edge, _, ok := parseTopic(topic)
+	if !ok {
+		return 0, false
+	}
+	return uint32(nodeHash(group, edge) >> 32), true
+}
+
+// lookup returns a known node, or nil.
+func (t *Translator) lookup(group, edge string) *node {
+	h := nodeHash(group, edge)
+	sh := &t.shards[h%nodeShards]
+	sh.mu.RLock()
+	n := sh.m[h].find(group, edge)
+	sh.mu.RUnlock()
+	return n
+}
+
+// allNodes returns every node (a snapshot of the list).
+func (t *Translator) allNodes() []*node {
+	list := make([]*node, 0, t.nodeCount.Load())
+	for i := range t.shards {
+		sh := &t.shards[i]
+		sh.mu.RLock()
+		for _, n := range sh.m {
+			for ; n != nil; n = n.next {
+				list = append(list, n)
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return list
+}
+
+// clock returns the current time (tests set now).
+func (t *Translator) clock() time.Time {
+	if t.now != nil {
+		return t.now()
+	}
+	return time.Now()
+}
+
+// clockAt is clock, but uses the receive time ns (unix nanoseconds) when
+// it is known.
+func (t *Translator) clockAt(ns int64) time.Time {
+	if t.now != nil || ns == 0 {
+		return t.clock()
+	}
+	return time.Unix(0, ns)
 }
 
 // Config returns the translator's settings.
@@ -174,24 +323,45 @@ func IsSparkplug(name string) bool {
 	return len(name) > len(Namespace) && name[len(Namespace)] == '/' && name[:len(Namespace)] == Namespace
 }
 
-// parseTopic splits spBv1.0/group/TYPE/edge[/device].
+// parseTopic splits spBv1.0/group/TYPE/edge[/device] (without allocating:
+// the parts are substrings of name).
 func parseTopic(name string) (group, typ, edge, dev string, ok bool) {
-	parts := strings.Split(name, "/")
-	if len(parts) < 4 || len(parts) > 5 || parts[0] != Namespace {
+	if !IsSparkplug(name) {
 		return "", "", "", "", false
 	}
-	group, typ, edge = parts[1], parts[2], parts[3]
-	if len(parts) == 5 {
-		dev = parts[4]
+	rest := name[len(Namespace)+1:]
+	var parts [4]string
+	n := 0
+	for n < 4 {
+		i := strings.IndexByte(rest, '/')
+		if i < 0 {
+			parts[n] = rest
+			n++
+			rest = ""
+			break
+		}
+		if n == 3 {
+			return "", "", "", "", false // more than 5 levels
+		}
+		parts[n] = rest[:i]
+		rest = rest[i+1:]
+		n++
 	}
-	if group == "" || edge == "" || (len(parts) == 5 && dev == "") {
+	if rest != "" || n < 3 {
+		return "", "", "", "", false
+	}
+	group, typ, edge = parts[0], parts[1], parts[2]
+	if n == 4 {
+		dev = parts[3]
+	}
+	if group == "" || edge == "" || (n == 4 && dev == "") {
 		return "", "", "", "", false
 	}
 	switch typ {
 	case NBIRTH, NDEATH, NDATA, NCMD:
-		return group, typ, edge, "", len(parts) == 4
+		return group, typ, edge, "", n == 3
 	case DBIRTH, DDEATH, DDATA, DCMD:
-		return group, typ, edge, dev, len(parts) == 5
+		return group, typ, edge, dev, n == 4
 	}
 	return "", "", "", "", false
 }
@@ -230,25 +400,40 @@ func (t *Translator) metricTopic(group, edge, dev, name string) string {
 // which are then stored as-is. The returned entries are the translated
 // metric values.
 func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
+	return t.ProcessAppend(e, nil)
+}
+
+// ProcessAppend is Process appending the translated values to out, so
+// that a caller translating many messages can reuse one slice.
+func (t *Translator) ProcessAppend(e store.Entry, out []store.Entry) ([]store.Entry, bool) {
 	group, typ, edge, dev, ok := parseTopic(e.Topic)
 	if !ok {
-		return nil, false
+		return out, false
 	}
-	t.messages.Add(1)
+	h := nodeHash(group, edge)
+	t.ctr[h%nodeShards].messages.Add(1)
 	if typ == NCMD || typ == DCMD {
-		return nil, true // commands from other hosts are not state
+		return out, true // commands from other hosts are not state
 	}
-	p, err := spb.Decode(e.Payload)
-	if err != nil {
+	p := t.payloads.Get().(*spb.Payload)
+	if err := spb.DecodeInto(p, e.Payload); err != nil {
+		t.payloads.Put(p)
 		t.malformed.Add(1)
-		return nil, true
+		return out, true
 	}
-	n := t.node(group, edge)
+	n := t.nodeHashed(h, group, edge)
 	if n == nil {
+		t.payloads.Put(p)
 		t.dropped.Add(1)
-		return nil, true
+		return out, true
 	}
-	now := t.now()
+	em := emit{out: slices.Grow(out, len(p.Metrics))}
+	before := len(out)
+	scratch := t.scratch.Get().(*[]byte)
+	em.block = (*scratch)[:0]
+	// The receive time stands for now: it was taken once per socket read,
+	// and reading the clock again costs (a lot, on some VMs).
+	now := t.clockAt(e.Time)
 	n.mu.Lock()
 	n.lastMsg = now
 	if err := p.Validate(); err != nil {
@@ -260,31 +445,58 @@ func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
 		if bd, ok := bdSeqOf(p); ok && n.online && n.born && !n.restored && n.bdSeq == bd && n.seq == 0 && p.HasSeq && p.Seq == 0 && p.HasTimestamp && p.Timestamp == n.birthTS {
 			// The same birth again, with nothing in between: a duplicate
 			// delivery (overlapping subscriptions, QoS 1 resend).
-			n.mu.Unlock()
-			return nil, true
+			break
 		}
 		if p.HasSeq && p.Seq != 0 {
 			t.problem(n, now, "NBIRTH with seq %d (must be 0)", p.Seq)
 		}
-		out = t.nodeBirth(n, p, &e, now)
+		t.nodeBirth(&em, n, p, &e, now)
 		// Messages of the new session that overtook the birth (possible
 		// with shared subscriptions) follow it; older ones are dropped.
-		out = t.drain(n, out, now)
+		t.drain(&em, n, now)
 		t.clearPending(n)
 	case NDEATH:
 		// Messages held for reordering are older than the death.
-		out = t.flushPending(n, nil, now)
-		out = append(out, t.nodeDeath(n, p, now)...)
+		t.flushPending(&em, n, now)
+		t.nodeDeath(&em, n, p, now)
 	default:
-		out = t.sequenced(n, typ, dev, p, &e, now)
+		t.sequenced(&em, n, typ, dev, p, &e, now)
 	}
 	n.mu.Unlock()
-	t.metrics.Add(uint64(len(out)))
-	return out, true
+	if !em.keep && cap(p.Metrics) <= 1024 {
+		t.payloads.Put(p)
+	}
+	if cap(em.block) <= 64<<10 {
+		*scratch = em.block[:0]
+		t.scratch.Put(scratch)
+	}
+	t.ctr[n.shard].metrics.Add(uint64(len(em.out) - before))
+	return em.out, true
+}
+
+// emit collects the values translated from one message.
+type emit struct {
+	out   []store.Entry
+	block []byte // scratch space to write a value in
+	keep  bool   // the payload is held for reordering: don't recycle it
+	// the last timestamp formatted, reused by the message's other values
+	tsMs  uint64
+	tsLen int
+	ts    [40]byte
+}
+
+// appendTime writes ms as an RFC 3339 JSON string, reusing the previous
+// formatting when the time is the same.
+func (em *emit) appendTime(buf []byte, ms uint64) []byte {
+	if em.tsLen == 0 || em.tsMs != ms {
+		em.tsLen = copy(em.ts[:], appendTime(em.ts[:0], int64(ms)))
+		em.tsMs = ms
+	}
+	return append(buf, em.ts[:em.tsLen]...)
 }
 
 // handle translates a DBIRTH, DDEATH, NDATA or DDATA message (lock held).
-func (t *Translator) handle(n *node, typ, dev string, p *spb.Payload, e *store.Entry, now time.Time) (out []store.Entry) {
+func (t *Translator) handle(em *emit, n *node, typ, dev string, p *spb.Payload, e *store.Entry, now time.Time) {
 	rebirth := t.checkSeq(n, p)
 	if n.restored && (typ == NDATA || typ == DDATA) && t.checkRestored(n, dev, p) {
 		// Back after a restart: the node is evidently online. A rebirth
@@ -297,23 +509,21 @@ func (t *Translator) handle(n *node, typ, dev string, p *spb.Payload, e *store.E
 	}
 	switch typ {
 	case DBIRTH:
-		out = t.deviceBirth(n, dev, p, e, now)
+		t.deviceBirth(em, n, dev, p, e, now)
 	case DDEATH:
 		// The device is offline as of the DDEATH's own timestamp.
 		at := now
 		if p.HasTimestamp {
 			at = time.UnixMilli(int64(p.Timestamp))
 		}
-		out = t.deviceDeath(n, dev, at)
+		t.deviceDeath(em, n, dev, at)
 	case NDATA, DDATA:
-		var unknown bool
-		out, unknown = t.data(n, dev, p, e)
+		unknown := t.data(em, n, dev, p, e)
 		rebirth = rebirth || unknown || !n.born
 	}
 	if rebirth {
 		t.requestRebirthLocked(n, now, false)
 	}
-	return out
 }
 
 // pending is a message held until the ones before it arrive.
@@ -327,20 +537,23 @@ type pending struct {
 // reorder timeout, a message that arrives ahead of its turn (a gap in the
 // sequence) is held until the missing ones arrive, or until the timeout
 // expires (see Flush).
-func (t *Translator) sequenced(n *node, typ, dev string, p *spb.Payload, e *store.Entry, now time.Time) []store.Entry {
+func (t *Translator) sequenced(em *emit, n *node, typ, dev string, p *spb.Payload, e *store.Entry, now time.Time) {
 	if p.HasSeq && n.seq >= 0 && int(p.Seq%256) == n.seq {
-		return nil // the last message again: a duplicate delivery
+		return // the last message again: a duplicate delivery
 	}
 	timeout := t.reorderTimeout()
 	if !p.HasSeq || timeout <= 0 || n.seq < 0 {
-		return t.handle(n, typ, dev, p, e, now)
+		t.handle(em, n, typ, dev, p, e, now)
+		return
 	}
 	seq := int(p.Seq % 256)
 	d := (seq - (n.seq+1)%256 + 256) % 256
 	switch {
 	case d == 0: // in order
 		n.behind = 0
-		return t.drain(n, t.handle(n, typ, dev, p, e, now), now)
+		t.handle(em, n, typ, dev, p, e, now)
+		t.drain(em, n, now)
+		return
 	case d < 128: // ahead: hold it
 		if n.pending == nil {
 			n.pending = map[int]pending{}
@@ -350,7 +563,8 @@ func (t *Translator) sequenced(n *node, typ, dev string, p *spb.Payload, e *stor
 			t.pendingNodes.Add(1)
 		}
 		n.pending[seq] = pending{typ: typ, dev: dev, p: p, e: *e}
-		return nil
+		em.keep = true
+		return
 	}
 	// Behind: a duplicate, or a message that arrived after its reorder
 	// timeout expired. Its values are older than the ones already
@@ -360,12 +574,12 @@ func (t *Translator) sequenced(n *node, typ, dev string, p *spb.Payload, e *stor
 	t.seqErrors.Add(1)
 	if n.behind++; n.behind < 3 {
 		t.requestRebirthLocked(n, now, false)
-		return nil
+		return
 	}
 	n.behind = 0
-	out := t.flushPending(n, nil, now)
+	t.flushPending(em, n, now)
 	n.seq = (seq + 255) % 256
-	return append(out, t.handle(n, typ, dev, p, e, now)...)
+	t.handle(em, n, typ, dev, p, e, now)
 }
 
 func (t *Translator) reorderTimeout() time.Duration {
@@ -376,7 +590,7 @@ func (t *Translator) reorderTimeout() time.Duration {
 }
 
 // drain handles the held messages that are now in order.
-func (t *Translator) drain(n *node, out []store.Entry, now time.Time) []store.Entry {
+func (t *Translator) drain(em *emit, n *node, now time.Time) {
 	for len(n.pending) > 0 {
 		next := (n.seq + 1) % 256
 		pm, ok := n.pending[next]
@@ -387,17 +601,16 @@ func (t *Translator) drain(n *node, out []store.Entry, now time.Time) []store.En
 		if len(n.pending) == 0 {
 			t.pendingNodes.Add(-1)
 		}
-		out = append(out, t.handle(n, pm.typ, pm.dev, pm.p, &pm.e, now)...)
+		t.handle(em, n, pm.typ, pm.dev, pm.p, &pm.e, now)
 	}
-	return out
 }
 
 // flushPending handles every held message in sequence order, as when the
 // reorder timeout expires: the first one reveals the gap (counted, and a
 // rebirth is requested when enabled).
-func (t *Translator) flushPending(n *node, out []store.Entry, now time.Time) []store.Entry {
+func (t *Translator) flushPending(em *emit, n *node, now time.Time) {
 	if len(n.pending) == 0 {
-		return out
+		return
 	}
 	base := (n.seq + 1) % 256
 	seqs := make([]int, 0, len(n.pending))
@@ -410,9 +623,8 @@ func (t *Translator) flushPending(n *node, out []store.Entry, now time.Time) []s
 	t.pendingNodes.Add(-1)
 	for _, s := range seqs {
 		pm := list[s]
-		out = append(out, t.handle(n, pm.typ, pm.dev, pm.p, &pm.e, now)...)
+		t.handle(em, n, pm.typ, pm.dev, pm.p, &pm.e, now)
 	}
-	return out
 }
 
 func (t *Translator) clearPending(n *node) {
@@ -430,24 +642,18 @@ func (t *Translator) Flush() []store.Entry {
 		return nil
 	}
 	timeout := t.reorderTimeout()
-	now := t.now()
-	t.mu.RLock()
-	list := make([]*node, 0, 8)
-	for _, n := range t.nodes {
-		list = append(list, n)
-	}
-	t.mu.RUnlock()
-	var out []store.Entry
-	for _, n := range list {
+	now := t.clock()
+	var em emit
+	for _, n := range t.allNodes() {
 		n.mu.Lock()
 		if len(n.pending) > 0 && now.Sub(n.pendingSince) >= timeout {
-			before := len(out)
-			out = t.flushPending(n, out, now)
-			t.metrics.Add(uint64(len(out) - before))
+			before := len(em.out)
+			t.flushPending(&em, n, now)
+			t.ctr[n.shard].metrics.Add(uint64(len(em.out) - before))
 		}
 		n.mu.Unlock()
 	}
-	return out
+	return em.out
 }
 
 // problem records a protocol violation of node n (lock held).
@@ -464,23 +670,31 @@ func (t *Translator) problem(n *node, now time.Time, format string, a ...any) {
 	t.problems.Add(1)
 }
 
+// node returns the node group/edge, creating it (nil when MaxNodes are
+// known).
 func (t *Translator) node(group, edge string) *node {
-	key := group + "/" + edge
-	t.mu.RLock()
-	n := t.nodes[key]
-	t.mu.RUnlock()
+	return t.nodeHashed(nodeHash(group, edge), group, edge)
+}
+
+func (t *Translator) nodeHashed(h uint64, group, edge string) *node {
+	sh := &t.shards[h%nodeShards]
+	sh.mu.RLock()
+	n := sh.m[h].find(group, edge)
+	sh.mu.RUnlock()
 	if n != nil {
 		return n
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if n = t.nodes[key]; n == nil {
-		if len(t.nodes) >= MaxNodes {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if n = sh.m[h].find(group, edge); n == nil {
+		if t.nodeCount.Load() >= MaxNodes {
 			return nil
 		}
-		n = &node{group: group, edge: edge, bdSeq: -1, seq: -1, metrics: map[string]*metric{},
-			aliases: map[uint64]*metric{}, devices: map[string]*device{}}
-		t.nodes[key] = n
+		// The names may be views into a message buffer: keep copies.
+		n = &node{shard: uint32(h % nodeShards), group: strings.Clone(group), edge: strings.Clone(edge), bdSeq: -1, seq: -1,
+			metrics: map[string]*metric{}, devices: map[string]*device{}, next: sh.m[h]}
+		sh.m[h] = n
+		t.nodeCount.Add(1)
 	}
 	return n
 }
@@ -518,8 +732,8 @@ func (t *Translator) register(n *node, devID string, defs map[string]*metric, p 
 	defer t.mu.Unlock()
 	t.dirty.Store(true)
 	for name, m := range defs {
-		if m.hasAlias && n.aliases[m.alias] == m {
-			delete(n.aliases, m.alias)
+		if m.hasAlias && n.aliases.get(m.alias) == m {
+			n.aliases.set(m.alias, nil)
 		}
 		if t.byTopic[m.topic] == m {
 			delete(t.byTopic, m.topic)
@@ -554,23 +768,24 @@ func (t *Translator) register(n *node, devID string, defs map[string]*metric, p 
 		}
 		defs[pm.Name] = m
 		if m.hasAlias {
-			if other := n.aliases[m.alias]; other != nil && other != m {
+			if other := n.aliases.get(m.alias); other != nil && other != m {
 				// Aliases must be unique across a node and its devices:
 				// the later birth wins.
-				t.problem(n, t.now(), "alias %d used by %s and %s", m.alias, describe(other), describe(m))
+				t.problem(n, t.clock(), "alias %d used by %s and %s", m.alias, describe(other), describe(m))
 			}
-			n.aliases[m.alias] = m
+			n.aliases.set(m.alias, m)
 		}
 		t.byTopic[m.topic] = m
 	}
 }
 
-func (t *Translator) nodeBirth(n *node, p *spb.Payload, e *store.Entry, now time.Time) []store.Entry {
+func (t *Translator) nodeBirth(em *emit, n *node, p *spb.Payload, e *store.Entry, now time.Time) {
 	// A node birth invalidates every device: they publish new births.
 	for id, d := range n.devices {
 		t.register(n, id, d.metrics, &spb.Payload{})
 		delete(n.devices, id)
 	}
+	n.lastDev = nil
 	t.register(n, "", n.metrics, p)
 	n.online, n.born, n.restored, n.birthAt, n.birthTS = true, true, false, now, p.Timestamp
 	n.bdSeq = -1
@@ -581,30 +796,29 @@ func (t *Translator) nodeBirth(n *node, p *spb.Payload, e *store.Entry, now time
 	if p.HasSeq {
 		n.seq = int(p.Seq % 256)
 	}
-	return t.values(n, "", n.metrics, p, e)
+	t.values(em, n.metrics, p, e)
 }
 
-func (t *Translator) nodeDeath(n *node, p *spb.Payload, now time.Time) []store.Entry {
+func (t *Translator) nodeDeath(em *emit, n *node, p *spb.Payload, now time.Time) {
 	// A death left behind by an older session (its will, delivered late)
 	// has an older bdSeq: ignore it. Deaths carrying a newer bdSeq are
 	// accepted: they can't come from an older session, and some edge nodes
 	// send the next session's bdSeq on a clean disconnect.
 	if bd, ok := bdSeqOf(p); ok && n.bdSeq >= 0 && staleBdSeq(bd, n.bdSeq) {
 		n.staleDeaths++
-		return nil
+		return
 	}
 	if !n.online {
-		return nil
+		return
 	}
 	n.online, n.deathAt = false, now
-	out := t.offline(n.metrics, nil)
+	t.offline(em, n.metrics)
 	for _, d := range n.devices {
 		if d.online {
 			d.online, d.deathAt = false, now
-			out = t.offline(d.metrics, out)
+			t.offline(em, d.metrics)
 		}
 	}
-	return out
 }
 
 func describe(m *metric) string {
@@ -624,41 +838,43 @@ func staleBdSeq(d, b int64) bool {
 	return diff > 0 && diff < 128
 }
 
-func (t *Translator) deviceBirth(n *node, devID string, p *spb.Payload, e *store.Entry, now time.Time) []store.Entry {
+func (t *Translator) deviceBirth(em *emit, n *node, devID string, p *spb.Payload, e *store.Entry, now time.Time) {
 	d := n.devices[devID]
 	if d == nil {
-		d = &device{id: devID, metrics: map[string]*metric{}}
-		n.devices[devID] = d
+		d = &device{id: strings.Clone(devID), metrics: map[string]*metric{}}
+		n.devices[d.id] = d
 	}
-	t.register(n, devID, d.metrics, p)
+	t.register(n, d.id, d.metrics, p)
 	d.online, d.birthAt = true, now
-	return t.values(n, devID, d.metrics, p, e)
+	t.values(em, d.metrics, p, e)
 }
 
-func (t *Translator) deviceDeath(n *node, devID string, now time.Time) []store.Entry {
+func (t *Translator) deviceDeath(em *emit, n *node, devID string, now time.Time) {
 	d := n.devices[devID]
 	if d == nil || !d.online {
-		return nil
+		return
 	}
 	d.online, d.deathAt = false, now
-	return t.offline(d.metrics, nil)
+	t.offline(em, d.metrics)
 }
 
 // data translates NDATA/DDATA. unknown reports metrics that couldn't be
 // resolved (alias without a birth).
-func (t *Translator) data(n *node, devID string, p *spb.Payload, e *store.Entry) (out []store.Entry, unknown bool) {
+func (t *Translator) data(em *emit, n *node, devID string, p *spb.Payload, e *store.Entry) (unknown bool) {
 	var defs map[string]*metric
 	if devID == "" {
 		defs = n.metrics
 	} else {
-		d := n.devices[devID]
-		if d == nil {
-			d = &device{id: devID, metrics: map[string]*metric{}, online: true}
-			n.devices[devID] = d
+		d := n.lastDev
+		if d == nil || d.id != devID {
+			if d = n.devices[devID]; d == nil {
+				d = &device{id: strings.Clone(devID), metrics: map[string]*metric{}, online: true}
+				n.devices[d.id] = d
+			}
+			n.lastDev = d
 		}
-		defs = d.metrics
+		devID, defs = d.id, d.metrics
 	}
-	out = make([]store.Entry, 0, len(p.Metrics))
 	for i := range p.Metrics {
 		pm := &p.Metrics[i]
 		var m *metric
@@ -682,7 +898,7 @@ func (t *Translator) data(n *node, devID string, p *spb.Payload, e *store.Entry)
 				defs[pm.Name] = m
 			}
 		case pm.HasAlias:
-			m = n.aliases[pm.Alias]
+			m = n.aliases.get(pm.Alias)
 			if m != nil && m.device != devID {
 				m = nil
 			}
@@ -693,33 +909,25 @@ func (t *Translator) data(n *node, devID string, p *spb.Payload, e *store.Entry)
 			unknown = true
 			continue
 		}
-		if ent, ok := t.value(m, pm, e, true); ok {
-			out = append(out, ent)
-		}
+		t.value(em, m, pm, e, true)
 	}
-	return out, unknown
+	return unknown
 }
 
 // values translates the metrics of a birth certificate.
-func (t *Translator) values(n *node, devID string, defs map[string]*metric, p *spb.Payload, e *store.Entry) []store.Entry {
-	out := make([]store.Entry, 0, len(p.Metrics))
+func (t *Translator) values(em *emit, defs map[string]*metric, p *spb.Payload, e *store.Entry) {
 	for i := range p.Metrics {
 		pm := &p.Metrics[i]
-		m := defs[pm.Name]
-		if m == nil {
-			continue
-		}
-		if ent, ok := t.value(m, pm, e, true); ok {
-			out = append(out, ent)
+		if m := defs[pm.Name]; m != nil {
+			t.value(em, m, pm, e, true)
 		}
 	}
-	return out
 }
 
-// value builds the translated entry of one metric value:
+// value translates one metric value:
 //
 //	{"value":72.4,"type":"Float","timestamp":"…","unit":"°C","online":true}
-func (t *Translator) value(m *metric, pm *spb.Metric, e *store.Entry, online bool) (store.Entry, bool) {
+func (t *Translator) value(em *emit, m *metric, pm *spb.Metric, e *store.Entry, online bool) {
 	dt := pm.Datatype
 	if dt == spb.TypeUnknown {
 		dt = m.datatype
@@ -734,53 +942,77 @@ func (t *Translator) value(m *metric, pm *spb.Metric, e *store.Entry, online boo
 		// value and lands at the right place in history.
 		recv = time.UnixMilli(int64(ts)).UnixNano()
 	}
-	buf := make([]byte, 0, 128)
-	buf = append(buf, `{"value":`...)
-	start := len(buf)
+	// Written in a reused scratch buffer, then copied into a payload of
+	// exactly its size: one small allocation per value, and nothing else
+	// kept alive by it.
+	buf := append(em.block[:0], `{"value":`...)
+	vstart := len(buf)
 	if pm.IsNull {
 		buf = append(buf, "null"...)
 	} else {
 		buf = AppendValue(buf, dt, pm.Value)
 	}
-	val := buf[start:len(buf):len(buf)] // shared, never modified: entries are immutable
-	buf = t.envelopeTail(buf, m, dt, ts, online, pm)
+	vend := len(buf)
+	buf = t.envelopeTail(em, buf, m, dt, ts, online, pm)
+	em.block = buf
+	payload := make([]byte, len(buf))
+	copy(payload, buf)
 	if !pm.IsHistorical && !pm.IsTransient {
-		m.value, m.ts, m.recv, m.qos, m.hasLast = val, ts, recv, e.QoS, true
+		// Shared, never modified (entries are immutable).
+		m.value, m.ts, m.recv, m.qos, m.hasLast = payload[vstart:vend:vend], ts, recv, e.QoS, true
 	}
 	// Transient values are streamed (watchers, webhooks) but not stored.
-	return store.Entry{Topic: m.topic, Payload: buf, QoS: e.QoS, Time: recv, Transient: pm.IsTransient}, true
+	em.out = append(em.out, store.Entry{Topic: m.topic, Payload: payload, QoS: e.QoS, Time: recv, Transient: pm.IsTransient, Ref: &m.ref})
 }
 
 // envelopeTail completes {"value":<value> with the metadata (pm is the
 // metric as received, nil when republishing the last value):
 //
 //	,"type":"Float","timestamp":"…","unit":"°C","online":true}
-func (t *Translator) envelopeTail(buf []byte, m *metric, dt spb.DataType, ts uint64, online bool, pm *spb.Metric) []byte {
-	buf = append(buf, `,"type":"`...)
-	buf = append(buf, dt.String()...)
-	buf = append(buf, `","timestamp":`...)
-	buf = appendTime(buf, int64(ts))
+func (t *Translator) envelopeTail(em *emit, buf []byte, m *metric, dt spb.DataType, ts uint64, online bool, pm *spb.Metric) []byte {
+	buf = append(buf, typeTag(dt)...)
+	buf = em.appendTime(buf, ts)
 	if m.unit != "" {
-		buf = append(buf, `,"unit":`...)
-		buf = store.AppendString(buf, m.unit)
+		if m.unitJSON == "" {
+			m.unitJSON = string(store.AppendString([]byte(`,"unit":`), m.unit))
+		}
+		buf = append(buf, m.unitJSON...)
 	}
-	if pm != nil && pm.IsHistorical {
-		buf = append(buf, `,"historical":true`...)
+	if pm != nil {
+		if pm.IsHistorical {
+			buf = append(buf, `,"historical":true`...)
+		}
+		if pm.IsTransient {
+			buf = append(buf, `,"transient":true`...)
+		}
+		if pm.Metadata != nil && hasMetadata(pm.Metadata) {
+			buf = append(buf, `,"metadata":`...)
+			buf = appendMetadata(buf, pm.Metadata)
+		}
+		if pm.Properties != nil && len(pm.Properties.Keys) > 0 {
+			buf = append(buf, `,"properties":`...)
+			buf = AppendProperties(buf, pm.Properties)
+		}
 	}
-	if pm != nil && pm.IsTransient {
-		buf = append(buf, `,"transient":true`...)
+	if online {
+		return append(buf, `,"online":true}`...)
 	}
-	if pm != nil && pm.Metadata != nil && hasMetadata(pm.Metadata) {
-		buf = append(buf, `,"metadata":`...)
-		buf = appendMetadata(buf, pm.Metadata)
+	return append(buf, `,"online":false}`...)
+}
+
+// typeTags are `,"type":"<name>","timestamp":` for every data type.
+var typeTags = func() (tags [64]string) {
+	for i := range tags {
+		tags[i] = `,"type":"` + spb.DataType(i).String() + `","timestamp":`
 	}
-	if pm != nil && pm.Properties != nil && len(pm.Properties.Keys) > 0 {
-		buf = append(buf, `,"properties":`...)
-		buf = AppendProperties(buf, pm.Properties)
+	return
+}()
+
+func typeTag(dt spb.DataType) string {
+	if int(dt) < len(typeTags) {
+		return typeTags[dt]
 	}
-	buf = append(buf, `,"online":`...)
-	buf = strconv.AppendBool(buf, online)
-	return append(buf, '}')
+	return `,"type":"` + dt.String() + `","timestamp":`
 }
 
 func hasMetadata(md *spb.MetaData) bool {
@@ -831,17 +1063,25 @@ func appendMetadata(buf []byte, md *spb.MetaData) []byte {
 
 // offline re-publishes the last value of every metric marked online:false,
 // keeping its time so the age still tells when it was last updated.
-func (t *Translator) offline(defs map[string]*metric, out []store.Entry) []store.Entry {
+func (t *Translator) offline(em *emit, defs map[string]*metric) {
+	need := 0
+	for _, m := range defs {
+		if m.hasLast {
+			need += len(m.value) + 96 + len(m.unit)*2
+		}
+	}
+	// One block for all of them: they are all replaced at the next birth.
+	block := make([]byte, 0, need)
 	for _, m := range defs {
 		if !m.hasLast {
 			continue
 		}
-		buf := append(make([]byte, 0, len(m.value)+96), `{"value":`...)
-		buf = append(buf, m.value...)
-		buf = t.envelopeTail(buf, m, m.datatype, m.ts, false, nil)
-		out = append(out, store.Entry{Topic: m.topic, Payload: buf, QoS: m.qos, Time: m.recv})
+		start := len(block)
+		block = append(block, `{"value":`...)
+		block = append(block, m.value...)
+		block = t.envelopeTail(em, block, m, m.datatype, m.ts, false, nil)
+		em.out = append(em.out, store.Entry{Topic: m.topic, Payload: block[start:len(block):len(block)], QoS: m.qos, Time: m.recv, Ref: &m.ref})
 	}
-	return out
 }
 
 // property returns the string value of property key (case-insensitive).
@@ -927,15 +1167,13 @@ func (t *Translator) RequestRebirth(group, edge string) (bool, error) {
 	if t.publish == nil {
 		return false, errors.New("not connected")
 	}
-	t.mu.RLock()
-	n := t.nodes[group+"/"+edge]
-	t.mu.RUnlock()
+	n := t.lookup(group, edge)
 	if n == nil {
 		return false, ErrUnknownNode
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return t.requestRebirthLocked(n, t.now(), true), nil
+	return t.requestRebirthLocked(n, t.clock(), true), nil
 }
 
 // --- commands ---
@@ -998,7 +1236,7 @@ func (t *Translator) Command(name string, payload []byte) (cmdTopic string, cmd 
 		return "", nil, fmt.Errorf("%s (%s metric %q): %w", name, m.datatype.String(), m.name, err)
 	}
 	v = sameKind(v, m.datatype, m.kind)
-	ms := uint64(t.now().UnixMilli())
+	ms := uint64(t.clock().UnixMilli())
 	cmd = spb.Encode(&spb.Payload{Timestamp: ms, HasTimestamp: true, Metrics: []spb.Metric{{
 		Name: m.name, Timestamp: ms, HasTimestamp: true, Datatype: m.datatype, Value: v,
 	}}})
@@ -1106,16 +1344,12 @@ func (t *Translator) metricInfos(defs map[string]*metric) []MetricInfo {
 // Nodes lists the known edge nodes (optionally of one group), sorted. With
 // metrics, every metric definition is included.
 func (t *Translator) Nodes(group string, metrics bool) []NodeInfo {
-	t.mu.RLock()
-	list := make([]*node, 0, len(t.nodes))
-	for _, n := range t.nodes {
-		if group == "" || n.group == group {
-			list = append(list, n)
-		}
-	}
-	t.mu.RUnlock()
+	list := t.allNodes()
 	out := make([]NodeInfo, 0, len(list))
 	for _, n := range list {
+		if group != "" && n.group != group {
+			continue
+		}
 		n.mu.Lock()
 		ni := NodeInfo{Group: n.group, Edge: n.edge, Online: n.online, BirthSeen: n.born, Restored: n.restored, BirthAt: tp(n.birthAt),
 			DeathAt: tp(n.deathAt), LastMessage: n.lastMsg.UTC(), SeqErrors: n.seqErrors, Unknown: n.unknown,
@@ -1150,14 +1384,13 @@ func (t *Translator) Nodes(group string, metrics bool) []NodeInfo {
 
 // Stats returns counters.
 func (t *Translator) Stats() Stats {
-	st := Stats{Messages: t.messages.Load(), Metrics: t.metrics.Load(), Malformed: t.malformed.Load(), Dropped: t.dropped.Load(), Problems: t.problems.Load(),
+	st := Stats{Malformed: t.malformed.Load(), Dropped: t.dropped.Load(), Problems: t.problems.Load(),
 		Unknown: t.unknown.Load(), SeqErrors: t.seqErrors.Load(), RebirthRequests: t.rebirths.Load(), Commands: t.commands.Load()}
-	t.mu.RLock()
-	list := make([]*node, 0, len(t.nodes))
-	for _, n := range t.nodes {
-		list = append(list, n)
+	for i := range t.ctr {
+		st.Messages += t.ctr[i].messages.Load()
+		st.Metrics += t.ctr[i].metrics.Load()
 	}
-	t.mu.RUnlock()
+	list := t.allNodes()
 	st.Nodes = len(list)
 	for _, n := range list {
 		n.mu.Lock()

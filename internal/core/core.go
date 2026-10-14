@@ -58,8 +58,12 @@ type Service struct {
 	hostMode   atomic.Bool // hostID != ""
 	hostOnline atomic.Bool
 	hostTS     atomic.Int64
-	stop       chan struct{}
-	bg         sync.WaitGroup
+	// workers translate Sparkplug messages in parallel (see Receive).
+	workersMu sync.RWMutex
+	workers   []chan store.Entry
+	workersWG sync.WaitGroup
+	stop      chan struct{}
+	bg        sync.WaitGroup
 	// brokerSource tells where the active broker config came from
 	// ("saved", "env" or "none").
 	brokerSource atomic.Value
@@ -78,7 +82,7 @@ func New(cfg config.Server, log *slog.Logger, st *state.State) *Service {
 		started: time.Now(),
 		stop:    make(chan struct{}),
 	}
-	s.mqtt = mqttc.New(log, s.Ingest)
+	s.mqtt = mqttc.New(log, s.Receive)
 	return s
 }
 
@@ -149,6 +153,7 @@ func (s *Service) Start(envBroker config.Broker, envOK bool) error {
 	s.bg.Add(2)
 	go s.historyLoop()
 	go s.sparkplugLoop()
+	s.startWorkers()
 	b, ok := s.state.Broker()
 	switch {
 	case ok:
@@ -167,6 +172,7 @@ func (s *Service) Start(envBroker config.Broker, envOK bool) error {
 // Close shuts everything down (saving the history snapshot).
 func (s *Service) Close() {
 	s.mqtt.Close()
+	s.stopWorkers()
 	s.hooks.Close()
 	select {
 	case <-s.stop:
