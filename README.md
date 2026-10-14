@@ -315,7 +315,19 @@ Settings saved through the API, MCP (`configure_sparkplug`) or the web UI (Broke
 
 `GET /api/v1/sparkplug/nodes?metrics=true` (MCP: `list_sparkplug_nodes`) lists edge nodes and devices with their online state, `bdSeq`, sequence errors and every metric with its type, unit and topic. `POST /api/v1/sparkplug/nodes/{group}/{edge_node}/rebirth` (MCP: `request_sparkplug_rebirth`) asks a node for a rebirth.
 
-**Performance:** decoding and translating a data message with 10 metrics takes about 3.8 µs and 15 allocations (about 2.6M metric values per second on one core). Plain MQTT traffic is unaffected: it costs one prefix check.
+**Performance:** decoding and translating a data message with 10 metrics takes about 4–6 µs and 15 allocations on one core. Plain MQTT traffic is unaffected: it costs one prefix check.
+
+A load test (`test/sparkplug/load_test.go`) runs mqtt-get as primary host against simulated edge nodes on an embedded broker, all in one process on 4 cores, and checks every translated value:
+
+| | 2,000 edge nodes, one device each, 106,000 metrics |
+|---|---|
+| All births at once | translated in 0.8 s; heap 82 MB (about 730 bytes per metric) |
+| 20,000 data messages/s (200,000 values/s) for 20 s | keeps up: no gaps, no lost values; publish-to-readable latency p50 7 ms, p99 57 ms |
+| Ceiling | about 36,000–39,000 messages/s (360,000–390,000 values/s), after which messages queue and latency grows |
+| Rebirth storm (every node dies and is born again) | 0.7 s |
+| Saving the definitions on shutdown | 0.3 s, 8 MB file |
+
+At the ceiling, one core is saturated by the connection that receives the messages: decoding, translating and storing all happen on its goroutine. The broker and the simulated edge nodes ran on the same 4 cores, so a dedicated machine does better. As a primary host, all `spBv1.0/#` traffic arrives on the first connection. Sparkplug needs each node's messages in order, so more connections (`MQTT_CONNECTIONS`) don't raise this ceiling. Run it with `SPARKPLUG_LOAD=1 go test -v -run Load ./test/sparkplug`; sizes are set by `SPARKPLUG_LOAD_NODES`, `_METRICS`, `_CHANGES`, `_RATE` and `_SECONDS`.
 
 ## Sparkplug B codec as a Go library
 
@@ -1325,7 +1337,7 @@ internal/webhook    webhook queues, batching, retries, signatures
 internal/state      persisted settings, webhooks, history rules and API keys
 internal/config     configuration model and environment parsing
 test/interop        real-broker interoperability suite + docker-compose
-test/sparkplug      Sparkplug B interop with pysparkplug (independent implementation)
+test/sparkplug      Sparkplug B interop with pysparkplug, and a primary host load test
 test/tck            Eclipse Sparkplug TCK host application tests (downloads the TCK; run.sh)
 ```
 
