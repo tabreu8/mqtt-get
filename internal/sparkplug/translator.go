@@ -400,12 +400,31 @@ func (t *Translator) metricTopic(group, edge, dev, name string) string {
 // which are then stored as-is. The returned entries are the translated
 // metric values.
 func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
-	return t.ProcessAppend(e, nil)
+	tr, handled := t.ProcessAppend(e, nil)
+	return entries(tr), handled
+}
+
+// Translated is a translated metric value: the entry to store, and the
+// reference to store it through (store.SetRef).
+type Translated struct {
+	Entry store.Entry
+	Ref   *store.Ref
+}
+
+func entries(tr []Translated) []store.Entry {
+	if tr == nil {
+		return nil
+	}
+	out := make([]store.Entry, len(tr))
+	for i := range tr {
+		out[i] = tr[i].Entry
+	}
+	return out
 }
 
 // ProcessAppend is Process appending the translated values to out, so
 // that a caller translating many messages can reuse one slice.
-func (t *Translator) ProcessAppend(e store.Entry, out []store.Entry) ([]store.Entry, bool) {
+func (t *Translator) ProcessAppend(e store.Entry, out []Translated) ([]Translated, bool) {
 	group, typ, edge, dev, ok := parseTopic(e.Topic)
 	if !ok {
 		return out, false
@@ -476,7 +495,7 @@ func (t *Translator) ProcessAppend(e store.Entry, out []store.Entry) ([]store.En
 
 // emit collects the values translated from one message.
 type emit struct {
-	out   []store.Entry
+	out   []Translated
 	block []byte // scratch space to write a value in
 	keep  bool   // the payload is held for reordering: don't recycle it
 	// the last timestamp formatted, reused by the message's other values
@@ -637,7 +656,10 @@ func (t *Translator) clearPending(n *node) {
 // Flush handles the messages held for reordering whose timeout has
 // expired, and returns their translated values. Call it periodically
 // (every 100 ms or so) when a reorder timeout is set.
-func (t *Translator) Flush() []store.Entry {
+func (t *Translator) Flush() []store.Entry { return entries(t.FlushTranslated()) }
+
+// FlushTranslated is Flush returning the store references too.
+func (t *Translator) FlushTranslated() []Translated {
 	if t.pendingNodes.Load() == 0 {
 		return nil
 	}
@@ -962,7 +984,7 @@ func (t *Translator) value(em *emit, m *metric, pm *spb.Metric, e *store.Entry, 
 		m.value, m.ts, m.recv, m.qos, m.hasLast = payload[vstart:vend:vend], ts, recv, e.QoS, true
 	}
 	// Transient values are streamed (watchers, webhooks) but not stored.
-	em.out = append(em.out, store.Entry{Topic: m.topic, Payload: payload, QoS: e.QoS, Time: recv, Transient: pm.IsTransient, Ref: &m.ref})
+	em.out = append(em.out, Translated{store.Entry{Topic: m.topic, Payload: payload, QoS: e.QoS, Time: recv, Transient: pm.IsTransient}, &m.ref})
 }
 
 // envelopeTail completes {"value":<value> with the metadata (pm is the
@@ -1080,7 +1102,7 @@ func (t *Translator) offline(em *emit, defs map[string]*metric) {
 		block = append(block, `{"value":`...)
 		block = append(block, m.value...)
 		block = t.envelopeTail(em, block, m, m.datatype, m.ts, false, nil)
-		em.out = append(em.out, store.Entry{Topic: m.topic, Payload: block[start:len(block):len(block)], QoS: m.qos, Time: m.recv, Ref: &m.ref})
+		em.out = append(em.out, Translated{store.Entry{Topic: m.topic, Payload: block[start:len(block):len(block)], QoS: m.qos, Time: m.recv}, &m.ref})
 	}
 }
 

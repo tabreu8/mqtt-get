@@ -30,14 +30,12 @@ type Entry struct {
 	Transient bool
 	Time      int64  // unix nanoseconds when received
 	Props     *Props // MQTT 5 properties (nil for MQTT 3.1.1 or none)
-	// Ref optionally caches where Topic is stored, for a producer that
-	// sets the same topics over and over (the Sparkplug translator): Set
-	// then skips looking the topic up.
-	Ref *Ref
 }
 
-// Ref caches the slot of a topic for Set. The zero value is ready to use.
-// Use one Ref for one topic only.
+// Ref caches where a topic is stored, for a producer that sets the same
+// topics over and over (the Sparkplug translator): SetRef then skips
+// looking the topic up. The zero value is ready to use. Use one Ref for
+// one topic only.
 type Ref struct {
 	sl atomic.Pointer[slot]
 	sh atomic.Pointer[shard] // stored before sl, so set whenever sl is
@@ -113,12 +111,15 @@ func (s *Store) shard(key string) *shard {
 
 // Set stores e as the latest value of e.Topic. It returns false if the value
 // was rejected because the topic limit was reached.
-func (s *Store) Set(e *Entry) bool {
+func (s *Store) Set(e *Entry) bool { return s.SetRef(e, nil) }
+
+// SetRef is Set through ref (nil: none), which caches e.Topic's slot.
+func (s *Store) SetRef(e *Entry, ref *Ref) bool {
 	var sh *shard
 	old := (*slot)(nil)
-	if e.Ref != nil {
-		if sl := e.Ref.sl.Load(); sl != nil {
-			sh = e.Ref.sh.Load()
+	if ref != nil {
+		if sl := ref.sl.Load(); sl != nil {
+			sh = ref.sh.Load()
 			sh.mu.Lock()
 			if !sl.dead {
 				old = sl
@@ -143,16 +144,16 @@ func (s *Store) Set(e *Entry) bool {
 			// packet), which the map key would otherwise keep alive.
 			sl := newSlot(e)
 			sh.m[strings.Clone(e.Topic)] = &sl
-			if e.Ref != nil {
-				e.Ref.sh.Store(sh)
-				e.Ref.sl.Store(&sl)
+			if ref != nil {
+				ref.sh.Store(sh)
+				ref.sl.Store(&sl)
 			}
 			sh.mu.Unlock()
 			return true
 		}
-		if e.Ref != nil {
-			e.Ref.sh.Store(sh)
-			e.Ref.sl.Store(old)
+		if ref != nil {
+			ref.sh.Store(sh)
+			ref.sl.Store(old)
 		}
 	}
 	if old.time > e.Time {

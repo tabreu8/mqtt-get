@@ -99,9 +99,9 @@ func New(cfg config.Server, log *slog.Logger, st *state.State) *Service {
 func (s *Service) Ingest(e store.Entry) {
 	if sp := s.spb.Load(); sp != nil && sparkplug.IsSparkplug(e.Topic) {
 		s.hostState(sp, &e)
-		if out, handled := sp.Process(e); handled {
+		if out, handled := sp.ProcessAppend(e, nil); handled {
 			for i := range out {
-				s.ingest(out[i])
+				s.ingestRef(out[i].Entry, out[i].Ref)
 			}
 			if !sp.Config().KeepRaw {
 				return
@@ -111,9 +111,12 @@ func (s *Service) Ingest(e store.Entry) {
 	s.ingest(e)
 }
 
-func (s *Service) ingest(e store.Entry) {
+func (s *Service) ingest(e store.Entry) { s.ingestRef(e, nil) }
+
+// ingestRef is ingest storing through ref (see store.SetRef).
+func (s *Service) ingestRef(e store.Entry, ref *store.Ref) {
 	if !e.Transient {
-		s.store.Set(&e)
+		s.store.SetRef(&e, ref)
 		s.hist.Add(&e)
 	}
 	s.hooks.Dispatch(e)

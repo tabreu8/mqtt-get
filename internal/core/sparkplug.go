@@ -144,13 +144,19 @@ const (
 type receiver struct {
 	s       *Service
 	batches [][]store.Entry // per worker
+	queued  int             // entries in batches
 }
 
 var batchPool = sync.Pool{New: func() any { b := make([]store.Entry, 0, batchSize); return &b }}
 
 func (r *receiver) Receive(e store.Entry) {
 	s := r.s
-	if s.spb.Load() != nil {
+	sp := s.spb.Load()
+	if sp == nil || !sparkplug.IsSparkplug(e.Topic) {
+		s.ingestRef(e, nil) // plain MQTT: nothing else to decide
+		return
+	}
+	{
 		if h, ok := sparkplug.Route(e.Topic); ok {
 			s.workersMu.RLock()
 			if w := s.workers; w != nil {
@@ -162,7 +168,9 @@ func (r *receiver) Receive(e store.Entry) {
 					r.batches[i] = (*batchPool.Get().(*[]store.Entry))[:0]
 				}
 				r.batches[i] = append(r.batches[i], e)
+				r.queued++
 				if len(r.batches[i]) >= batchSize {
+					r.queued -= len(r.batches[i])
 					w[i] <- r.batches[i]
 					r.batches[i] = nil
 				}
@@ -176,6 +184,10 @@ func (r *receiver) Receive(e store.Entry) {
 }
 
 func (r *receiver) Flush() {
+	if r.queued == 0 {
+		return
+	}
+	r.queued = 0
 	s := r.s
 	s.workersMu.RLock()
 	defer s.workersMu.RUnlock()
@@ -224,7 +236,7 @@ func (s *Service) stopWorkers() {
 
 func (s *Service) worker(ch chan []store.Entry) {
 	defer s.workersWG.Done()
-	var out []store.Entry // reused: ingest copies what it keeps
+	var out []sparkplug.Translated // reused: ingest copies what it keeps
 	for batch := range ch {
 		for _, e := range batch {
 			sp := s.spb.Load()
@@ -235,7 +247,7 @@ func (s *Service) worker(ch chan []store.Entry) {
 			var handled bool
 			out, handled = sp.ProcessAppend(e, out[:0])
 			for i := range out {
-				s.ingest(out[i])
+				s.ingestRef(out[i].Entry, out[i].Ref)
 			}
 			clear(out) // don't keep the payloads alive until the next message
 			if !handled || sp.Config().KeepRaw {
@@ -301,8 +313,8 @@ func (s *Service) sparkplugLoop() {
 		select {
 		case <-t.C:
 			if sp := s.spb.Load(); sp != nil {
-				for _, e := range sp.Flush() {
-					s.ingest(e)
+				for _, tr := range sp.FlushTranslated() {
+					s.ingestRef(tr.Entry, tr.Ref)
 				}
 			}
 		case <-save.C:

@@ -135,7 +135,7 @@ func TestPropsJSONAndExpiry(t *testing.T) {
 func TestSetWithRef(t *testing.T) {
 	s := New(0)
 	var ref Ref
-	set := func(v string, ts int64) { s.Set(&Entry{Topic: "a/b", Payload: []byte(v), Time: ts, Ref: &ref}) }
+	set := func(v string, ts int64) { s.SetRef(&Entry{Topic: "a/b", Payload: []byte(v), Time: ts}, &ref) }
 	get := func() string {
 		e, ok := s.Get("a/b")
 		if !ok {
