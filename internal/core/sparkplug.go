@@ -47,6 +47,26 @@ func (s *Service) applySparkplug(c config.Sparkplug) {
 	s.spb.Store(sparkplug.New(c, s.sparkplugPublish))
 }
 
+// sparkplugLoop translates the Sparkplug messages held for reordering once
+// their timeout expires.
+func (s *Service) sparkplugLoop() {
+	defer s.bg.Done()
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if sp := s.spb.Load(); sp != nil {
+				for _, e := range sp.Flush() {
+					s.ingest(e)
+				}
+			}
+		case <-s.stop:
+			return
+		}
+	}
+}
+
 // sparkplugPublish sends a rebirth request without blocking ingest.
 func (s *Service) sparkplugPublish(name string, payload []byte) {
 	go func() {
@@ -114,8 +134,12 @@ func (s *Service) Sparkplug() SparkplugView {
 	if sp := s.spb.Load(); sp != nil {
 		st := sp.Stats()
 		v.Stats = &st
-		if !v.Subscribed {
+		b := s.mqtt.Config()
+		switch {
+		case !v.Subscribed:
 			v.Hint = "the broker subscriptions don't include spBv1.0/#: add it to receive Sparkplug messages"
+		case b.SharedGroup != "":
+			v.Hint = "with a shared subscription group, Sparkplug messages are spread over several connections and a node's messages can arrive out of order or at another subscriber: keep reorder_timeout_ms on, or subscribe to spBv1.0/# without a shared group"
 		}
 	}
 	return v

@@ -248,7 +248,7 @@ curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/spb/plant1/pre
 - **Types**: all integer types (signed values decoded as two's complement, per Sparkplug 3.0), Float, Double, Boolean, String, Text, UUID, DateTime (as an RFC 3339 string), Bytes and File (base64), every array type, DataSets (`{"columns","types","rows"}`) and Templates (`{"template_ref","metrics","parameters"}`). 64-bit integers keep every digit.
 - **Births and aliases.** Births record each metric's name, alias and type, so data messages that carry only aliases are decoded. A new node birth invalidates its devices until they're born again.
 - **Deaths.** `NDEATH` and `DDEATH` republish the metrics with `"online":false`, keeping the last value and its age. A death left over from an older session (an older `bdSeq`, e.g. a will delivered late) is ignored. A death with a *newer* `bdSeq` is accepted, because some edge nodes send the next session's `bdSeq` when they disconnect cleanly.
-- **Sequence numbers** are checked for each edge node; gaps (lost messages) are counted.
+- **Sequence numbers** are checked for each edge node. A message that arrives ahead of its turn is held for up to `reorder_timeout_ms` (default 2 s) for the missing ones, then everything is translated in order. If they don't arrive in time, the held messages are translated anyway, the gap is counted as a sequence error and, with `rebirth` on, a rebirth is requested. A message that arrives after that (late, or a duplicate) is dropped, since newer values were already translated. With `reorder_timeout_ms` set to 0, gaps are counted immediately and nothing is held.
 - **Joining late.** Data from a node whose birth mqtt-get missed: metrics that carry names are still translated (typed by their value), and metrics sent only as aliases are counted as unknown. With `rebirth` on, mqtt-get then asks the node to publish its births again (an `NCMD` with `Node Control/Rebirth`), at most once per `rebirth_interval_sec`. The same happens after a sequence gap.
 - **Template definitions** in births (such as Ignition's `_types_/…`) describe types and are not translated; template instances are.
 - **Transient** metrics (`is_transient`) are delivered to waits, webhooks and the WebSocket stream (flagged `"transient":true`), but not stored as the latest value or in history.
@@ -288,11 +288,12 @@ mqtt-get acts as a Sparkplug 3.0 host application that **observes**: it decodes 
 | `prefix` | `SPARKPLUG_PREFIX` | `spb` | Prefix of the translated topics |
 | `rebirth` | `SPARKPLUG_REBIRTH` | `false` | Request births from nodes that can't be decoded or lost messages (publishes `NCMD`) |
 | `rebirth_interval_sec` | `SPARKPLUG_REBIRTH_INTERVAL_SEC` | `30` | Minimum time between rebirth requests to one node |
+| `reorder_timeout_ms` | `SPARKPLUG_REORDER_TIMEOUT_MS` | `2000` | How long to wait for missing messages before treating the gap as lost (0: don't wait) |
 | `commands` | `SPARKPLUG_COMMANDS` | `false` | Allow writes through publish (needs the `publish` scope) |
 | `commands_filter` | `SPARKPLUG_COMMANDS_FILTER` (comma-separated) | all | Topic filters of the metrics that may be written |
 | `keep_raw` | `SPARKPLUG_KEEP_RAW` | `false` | Also store the raw protobuf messages |
 
-Settings saved through the API, MCP (`configure_sparkplug`) or the web UI (Broker tab) take precedence over the environment. Changing them keeps what mqtt-get knows about the edge nodes, except a prefix change, which starts over. The broker subscriptions must include `spBv1.0/#` (the default `#` does); `GET /api/v1/sparkplug` warns when they don't.
+Settings saved through the API, MCP (`configure_sparkplug`) or the web UI (Broker tab) take precedence over the environment. Changing them keeps what mqtt-get knows about the edge nodes, except a prefix change, which starts over. The broker subscriptions must include `spBv1.0/#` (the default `#` does); `GET /api/v1/sparkplug` warns when they don't. It also warns when a shared subscription group is set (`MQTT_SHARED_GROUP`): a node's messages are then spread over several connections, so they can arrive out of order (the reorder timeout absorbs that) or at another subscriber in the group (which loses them for this one).
 
 `GET /api/v1/sparkplug/nodes?metrics=true` (MCP: `list_sparkplug_nodes`) lists edge nodes and devices with their online state, `bdSeq`, sequence errors and every metric with its type, unit and topic. `POST /api/v1/sparkplug/nodes/{group}/{edge_node}/rebirth` (MCP: `request_sparkplug_rebirth`) asks a node for a rebirth.
 

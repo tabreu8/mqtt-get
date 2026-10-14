@@ -493,7 +493,15 @@ type Sparkplug struct {
 	// one of these topic filters (e.g. "spb/plant1/+/+/Setpoints/#").
 	// Empty: every metric is writable when Commands is on.
 	CommandsFilter []string `json:"commands_filter,omitempty"`
+	// ReorderTimeoutMs is how long a message that arrives out of sequence
+	// is held for the missing ones (default 2000; 0 disables reordering:
+	// gaps are counted immediately). When it expires, the held messages
+	// are translated and a rebirth is requested (with Rebirth).
+	ReorderTimeoutMs *int `json:"reorder_timeout_ms,omitempty"`
 }
+
+// DefaultReorderTimeoutMs is the default Sparkplug reorder timeout.
+const DefaultReorderTimeoutMs = 2000
 
 // Normalize fills defaults.
 func (s *Sparkplug) Normalize() {
@@ -503,6 +511,10 @@ func (s *Sparkplug) Normalize() {
 	}
 	if s.RebirthIntervalSec <= 0 {
 		s.RebirthIntervalSec = 30
+	}
+	if s.ReorderTimeoutMs == nil {
+		ms := DefaultReorderTimeoutMs
+		s.ReorderTimeoutMs = &ms
 	}
 	var filters []string
 	for _, f := range s.CommandsFilter {
@@ -523,6 +535,9 @@ func (s *Sparkplug) Validate() error {
 	}
 	if s.RebirthIntervalSec > 86400 {
 		return errors.New("rebirth_interval_sec must be <= 86400")
+	}
+	if ms := s.ReorderTimeoutMs; ms != nil && (*ms < 0 || *ms > 60000) {
+		return errors.New("reorder_timeout_ms must be between 0 and 60000")
 	}
 	if len(s.CommandsFilter) > 1000 {
 		return errors.New("commands_filter: at most 1000 filters")
@@ -649,6 +664,10 @@ func SparkplugFromEnv() (s Sparkplug, ok bool, err error) {
 		RebirthIntervalSec: envInt("SPARKPLUG_REBIRTH_INTERVAL_SEC", 0),
 		Commands:           envBool("SPARKPLUG_COMMANDS", false),
 		CommandsFilter:     envList("SPARKPLUG_COMMANDS_FILTER"),
+	}
+	if Env("SPARKPLUG_REORDER_TIMEOUT_MS") != "" {
+		ms := envInt("SPARKPLUG_REORDER_TIMEOUT_MS", DefaultReorderTimeoutMs)
+		s.ReorderTimeoutMs = &ms
 	}
 	s.Normalize()
 	return s, true, s.Validate()

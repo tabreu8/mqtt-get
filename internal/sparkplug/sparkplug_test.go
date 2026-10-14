@@ -60,6 +60,9 @@ func (f *fakeBroker) count() int {
 
 func newT(cfg config.Sparkplug) (*Translator, *fakeBroker, *time.Time) {
 	cfg.Enabled = true
+	if cfg.ReorderTimeoutMs == nil {
+		cfg.ReorderTimeoutMs = ms(0) // gaps reported at once, unless a test sets it
+	}
 	cfg.Normalize()
 	fb := &fakeBroker{}
 	tr := New(cfg, fb.publish)
@@ -730,5 +733,78 @@ func TestCommandsFilter(t *testing.T) {
 	}
 	if !writable["spb/g/e/Setpoints/Temp"] || writable["spb/g/e/Level"] || !writable["spb/g/e/valve/Open"] || writable["spb/g/e/valve/Offset"] {
 		t.Fatalf("writable flags: %v", writable)
+	}
+}
+
+func ms(v int) *int { return &v }
+
+func TestReorderWindow(t *testing.T) {
+	tr, fb, now := newT(config.Sparkplug{Rebirth: true, ReorderTimeoutMs: ms(2000)})
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1, dbl("A", 1, 0))))
+	got := func(out []store.Entry) []float64 {
+		var vs []float64
+		for _, v := range values(t, out) {
+			vs = append(vs, v["value"].(float64))
+		}
+		return vs
+	}
+	// 2 arrives before 1: held, then both are translated in order.
+	if out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(2, byAlias(1, 2)))); len(out) != 0 {
+		t.Fatalf("message ahead of its turn translated at once: %v", got(out))
+	}
+	out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(1, byAlias(1, 1))))
+	if len(out) != 2 || !strings.Contains(string(out[0].Payload), `"value":1`) || !strings.Contains(string(out[1].Payload), `"value":2`) {
+		t.Fatalf("reordered: %v", got(out))
+	}
+	if st := tr.Stats(); st.SeqErrors != 0 || fb.count() != 0 || tr.Flush() != nil {
+		t.Fatalf("missing message arrived in time: %+v, %d rebirths", st, fb.count())
+	}
+
+	// 4 and 5 arrive, 3 never does: held until the timeout, then
+	// translated, the gap counted and a rebirth requested.
+	tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(5, byAlias(1, 5))))
+	tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(4, byAlias(1, 4))))
+	*now = now.Add(1900 * time.Millisecond)
+	if out := tr.Flush(); out != nil {
+		t.Fatalf("flushed before the timeout: %v", got(out))
+	}
+	*now = now.Add(200 * time.Millisecond)
+	out = tr.Flush()
+	if len(out) != 2 || !strings.Contains(string(out[0].Payload), `"value":4`) || !strings.Contains(string(out[1].Payload), `"value":5`) {
+		t.Fatalf("flushed: %v", got(out))
+	}
+	if st := tr.Stats(); st.SeqErrors != 1 || fb.count() != 1 || fb.sent[0].topic != "spBv1.0/g/NCMD/e" {
+		t.Fatalf("after the timeout: %+v, %d rebirths", st, fb.count())
+	}
+	// 3 shows up late: dropped (older than what was translated).
+	if out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(3, byAlias(1, 3)))); len(out) != 0 {
+		t.Fatalf("late message translated: %v", got(out))
+	}
+	if out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(6, byAlias(1, 6)))); len(out) != 1 {
+		t.Fatal("normal operation did not resume")
+	}
+
+	// A node that restarts its sequence without a birth we saw is
+	// followed after a few messages.
+	for i, seq := range []uint64{0, 1, 2, 3} {
+		out, _ := tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(seq, byAlias(1, float64(100+i)))))
+		if (i < 2) != (len(out) == 0) {
+			t.Fatalf("restarted sequence, message %d: %v", i, got(out))
+		}
+	}
+
+	// A death translates what was held first; a birth drops older
+	// held messages and keeps the new session's.
+	tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(9, byAlias(1, 9))))
+	out, _ = tr.Process(entry("spBv1.0/g/NDEATH/e", spb.Encode(&spb.Payload{Metrics: []spb.Metric{{Name: "bdSeq", Value: spb.Value{Kind: spb.KindLong, Uint: 1}}}})))
+	if len(out) < 1 || !strings.Contains(string(out[0].Payload), `"value":9`) || !strings.Contains(string(out[0].Payload), `"online":true`) {
+		t.Fatalf("death with held messages: %v", got(out))
+	}
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 2, dbl("A", 1, 0))))
+	tr.Process(entry("spBv1.0/g/NDATA/e", dataPayload(7, byAlias(1, 7)))) // stale
+	tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 3, dbl("A", 1, 0))))
+	*now = now.Add(time.Hour)
+	if out := tr.Flush(); out != nil || tr.pendingNodes.Load() != 0 {
+		t.Fatalf("held messages survived a birth: %v", got(out))
 	}
 }

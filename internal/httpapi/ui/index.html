@@ -201,6 +201,7 @@ tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
       <div class="row">
         <div><label>Topic prefix</label><input name="prefix" placeholder="spb"></div>
         <div><label>Minimum seconds between rebirth requests</label><input name="rebirth_interval_sec" type="number" min="1" value="30"></div>
+        <div><label>Reorder timeout (ms, 0 = off)</label><input name="reorder_timeout_ms" type="number" min="0" max="60000" value="2000"></div>
       </div>
       <label><input type="checkbox" name="rebirth">Request a rebirth when a node's metrics can't be decoded or messages were lost</label>
       <label><input type="checkbox" name="commands">Allow writes: publishing to a metric topic sends an NCMD/DCMD to the device</label>
@@ -603,6 +604,7 @@ async function loadSparkplug() {
   try { v = await api('GET', '/api/v1/sparkplug'); } catch (e) { return; }
   const c = v.config, e = $('#spbForm').elements;
   e.enabled.checked = c.enabled; e.prefix.value = c.prefix || ''; e.rebirth_interval_sec.value = c.rebirth_interval_sec || 30;
+  e.reorder_timeout_ms.value = c.reorder_timeout_ms ?? 2000;
   e.rebirth.checked = !!c.rebirth; e.commands.checked = !!c.commands; e.keep_raw.checked = !!c.keep_raw;
   e.commands_filter.value = (c.commands_filter || []).join('\n');
   $('#spbHint').textContent = v.hint || '';
@@ -627,6 +629,7 @@ $('#spbForm').onsubmit = async ev => {
   ev.preventDefault();
   const e = ev.target.elements;
   const body = { enabled: e.enabled.checked, prefix: e.prefix.value.trim(), rebirth_interval_sec: parseInt(e.rebirth_interval_sec.value) || 0,
+    reorder_timeout_ms: Math.max(0, parseInt(e.reorder_timeout_ms.value) || 0),
     rebirth: e.rebirth.checked, commands: e.commands.checked, keep_raw: e.keep_raw.checked,
     commands_filter: e.commands_filter.value.split(/[\n,]/).map(x => x.trim()).filter(Boolean) };
   try { await api('PUT', '/api/v1/sparkplug', body); $('#spbErr').textContent = ''; toast('Sparkplug settings saved'); loadSparkplug(); }

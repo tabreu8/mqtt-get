@@ -139,8 +139,9 @@ func (s *Service) Start(envBroker config.Broker, envOK bool) error {
 			s.log.Info("history: restored", "file", p, "topics", st.Topics, "points", st.Points)
 		}
 	}
-	s.bg.Add(1)
+	s.bg.Add(2)
 	go s.historyLoop()
+	go s.sparkplugLoop()
 	b, ok := s.state.Broker()
 	switch {
 	case ok:

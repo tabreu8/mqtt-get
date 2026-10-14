@@ -480,3 +480,30 @@ func TestSparkplugTransientIsStreamedNotStored(t *testing.T) {
 		t.Fatalf("transient value recorded in history: %v", err)
 	}
 }
+
+func TestSparkplugReorderTimeoutFlushes(t *testing.T) {
+	e := newWSEnv(t, config.Server{})
+	if err := e.svc.Start(config.Broker{}, false); err != nil {
+		t.Fatal(err)
+	}
+	timeout := 150
+	if _, err := e.svc.SetSparkplug(config.Sparkplug{Enabled: true, ReorderTimeoutMs: &timeout}); err != nil {
+		t.Fatal(err)
+	}
+	send := func(typ string, seq uint64, v float64) {
+		e.svc.Ingest(store.Entry{Topic: "spBv1.0/g/" + typ + "/e", Time: time.Now().UnixNano(), Payload: spb.Encode(&spb.Payload{Seq: seq, HasSeq: true,
+			Metrics: []spb.Metric{{Name: "A", Datatype: spb.TypeDouble, Value: spb.Value{Kind: spb.KindDouble, Float: v}}}})})
+	}
+	send("NBIRTH", 0, 0)
+	send("NDATA", 2, 2) // 1 never arrives
+	if v, _ := e.svc.Store().Get("spb/g/e/A"); v == nil || !strings.Contains(string(v.Payload), `"value":0`) {
+		t.Fatal("message ahead of its turn translated before the timeout")
+	}
+	eventually(t, func() bool {
+		v, _ := e.svc.Store().Get("spb/g/e/A")
+		return v != nil && strings.Contains(string(v.Payload), `"value":2`)
+	})
+	if st := e.svc.Sparkplug().Stats; st.SeqErrors != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}

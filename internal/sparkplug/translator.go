@@ -94,6 +94,12 @@ type node struct {
 
 	seqErrors, unknown, rebirths, staleDeaths uint64
 
+	// Messages held until the sequence gap before them is filled (by seq),
+	// since pendingSince; behind counts messages dropped in a row as late.
+	pending      map[int]pending
+	pendingSince time.Time
+	behind       int
+
 	// problems counts protocol violations (payloads failing validation,
 	// NBIRTH seq other than 0, alias conflicts); lastProblem describes
 	// the latest.
@@ -134,6 +140,7 @@ type Translator struct {
 	byTopic map[string]*metric // translated topic -> metric (commands)
 
 	messages, metrics, malformed, dropped, problems, unknown, seqErrors, rebirths, commands atomic.Uint64
+	pendingNodes                                                                            atomic.Int64 // nodes holding messages
 }
 
 // New creates a translator. cfg must be normalized and valid.
@@ -244,33 +251,176 @@ func (t *Translator) Process(e store.Entry) (out []store.Entry, handled bool) {
 		// Still translated (leniently): the problem is reported per node.
 		t.problem(n, now, "%s: %v", typ, err)
 	}
-	var rebirth bool
 	switch typ {
 	case NBIRTH:
 		if p.HasSeq && p.Seq != 0 {
 			t.problem(n, now, "NBIRTH with seq %d (must be 0)", p.Seq)
 		}
 		out = t.nodeBirth(n, p, &e, now)
+		// Messages of the new session that overtook the birth (possible
+		// with shared subscriptions) follow it; older ones are dropped.
+		out = t.drain(n, out, now)
+		t.clearPending(n)
 	case NDEATH:
-		out = t.nodeDeath(n, p, now)
+		// Messages held for reordering are older than the death.
+		out = t.flushPending(n, nil, now)
+		out = append(out, t.nodeDeath(n, p, now)...)
+	default:
+		out = t.sequenced(n, typ, dev, p, &e, now)
+	}
+	n.mu.Unlock()
+	t.metrics.Add(uint64(len(out)))
+	return out, true
+}
+
+// handle translates a DBIRTH, DDEATH, NDATA or DDATA message (lock held).
+func (t *Translator) handle(n *node, typ, dev string, p *spb.Payload, e *store.Entry, now time.Time) (out []store.Entry) {
+	rebirth := t.checkSeq(n, p)
+	switch typ {
 	case DBIRTH:
-		rebirth = t.checkSeq(n, p)
-		out = t.deviceBirth(n, dev, p, &e, now)
+		out = t.deviceBirth(n, dev, p, e, now)
 	case DDEATH:
-		rebirth = t.checkSeq(n, p)
 		out = t.deviceDeath(n, dev, now)
 	case NDATA, DDATA:
-		rebirth = t.checkSeq(n, p)
 		var unknown bool
-		out, unknown = t.data(n, dev, p, &e)
+		out, unknown = t.data(n, dev, p, e)
 		rebirth = rebirth || unknown || !n.born
 	}
 	if rebirth {
 		t.requestRebirthLocked(n, now, false)
 	}
-	n.mu.Unlock()
-	t.metrics.Add(uint64(len(out)))
-	return out, true
+	return out
+}
+
+// pending is a message held until the ones before it arrive.
+type pending struct {
+	typ, dev string
+	p        *spb.Payload
+	e        store.Entry
+}
+
+// sequenced handles a message that carries a sequence number. With a
+// reorder timeout, a message that arrives ahead of its turn (a gap in the
+// sequence) is held until the missing ones arrive, or until the timeout
+// expires (see Flush).
+func (t *Translator) sequenced(n *node, typ, dev string, p *spb.Payload, e *store.Entry, now time.Time) []store.Entry {
+	timeout := t.reorderTimeout()
+	if !p.HasSeq || timeout <= 0 || n.seq < 0 {
+		return t.handle(n, typ, dev, p, e, now)
+	}
+	seq := int(p.Seq % 256)
+	d := (seq - (n.seq+1)%256 + 256) % 256
+	switch {
+	case d == 0: // in order
+		n.behind = 0
+		return t.drain(n, t.handle(n, typ, dev, p, e, now), now)
+	case d < 128: // ahead: hold it
+		if n.pending == nil {
+			n.pending = map[int]pending{}
+		}
+		if len(n.pending) == 0 {
+			n.pendingSince = now
+			t.pendingNodes.Add(1)
+		}
+		n.pending[seq] = pending{typ: typ, dev: dev, p: p, e: *e}
+		return nil
+	}
+	// Behind: a duplicate, or a message that arrived after its reorder
+	// timeout expired. Its values are older than the ones already
+	// translated, so it is dropped. Several in a row mean the node
+	// restarted its sequence without a birth we saw: follow it.
+	n.seqErrors++
+	t.seqErrors.Add(1)
+	if n.behind++; n.behind < 3 {
+		t.requestRebirthLocked(n, now, false)
+		return nil
+	}
+	n.behind = 0
+	out := t.flushPending(n, nil, now)
+	n.seq = (seq + 255) % 256
+	return append(out, t.handle(n, typ, dev, p, e, now)...)
+}
+
+func (t *Translator) reorderTimeout() time.Duration {
+	if ms := t.cfg.Load().ReorderTimeoutMs; ms != nil {
+		return time.Duration(*ms) * time.Millisecond
+	}
+	return 0
+}
+
+// drain handles the held messages that are now in order.
+func (t *Translator) drain(n *node, out []store.Entry, now time.Time) []store.Entry {
+	for len(n.pending) > 0 {
+		next := (n.seq + 1) % 256
+		pm, ok := n.pending[next]
+		if !ok {
+			break
+		}
+		delete(n.pending, next)
+		if len(n.pending) == 0 {
+			t.pendingNodes.Add(-1)
+		}
+		out = append(out, t.handle(n, pm.typ, pm.dev, pm.p, &pm.e, now)...)
+	}
+	return out
+}
+
+// flushPending handles every held message in sequence order, as when the
+// reorder timeout expires: the first one reveals the gap (counted, and a
+// rebirth is requested when enabled).
+func (t *Translator) flushPending(n *node, out []store.Entry, now time.Time) []store.Entry {
+	if len(n.pending) == 0 {
+		return out
+	}
+	base := (n.seq + 1) % 256
+	seqs := make([]int, 0, len(n.pending))
+	for s := range n.pending {
+		seqs = append(seqs, s)
+	}
+	sort.Slice(seqs, func(i, j int) bool { return (seqs[i]-base+256)%256 < (seqs[j]-base+256)%256 })
+	list := n.pending
+	n.pending = nil
+	t.pendingNodes.Add(-1)
+	for _, s := range seqs {
+		pm := list[s]
+		out = append(out, t.handle(n, pm.typ, pm.dev, pm.p, &pm.e, now)...)
+	}
+	return out
+}
+
+func (t *Translator) clearPending(n *node) {
+	if len(n.pending) > 0 {
+		n.pending = nil
+		t.pendingNodes.Add(-1)
+	}
+}
+
+// Flush handles the messages held for reordering whose timeout has
+// expired, and returns their translated values. Call it periodically
+// (every 100 ms or so) when a reorder timeout is set.
+func (t *Translator) Flush() []store.Entry {
+	if t.pendingNodes.Load() == 0 {
+		return nil
+	}
+	timeout := t.reorderTimeout()
+	now := t.now()
+	t.mu.RLock()
+	list := make([]*node, 0, 8)
+	for _, n := range t.nodes {
+		list = append(list, n)
+	}
+	t.mu.RUnlock()
+	var out []store.Entry
+	for _, n := range list {
+		n.mu.Lock()
+		if len(n.pending) > 0 && now.Sub(n.pendingSince) >= timeout {
+			before := len(out)
+			out = t.flushPending(n, out, now)
+			t.metrics.Add(uint64(len(out) - before))
+		}
+		n.mu.Unlock()
+	}
+	return out
 }
 
 // problem records a protocol violation of node n (lock held).

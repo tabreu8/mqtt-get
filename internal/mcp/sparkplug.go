@@ -78,6 +78,7 @@ var sparkplugAdminTools = []*tool{
 			"keep_raw":             boolean("Also keep the raw protobuf messages under spBv1.0/... (default false)"),
 			"rebirth":              boolean("Request a rebirth when a node's metrics can't be decoded or messages were lost (default false)"),
 			"rebirth_interval_sec": integer("Minimum seconds between rebirth requests per node (default 30)", 1, 86400),
+			"reorder_timeout_ms":   integer("How long to hold a message that arrives out of sequence for the missing ones; when it expires, a rebirth is requested (with rebirth). 0 disables (default 2000)", 0, 60000),
 			"commands":             boolean("Allow writes to Sparkplug metrics through publish (default false)"),
 			"commands_filter":      strList("Only metrics whose translated topic matches one of these topic filters are writable (e.g. [\"spb/plant1/+/+/Setpoints/#\"]); empty: all"),
 		}),
