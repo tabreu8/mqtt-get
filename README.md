@@ -315,19 +315,33 @@ Settings saved through the API, MCP (`configure_sparkplug`) or the web UI (Broke
 
 `GET /api/v1/sparkplug/nodes?metrics=true` (MCP: `list_sparkplug_nodes`) lists edge nodes and devices with their online state, `bdSeq`, sequence errors and every metric with its type, unit and topic. `POST /api/v1/sparkplug/nodes/{group}/{edge_node}/rebirth` (MCP: `request_sparkplug_rebirth`) asks a node for a rebirth.
 
-**Performance:** decoding and translating a data message with 10 metrics takes about 4–6 µs and 15 allocations on one core. Plain MQTT traffic is unaffected: it costs one prefix check.
+### Sparkplug performance
 
-A load test (`test/sparkplug/load_test.go`) runs mqtt-get as primary host against simulated edge nodes on an embedded broker, all in one process on 4 cores, and checks every translated value:
+Sparkplug messages are translated in parallel: the connection that receives them hands them to one worker per CPU, each edge node always to the same worker, so translation uses every core while each node's messages stay in order. They are handed over in batches, one per socket read. When the workers fall behind, the reader waits, which slows the broker down instead of dropping messages, as for plain MQTT traffic. Each value costs one allocation of exactly its size, and nothing in it keeps other values alive.
 
-| | 2,000 edge nodes, one device each, 106,000 metrics |
+Measured on a 4-vCPU VM with `cmd/floodbroker -sparkplug 1000 -metrics K`, a fake broker that plays 1,000 edge nodes (births, then DDATA by alias) as fast as the socket accepts, into the mqtt-get binary:
+
+| DDATA carrying | Messages/s | Values/s |
+|---|---|---|
+| 1 metric | **1.9M** | 1.9M |
+| 10 metrics | **454k** | **4.5M** |
+| 50 metrics | **95k** | **4.7M** |
+
+Plain MQTT messages on the same machine: about 4.1M messages/s. A Sparkplug message carries several values, and each one becomes its own topic with a JSON value, so messages/s depends on the message size. Counted in values, Sparkplug matches plain ingest from about 10 metrics per message. A one-metric message costs about twice a plain one, for the protobuf decoding, the node state and the JSON. Plain MQTT traffic is unaffected by Sparkplug support: it costs one prefix check.
+
+On one core, a 10-metric message takes about 7 µs (`go test -run '^$' -bench Ingest ./test/sparkplug` measures it without a broker or network, also through the workers).
+
+A load test (`test/sparkplug/load_test.go`) runs mqtt-get as primary host against 2,000 simulated edge nodes (one device each, 106,000 metrics) on an embedded broker in the same process, and checks every translated value:
+
+| | |
 |---|---|
-| All births at once | translated in 0.8 s; heap 82 MB (about 730 bytes per metric) |
-| 20,000 data messages/s (200,000 values/s) for 20 s | keeps up: no gaps, no lost values; publish-to-readable latency p50 7 ms, p99 57 ms |
-| Ceiling | about 36,000–39,000 messages/s (360,000–390,000 values/s), after which messages queue and latency grows |
-| Rebirth storm (every node dies and is born again) | 0.7 s |
-| Saving the definitions on shutdown | 0.3 s, 8 MB file |
+| All births at once | translated in 0.45 s; heap 82 MB (about 720 bytes per metric) |
+| 20,000 data messages/s (200,000 values/s) | no gaps, no lost values; publish-to-readable latency p50 8 ms, p99 75 ms |
+| As fast as the simulated edge nodes go (about 80,000 messages/s, 800,000 values/s) | keeps up: all translated 15 ms after the last one |
+| Rebirth storm (every node dies and is born again) | 0.6 s |
+| Saving the definitions on shutdown | 0.2 s, 8 MB file |
 
-At the ceiling, one core is saturated by the connection that receives the messages: decoding, translating and storing all happen on its goroutine. The broker and the simulated edge nodes ran on the same 4 cores, so a dedicated machine does better. As a primary host, all `spBv1.0/#` traffic arrives on the first connection. Sparkplug needs each node's messages in order, so more connections (`MQTT_CONNECTIONS`) don't raise this ceiling. Run it with `SPARKPLUG_LOAD=1 go test -v -run Load ./test/sparkplug`; sizes are set by `SPARKPLUG_LOAD_NODES`, `_METRICS`, `_CHANGES`, `_RATE` and `_SECONDS`.
+Run it with `SPARKPLUG_LOAD=1 go test -v -run Load ./test/sparkplug`; sizes are set by `SPARKPLUG_LOAD_NODES`, `_METRICS`, `_CHANGES`, `_RATE` and `_SECONDS`.
 
 ## Sparkplug B codec as a Go library
 
@@ -1323,7 +1337,7 @@ The regular tests need nothing installed. They start embedded MQTT brokers (plai
 ```
 cmd/mqtt-get        entry point: serve, mcp (standalone stdio / proxy), healthcheck
 cmd/loadgen         MQTT load generator (publishes through a real broker)
-cmd/floodbroker     fake broker that floods subscribers, to measure ingest capacity without a broker bottleneck
+cmd/floodbroker     fake broker that floods subscribers (plain or Sparkplug), to measure ingest capacity without a broker bottleneck
 internal/core       THE foundation: every operation, scopes, typed errors, watchers, topic tree
 internal/httpapi    REST interface for systems + web UI (httpapi/ui/index.html) + metrics
 internal/mcp        MCP interface for agents: tools, resources, prompts, completion; HTTP + stdio transports

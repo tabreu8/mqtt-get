@@ -5,6 +5,12 @@
 // subscriber, not by a real broker. Supports MQTT 3.1.1 and 5.
 //
 //	go run ./cmd/floodbroker -addr :1884 -topics 1000 -size 64
+//
+// With -sparkplug N it plays N Sparkplug B edge nodes instead, each with
+// one device: their births first, then DDATA messages carrying -metrics
+// metrics each (by alias, with consecutive sequence numbers).
+//
+//	go run ./cmd/floodbroker -addr :1884 -sparkplug 1000 -metrics 10
 package main
 
 import (
@@ -18,6 +24,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/tabreu8/mqtt-get/sparkplug"
 )
 
 var (
@@ -26,6 +34,8 @@ var (
 	size    = flag.Int("size", 64, "payload bytes")
 	qos     = flag.Int("qos", 0, "QoS of the flood (0 or 1; acknowledgements are read and ignored)")
 	props   = flag.Bool("props", false, "MQTT 5: give every message a content type, a user property and an expiry")
+	spNodes = flag.Int("sparkplug", 0, "play this many Sparkplug B edge nodes instead (one device each)")
+	spK     = flag.Int("metrics", 10, "Sparkplug: metrics per DDATA message")
 	sent    atomic.Uint64
 )
 
@@ -138,6 +148,13 @@ func serve(c net.Conn) {
 	}()
 	block := buildBlock(filters, v5)
 	perBlock := uint64(len(filters) * *nTopics)
+	if *spNodes > 0 {
+		births, data, n := sparkplugBlocks(v5)
+		if _, err := c.Write(births); err != nil {
+			return
+		}
+		block, perBlock = data, uint64(n)
+	}
 	for {
 		if _, err := c.Write(block); err != nil {
 			return
@@ -177,6 +194,48 @@ func buildBlock(filters []string, v5 bool) []byte {
 		}
 	}
 	return block
+}
+
+// publish encodes a QoS 0 PUBLISH.
+func publish(b []byte, topic string, payload []byte, v5 bool) []byte {
+	vh := appendStr(nil, topic)
+	if v5 {
+		vh = append(vh, 0) // no properties
+	}
+	b = appendVarint(append(b, 0x30), len(vh)+len(payload))
+	return append(append(b, vh...), payload...)
+}
+
+// sparkplugBlocks pre-encodes the births of the edge nodes, and 256 DDATA
+// messages per node (interleaved across nodes) with consecutive sequence
+// numbers that follow the births, so the data block can be sent in a loop.
+func sparkplugBlocks(v5 bool) (births, data []byte, n int) {
+	metrics := max(50, *spK)
+	for i := 0; i < *spNodes; i++ {
+		edge := "edge-" + strconv.Itoa(i)
+		nb := &sparkplug.Payload{Timestamp: uint64(time.Now().UnixMilli()), HasTimestamp: true, Seq: 0, HasSeq: true, Metrics: []sparkplug.Metric{
+			{Name: "bdSeq", Datatype: sparkplug.TypeInt64, Value: sparkplug.Value{Kind: sparkplug.KindLong}},
+			{Name: "Node Control/Rebirth", Datatype: sparkplug.TypeBoolean, Value: sparkplug.Value{Kind: sparkplug.KindBool}}}}
+		births = publish(births, "spBv1.0/flood/NBIRTH/"+edge, sparkplug.Encode(nb), v5)
+		db := &sparkplug.Payload{Timestamp: uint64(time.Now().UnixMilli()), HasTimestamp: true, Seq: 1, HasSeq: true}
+		for m := 0; m < metrics; m++ {
+			db.Metrics = append(db.Metrics, sparkplug.Metric{Name: "Sensors/S" + strconv.Itoa(m), Alias: uint64(10 + m), HasAlias: true,
+				Datatype: sparkplug.TypeDouble, Value: sparkplug.Value{Kind: sparkplug.KindDouble}})
+		}
+		births = publish(births, "spBv1.0/flood/DBIRTH/"+edge+"/dev", sparkplug.Encode(db), v5)
+	}
+	for s := 0; s < 256; s++ {
+		for i := 0; i < *spNodes; i++ {
+			p := &sparkplug.Payload{Timestamp: uint64(time.Now().UnixMilli()), HasTimestamp: true, Seq: uint64(s+2) % 256, HasSeq: true}
+			for j := 0; j < *spK; j++ {
+				p.Metrics = append(p.Metrics, sparkplug.Metric{Alias: uint64(10 + (s**spK+j)%metrics), HasAlias: true,
+					Value: sparkplug.Value{Kind: sparkplug.KindDouble, Float: float64(s) + float64(j)/8}})
+			}
+			data = publish(data, "spBv1.0/flood/DDATA/edge-"+strconv.Itoa(i)+"/dev", sparkplug.Encode(p), v5)
+			n++
+		}
+	}
+	return births, data, n
 }
 
 func init() { log.SetFlags(log.Ltime) }
