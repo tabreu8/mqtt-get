@@ -4,3 +4,5 @@
 *.test
 *.out
 /test/tck/broker/target/
+/SparkplugTCKResultsCollector-*/
+/SparkplugTCKresults.log

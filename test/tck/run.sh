@@ -26,7 +26,9 @@ mkdir -p "$run/extensions" "$run/data"
 unzip -q "$run/SparkplugTCK/hivemq-extension/sparkplug-tck-3.0.0.zip" -d "$run/extensions"
 
 mvn -q -B -f broker/pom.xml compile dependency:build-classpath -Dmdep.outputFile="$run/classpath"
-java -cp "broker/target/classes:$(cat "$run/classpath")" tck.Broker "$PWD/broker/conf" "$run/data" "$run/extensions" >"$run/broker.log" 2>&1 &
+# From $run: the TCK writes its result files to the working directory.
+here=$PWD
+(cd "$run" && exec java -cp "$here/broker/target/classes:$(cat classpath)" tck.Broker "$here/broker/conf" data extensions >broker.log 2>&1) &
 broker=$!
 trap 'kill $broker 2>/dev/null || true' EXIT
 for _ in $(seq 120); do
