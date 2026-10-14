@@ -231,6 +231,7 @@ func TestNames(t *testing.T) {
 
 // FuzzDecode: malformed input must return an error, never panic, and
 // anything decoded must survive an encode/decode round trip unchanged.
+// Validate and UnpackArray must not panic on whatever decodes.
 func FuzzDecode(f *testing.F) {
 	for _, h := range []string{birthHex, dataHex, metadataHex} {
 		f.Add(mustHex(f, h))
@@ -243,6 +244,12 @@ func FuzzDecode(f *testing.F) {
 				t.Fatalf("error %v with payload %v", err, p)
 			}
 			return
+		}
+		_ = p.Validate() // must not panic either
+		for _, m := range p.Metrics {
+			if m.Datatype.IsArray() {
+				_, _ = UnpackArray(m.Datatype, m.Value.Bytes)
+			}
 		}
 		enc := Encode(p)
 		p2, err := Decode(enc)

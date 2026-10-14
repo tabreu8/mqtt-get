@@ -10,9 +10,12 @@
 // This package handles only that payload. [Decode] turns the bytes of an
 // MQTT message into a [Payload]; [Encode] does the reverse. It covers every
 // message of the sparkplug_b.proto schema used by Sparkplug 3.0: metrics,
-// metric metadata, property sets, data sets and templates. It is written
-// by hand from the schema, has no dependencies outside the Go standard
-// library, and needs no code generation.
+// metric metadata, property sets, data sets and templates.
+// [Payload.Validate] checks a payload against the specification's value
+// rules, and [UnpackArray] and [PackArray] convert array values to and from
+// Go slices. The package is written by hand from the schema, has no
+// dependencies outside the Go standard library, and needs no code
+// generation.
 //
 // It is not an edge node, not a host application and not an MQTT client:
 // it doesn't connect to brokers, build topics, track births and deaths,
@@ -36,8 +39,13 @@
 //   - Array types (Int8Array to DateTimeArray) are packed into
 //     [Value.Bytes]: little-endian values; BooleanArray is a little-endian
 //     uint32 count followed by the booleans packed most significant bit
-//     first; StringArray is NUL-terminated strings. This package doesn't
-//     unpack them.
+//     first; StringArray is NUL-terminated strings. [UnpackArray] and
+//     [PackArray] convert them.
 //
 // A null value is a metric with IsNull set, not a value.
+//
+// Implementations differ on which field carries some types (for example
+// UInt32 in int_value or long_value, Float in float_value or
+// double_value). [Decode] accepts either, and so does [Payload.Validate];
+// when writing to a device, use the field it used in its birth.
 package sparkplug

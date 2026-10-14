@@ -58,3 +58,32 @@ func ExampleEncode() {
 	// Output:
 	// 088080b3c19c3312210a144e6f646520436f6e74726f6c2f52656269727468188080b3c19c33200b7001
 }
+
+// Read an Int32Array metric, then build a BooleanArray one.
+func ExampleUnpackArray() {
+	m := sparkplug.Metric{Name: "Setpoints", Datatype: sparkplug.TypeInt32Array,
+		Value: sparkplug.Value{Kind: sparkplug.KindBytes, Bytes: []byte{0xff, 0xff, 0xff, 0xff, 2, 0, 0, 0}}}
+	vals, err := sparkplug.UnpackArray(m.Datatype, m.Value.Bytes)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(vals.([]int32))
+
+	packed, _ := sparkplug.PackArray(sparkplug.TypeBooleanArray, []bool{true, false, true})
+	fmt.Printf("%x\n", packed)
+	// Output:
+	// [-1 2]
+	// 03000000a0
+}
+
+// Check a payload before publishing it (or after receiving it).
+func ExamplePayload_Validate() {
+	p := &sparkplug.Payload{Seq: 1, HasSeq: true, Metrics: []sparkplug.Metric{
+		{Name: "Speed", Datatype: sparkplug.TypeUInt8, Value: sparkplug.Value{Kind: sparkplug.KindInt, Uint: 300}},
+		{Name: "Mode", Datatype: sparkplug.TypeString, Value: sparkplug.Value{Kind: sparkplug.KindBool}},
+	}}
+	fmt.Println(p.Validate())
+	// Output:
+	// metric 0 ("Speed"): 300 is out of range for UInt8
+	// metric 1 ("Mode"): String value carried as Bool
+}
