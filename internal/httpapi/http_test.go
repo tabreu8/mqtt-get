@@ -48,7 +48,7 @@ func startBroker(t *testing.T) (*mochi.Server, string) {
 		t.Fatal(err)
 	}
 	go func() { _ = b.Serve() }()
-	t.Cleanup(func() { _ = b.Close() })
+	t.Cleanup(func() { closeBroker(b) })
 	return b, addr
 }
 
@@ -415,5 +415,21 @@ func TestPropertiesNeedMQTT5(t *testing.T) {
 	code, out, _ := e.do("POST", "/api/v1/publish", e.admin, `{"topic":"x","payload":"y","properties":{"content_type":"text/plain"}}`)
 	if code != 400 || !strings.Contains(out, "protocol_version 5") {
 		t.Fatalf("want 400 mentioning protocol_version 5, got %d %s", code, out)
+	}
+}
+
+// closeBroker closes an embedded broker without hanging the test: mochi's
+// Close can deadlock when a client disconnects while it runs (its client
+// list takes a read lock recursively).
+func closeBroker(b *mochi.Server) {
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }() // a test may already have closed it
+		_ = b.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
 	}
 }

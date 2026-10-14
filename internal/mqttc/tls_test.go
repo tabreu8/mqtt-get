@@ -162,10 +162,7 @@ func startBroker(t *testing.T, p pki, o brokerOpts) (*mochi.Server, string) {
 		t.Fatal(err)
 	}
 	go func() { _ = b.Serve() }()
-	t.Cleanup(func() {
-		defer func() { _ = recover() }() // a test may already have closed it (restart tests)
-		_ = b.Close()
-	})
+	t.Cleanup(func() { closeBroker(b) })
 	time.Sleep(50 * time.Millisecond)
 	return b, lc.Address
 }
@@ -475,6 +472,22 @@ func restartBroker(t *testing.T, addr string) *mochi.Server {
 		t.Fatal(err)
 	}
 	go func() { _ = b.Serve() }()
-	t.Cleanup(func() { _ = b.Close() })
+	t.Cleanup(func() { closeBroker(b) })
 	return b
+}
+
+// closeBroker closes an embedded broker without hanging the test: mochi's
+// Close can deadlock when a client disconnects while it runs (its client
+// list takes a read lock recursively).
+func closeBroker(b *mochi.Server) {
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }() // a test may already have closed it
+		_ = b.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
 }

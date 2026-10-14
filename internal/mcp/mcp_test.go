@@ -67,7 +67,7 @@ func newServiceVersion(t *testing.T, withBroker bool, version uint) (*core.Servi
 			t.Fatal(err)
 		}
 		go func() { _ = b.Serve() }()
-		t.Cleanup(func() { _ = b.Close() })
+		t.Cleanup(func() { closeBroker(b) })
 	}
 	svc := core.New(config.Server{MaxTopics: 100000, MaxBodyBytes: 1 << 20, PublishTimeout: 5 * time.Second}, quiet(), st)
 	t.Cleanup(svc.Close)
@@ -936,5 +936,21 @@ func TestPublishAndWaitMQTT5Correlation(t *testing.T) {
 	props := resp["properties"].(map[string]any)
 	if !strings.HasPrefix(props["correlation_data"].(string), "mqtt-get-") {
 		t.Fatalf("correlation data: %v", props)
+	}
+}
+
+// closeBroker closes an embedded broker without hanging the test: mochi's
+// Close can deadlock when a client disconnects while it runs (its client
+// list takes a read lock recursively).
+func closeBroker(b *mochi.Server) {
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }() // a test may already have closed it
+		_ = b.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
 	}
 }

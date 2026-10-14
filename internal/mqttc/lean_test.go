@@ -243,7 +243,7 @@ func TestLeanReconnectAndResubscribe(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "connect", func() bool { return m.Status().Connected })
-	_ = b.Close()
+	closeBroker(b)
 	waitFor(t, "disconnect noticed", func() bool { return !m.Status().Connected })
 	b2 := restartBroker(t, addr)
 	waitFor(t, "reconnect", func() bool { return m.Status().Connected })
