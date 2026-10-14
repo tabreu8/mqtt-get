@@ -41,7 +41,7 @@ grep -q "BROKER READY" "$run/broker.log" || { cat "$run/broker.log"; echo "broke
 status=0
 SPARKPLUG_TCK_BROKER=tcp://127.0.0.1:1883 go test -count=1 -v -timeout 20m . || status=$?
 if [ $status -ne 0 ]; then
-	echo "--- broker log (last 200 lines)"
-	tail -n 200 "$run/broker.log"
+	echo "--- broker log"
+	cat "$run/broker.log"
 fi
 exit $status

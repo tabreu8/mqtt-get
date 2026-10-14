@@ -153,6 +153,10 @@ func (d *driver) run(test string, onPrompt func(string) string, then func(), par
 		d.mu.Lock()
 		d.onPrompt = onPrompt
 		d.mu.Unlock()
+		// The previous test's simulated edge node must be gone: the TCK
+		// reuses an edge node it still sees as connected, and then waits
+		// for an operator to stop it.
+		d.waitEdgeOffline()
 		// No test left running, no stale result.
 		d.cli.Publish("SPARKPLUG_TCK/TEST_CONTROL", 1, false, "END_TEST").Wait()
 		time.Sleep(300 * time.Millisecond)
@@ -297,6 +301,34 @@ type nodeInfo struct {
 		Online  bool      `json:"online"`
 		DeathAt time.Time `json:"death_at"`
 	} `json:"devices"`
+}
+
+// waitEdgeOffline waits until mqtt-get shows the TCK's edge node offline
+// (or has never seen it), then gives the TCK a moment to catch up.
+func (d *driver) waitEdgeOffline() {
+	if d.host == nil {
+		return
+	}
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		req, _ := http.NewRequest("GET", d.host.http.URL+"/api/v1/sparkplug/nodes?group="+group, nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			continue
+		}
+		var r struct{ Nodes []nodeInfo }
+		_ = json.NewDecoder(resp.Body).Decode(&r)
+		resp.Body.Close()
+		online := false
+		for _, n := range r.Nodes {
+			online = online || (n.Edge == edge && n.Online)
+		}
+		if !online {
+			time.Sleep(time.Second)
+			return
+		}
+	}
+	d.t.Log("the TCK's edge node is still online")
 }
 
 func (d *driver) node() nodeInfo {
