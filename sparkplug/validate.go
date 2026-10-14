@@ -124,6 +124,9 @@ func (v *validator) metric(m *Metric, inTemplate bool) {
 
 // value checks that val is carried as data type t requires.
 func (v *validator) value(t DataType, val Value) {
+	if val.Kind == KindExtension {
+		return // application-defined: nothing to check
+	}
 	want := func(k1, k2 Kind) bool {
 		if val.Kind == k1 || val.Kind == k2 {
 			return true

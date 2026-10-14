@@ -754,7 +754,7 @@ func (t *Translator) envelopeTail(buf []byte, m *metric, dt spb.DataType, ts uin
 	if pm != nil && pm.IsTransient {
 		buf = append(buf, `,"transient":true`...)
 	}
-	if pm != nil && pm.Metadata != nil && *pm.Metadata != (spb.MetaData{}) {
+	if pm != nil && pm.Metadata != nil && hasMetadata(pm.Metadata) {
 		buf = append(buf, `,"metadata":`...)
 		buf = appendMetadata(buf, pm.Metadata)
 	}
@@ -765,6 +765,11 @@ func (t *Translator) envelopeTail(buf []byte, m *metric, dt spb.DataType, ts uin
 	buf = append(buf, `,"online":`...)
 	buf = strconv.AppendBool(buf, online)
 	return append(buf, '}')
+}
+
+func hasMetadata(md *spb.MetaData) bool {
+	return md.IsMultiPart || md.ContentType != "" || md.Size != 0 || md.Seq != 0 || md.FileName != "" ||
+		md.FileType != "" || md.MD5 != "" || md.Description != ""
 }
 
 // appendMetadata writes the metadata of a value (files and multi-part

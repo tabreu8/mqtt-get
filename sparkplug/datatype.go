@@ -67,7 +67,8 @@ type Kind uint8
 
 // Value kinds. Metrics use KindInt to KindTemplate; property values use
 // KindInt to KindString, KindPropertySet and KindPropertySetList; data set
-// cells and template parameters use KindInt to KindString.
+// cells and template parameters use KindInt to KindString. Any of them can
+// also carry KindExtension.
 const (
 	KindNone            Kind = iota // no value field is set
 	KindInt                         // uint32 int_value, in Value.Uint
@@ -81,10 +82,13 @@ const (
 	KindTemplate                    // template_value, in Value.Template
 	KindPropertySet                 // propertyset_value, in Value.Properties
 	KindPropertySetList             // propertysets_value, in Value.PropertiesList
+	// KindExtension is an extension_value: an application-defined value
+	// whose encoded protobuf message is kept as is in Value.Bytes.
+	KindExtension
 )
 
 var kindNames = [...]string{"None", "Int", "Long", "Float", "Double", "Bool", "String", "Bytes",
-	"DataSet", "Template", "PropertySet", "PropertySetList"}
+	"DataSet", "Template", "PropertySet", "PropertySetList", "Extension"}
 
 // String returns the kind's name ("Int", "Double", …).
 func (k Kind) String() string {

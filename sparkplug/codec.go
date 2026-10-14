@@ -23,6 +23,9 @@ type Payload struct {
 	UUID string
 	// Body is optional application-specific data.
 	Body []byte
+	// Unknown holds the encoded fields Decode didn't recognize (newer
+	// schema fields, extensions), which Encode writes back unchanged.
+	Unknown []byte
 }
 
 // Metric is one metric of a payload or of a template.
@@ -55,6 +58,8 @@ type Metric struct {
 	// Value is the metric's value (see the package documentation for how
 	// each data type is represented).
 	Value Value
+	// Unknown holds unrecognized encoded fields (see Payload.Unknown).
+	Unknown []byte
 }
 
 // MetaData describes a metric's value, mainly for File metrics and values
@@ -68,6 +73,7 @@ type MetaData struct {
 	FileType    string // file type, for File metrics
 	MD5         string // MD5 checksum of the complete value
 	Description string // free-form description
+	Unknown     []byte // unrecognized encoded fields (see Payload.Unknown)
 }
 
 // Value is the value of a metric, property, data set cell or template
@@ -84,7 +90,8 @@ type Value struct {
 	Bool bool
 	// Str holds KindString values.
 	Str string
-	// Bytes holds KindBytes values, including packed arrays.
+	// Bytes holds KindBytes values, including packed arrays, and the
+	// encoded message of KindExtension values.
 	Bytes []byte
 	// DataSet holds KindDataSet values.
 	DataSet *DataSet
@@ -104,6 +111,8 @@ type PropertySet struct {
 	Keys []string
 	// Values are the property values, one per key.
 	Values []PropertyValue
+	// Unknown holds unrecognized encoded fields (see Payload.Unknown).
+	Unknown []byte
 }
 
 // PropertyValue is one property of a PropertySet.
@@ -114,6 +123,8 @@ type PropertyValue struct {
 	IsNull bool
 	// Value is the property's value.
 	Value Value
+	// Unknown holds unrecognized encoded fields (see Payload.Unknown).
+	Unknown []byte
 }
 
 // DataSet is a table of typed columns.
@@ -126,6 +137,9 @@ type DataSet struct {
 	Types []DataType
 	// Rows hold one value per column. A cell with Kind KindNone is null.
 	Rows [][]Value
+	// Unknown holds unrecognized encoded fields of the data set itself
+	// (see Payload.Unknown); those of rows and cells are dropped.
+	Unknown []byte
 }
 
 // Template is a user-defined type: a definition (IsDefinition, usually
@@ -142,6 +156,8 @@ type Template struct {
 	TemplateRef string
 	// IsDefinition tells a definition from an instance.
 	IsDefinition bool
+	// Unknown holds unrecognized encoded fields (see Payload.Unknown).
+	Unknown []byte
 }
 
 // Parameter is a template parameter.
@@ -152,6 +168,8 @@ type Parameter struct {
 	Type DataType
 	// Value is the parameter's value.
 	Value Value
+	// Unknown holds unrecognized encoded fields (see Payload.Unknown).
+	Unknown []byte
 }
 
 // ErrMalformed is returned by Decode for input that is not a valid
@@ -174,6 +192,11 @@ const maxDepth = 16
 type reader struct {
 	b   []byte
 	err error
+	// mark is where the current field (its key) starts; with keep,
+	// skipped fields are collected in unk.
+	mark []byte
+	keep bool
+	unk  []byte
 }
 
 func (r *reader) fail() { r.err = ErrMalformed; r.b = nil }
@@ -224,6 +247,7 @@ func (r *reader) next() (field uint64, wt int, ok bool) {
 	if r.err != nil || len(r.b) == 0 {
 		return 0, 0, false
 	}
+	r.mark = r.b
 	k := r.varint()
 	if r.err != nil {
 		return 0, 0, false
@@ -236,8 +260,15 @@ func (r *reader) next() (field uint64, wt int, ok bool) {
 	return field, wt, true
 }
 
-// skip skips a field of wire type wt.
+// skip skips a field of wire type wt (keeping it in *r.unk when set).
 func (r *reader) skip(wt int) {
+	r.discard(wt)
+	if r.keep && r.err == nil {
+		r.unk = append(r.unk, r.mark[:len(r.mark)-len(r.b)]...)
+	}
+}
+
+func (r *reader) discard(wt int) {
 	switch wt {
 	case wireVarint:
 		r.varint()
@@ -263,8 +294,9 @@ func (r *reader) expect(wt, want int) bool {
 
 // Decode parses a Sparkplug B payload, such as the body of an MQTT message
 // published on an spBv1.0 topic. Input that isn't a valid payload returns
-// ErrMalformed; Decode never panics. Fields unknown to the schema and
-// extensions are skipped. Nesting (templates in metrics, property sets in
+// ErrMalformed; Decode never panics. Fields unknown to the schema are kept
+// in the Unknown field of their message and extension values as
+// KindExtension, so that Encode reproduces them. Nesting (templates in metrics, property sets in
 // property sets) is limited to 16 levels. The returned payload doesn't
 // reference b.
 func Decode(b []byte) (*Payload, error) {
@@ -272,7 +304,7 @@ func Decode(b []byte) (*Payload, error) {
 	if n := countMetrics(b); n > 0 {
 		p.Metrics = make([]Metric, 0, n)
 	}
-	r := &reader{b: b}
+	r := &reader{b: b, keep: true}
 	for {
 		f, wt, ok := r.next()
 		if !ok {
@@ -308,6 +340,7 @@ func Decode(b []byte) (*Payload, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
+	p.Unknown = r.unk
 	return p, nil
 }
 
@@ -325,7 +358,7 @@ func countMetrics(b []byte) int {
 		if f == 2 && wt == wireBytes {
 			n++
 		}
-		r.skip(wt)
+		r.discard(wt)
 	}
 }
 
@@ -347,9 +380,11 @@ func sub(b []byte, parent *reader, depth int, fn func(r *reader, depth int)) {
 
 func decodeMetric(b []byte, m *Metric, parent *reader, depth int) {
 	sub(b, parent, depth, func(r *reader, depth int) {
+		r.keep = true
 		for {
 			f, wt, ok := r.next()
 			if !ok {
+				m.Unknown = r.unk
 				return
 			}
 			switch f {
@@ -409,7 +444,11 @@ func decodeMetric(b []byte, m *Metric, parent *reader, depth int) {
 					m.Metadata = &MetaData{}
 					decodeMetaData(r.bytes(), m.Metadata, r, depth)
 				}
-			default: // 19 extension, unknown fields
+			case 19:
+				if r.expect(wt, wireBytes) {
+					m.Value = Value{Kind: KindExtension, Bytes: append([]byte{}, r.bytes()...)}
+				}
+			default:
 				r.skip(wt)
 			}
 		}
@@ -457,9 +496,11 @@ func b2u(b bool) uint64 {
 
 func decodeMetaData(b []byte, md *MetaData, parent *reader, depth int) {
 	sub(b, parent, depth, func(r *reader, _ int) {
+		r.keep = true
 		for {
 			f, wt, ok := r.next()
 			if !ok {
+				md.Unknown = r.unk
 				return
 			}
 			switch {
@@ -488,9 +529,11 @@ func decodeMetaData(b []byte, md *MetaData, parent *reader, depth int) {
 
 func decodePropertySet(b []byte, ps *PropertySet, parent *reader, depth int) {
 	sub(b, parent, depth, func(r *reader, depth int) {
+		r.keep = true
 		for {
 			f, wt, ok := r.next()
 			if !ok {
+				ps.Unknown = r.unk
 				return
 			}
 			switch {
@@ -509,9 +552,11 @@ func decodePropertySet(b []byte, ps *PropertySet, parent *reader, depth int) {
 
 func decodePropertyValue(b []byte, pv *PropertyValue, parent *reader, depth int) {
 	sub(b, parent, depth, func(r *reader, depth int) {
+		r.keep = true
 		for {
 			f, wt, ok := r.next()
 			if !ok {
+				pv.Unknown = r.unk
 				return
 			}
 			switch f {
@@ -551,6 +596,10 @@ func decodePropertyValue(b []byte, pv *PropertyValue, parent *reader, depth int)
 					})
 					pv.Value = Value{Kind: KindPropertySetList, PropertiesList: list}
 				}
+			case 11:
+				if r.expect(wt, wireBytes) {
+					pv.Value = Value{Kind: KindExtension, Bytes: append([]byte{}, r.bytes()...)}
+				}
 			default:
 				r.skip(wt)
 			}
@@ -560,9 +609,11 @@ func decodePropertyValue(b []byte, pv *PropertyValue, parent *reader, depth int)
 
 func decodeDataSet(b []byte, ds *DataSet, parent *reader, depth int) {
 	sub(b, parent, depth, func(r *reader, depth int) {
+		r.keep = true
 		for {
 			f, wt, ok := r.next()
 			if !ok {
+				ds.Unknown = r.unk
 				return
 			}
 			switch {
@@ -601,7 +652,9 @@ func decodeDataSet(b []byte, ds *DataSet, parent *reader, depth int) {
 								}
 								if f >= 1 && f <= 6 {
 									decodeScalar(er, f-1, wt, &v)
-								} else {
+								} else if f == 7 && er.expect(wt, wireBytes) {
+									v = Value{Kind: KindExtension, Bytes: append([]byte{}, er.bytes()...)}
+								} else if f != 7 {
 									er.skip(wt)
 								}
 							}
@@ -619,9 +672,11 @@ func decodeDataSet(b []byte, ds *DataSet, parent *reader, depth int) {
 
 func decodeTemplate(b []byte, t *Template, parent *reader, depth int) {
 	sub(b, parent, depth, func(r *reader, depth int) {
+		r.keep = true
 		for {
 			f, wt, ok := r.next()
 			if !ok {
+				t.Unknown = r.unk
 				return
 			}
 			switch {
@@ -634,9 +689,11 @@ func decodeTemplate(b []byte, t *Template, parent *reader, depth int) {
 			case f == 3 && wt == wireBytes:
 				var p Parameter
 				sub(r.bytes(), r, depth, func(pr *reader, _ int) {
+					pr.keep = true
 					for {
 						f, wt, ok := pr.next()
 						if !ok {
+							p.Unknown = pr.unk
 							return
 						}
 						switch f {
@@ -650,6 +707,10 @@ func decodeTemplate(b []byte, t *Template, parent *reader, depth int) {
 							}
 						case 3, 4, 5, 6, 7, 8:
 							decodeScalar(pr, f-3, wt, &p.Value)
+						case 9:
+							if pr.expect(wt, wireBytes) {
+								p.Value = Value{Kind: KindExtension, Bytes: append([]byte{}, pr.bytes()...)}
+							}
 						default:
 							pr.skip(wt)
 						}
@@ -744,6 +805,7 @@ func Encode(p *Payload) []byte {
 	if p.Body != nil {
 		w.bytes(5, p.Body)
 	}
+	w.b = append(w.b, p.Unknown...)
 	return w.b
 }
 
@@ -795,6 +857,7 @@ func encodeMetric(w *writer, m *Metric) {
 			if md.Description != "" {
 				w.str(8, md.Description)
 			}
+			w.b = append(w.b, md.Unknown...)
 		})
 	}
 	if m.Properties != nil {
@@ -807,9 +870,12 @@ func encodeMetric(w *writer, m *Metric) {
 		w.msg(17, func(w *writer) { encodeDataSet(w, m.Value.DataSet) })
 	case KindTemplate:
 		w.msg(18, func(w *writer) { encodeTemplate(w, m.Value.Template) })
+	case KindExtension:
+		w.bytes(19, m.Value.Bytes)
 	default:
 		w.scalar(10, m.Value)
 	}
+	w.b = append(w.b, m.Unknown...)
 }
 
 func encodePropertySet(w *writer, ps *PropertySet) {
@@ -834,11 +900,15 @@ func encodePropertySet(w *writer, ps *PropertySet) {
 						w.msg(1, func(w *writer) { encodePropertySet(w, &pv.Value.PropertiesList[j]) })
 					}
 				})
+			case KindExtension:
+				w.bytes(11, pv.Value.Bytes)
 			default:
 				w.scalar(3, pv.Value)
 			}
+			w.b = append(w.b, pv.Unknown...)
 		})
 	}
+	w.b = append(w.b, ps.Unknown...)
 }
 
 func encodeDataSet(w *writer, ds *DataSet) {
@@ -852,10 +922,17 @@ func encodeDataSet(w *writer, ds *DataSet) {
 	for _, row := range ds.Rows {
 		w.msg(4, func(w *writer) {
 			for _, v := range row {
-				w.msg(1, func(w *writer) { w.scalar(1, v) })
+				w.msg(1, func(w *writer) {
+					if v.Kind == KindExtension {
+						w.bytes(7, v.Bytes)
+					} else {
+						w.scalar(1, v)
+					}
+				})
 			}
 		})
 	}
+	w.b = append(w.b, ds.Unknown...)
 }
 
 func encodeTemplate(w *writer, t *Template) {
@@ -875,7 +952,12 @@ func encodeTemplate(w *writer, t *Template) {
 			if p.Type != 0 {
 				w.varint(2, uint64(p.Type))
 			}
-			w.scalar(3, p.Value)
+			if p.Value.Kind == KindExtension {
+				w.bytes(9, p.Value.Bytes)
+			} else {
+				w.scalar(3, p.Value)
+			}
+			w.b = append(w.b, p.Unknown...)
 		})
 	}
 	if t.TemplateRef != "" {
@@ -884,4 +966,5 @@ func encodeTemplate(w *writer, t *Template) {
 	if t.IsDefinition {
 		w.bool(5, true)
 	}
+	w.b = append(w.b, t.Unknown...)
 }

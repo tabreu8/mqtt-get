@@ -55,6 +55,12 @@ func appendTime(buf []byte, ms int64) []byte {
 
 // AppendValue appends v, interpreted as data type t, as JSON.
 func AppendValue(buf []byte, t spb.DataType, v spb.Value) []byte {
+	if v.Kind == spb.KindExtension {
+		// Application-defined: the encoded message, as is.
+		buf = append(buf, `{"extension":"`...)
+		buf = base64.StdEncoding.AppendEncode(buf, v.Bytes)
+		return append(buf, `"}`...)
+	}
 	if t == spb.TypeUnknown {
 		t = inferType(v)
 	}

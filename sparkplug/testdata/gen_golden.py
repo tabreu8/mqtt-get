@@ -1,5 +1,5 @@
 """Regenerates the golden payloads of codec_test.go (birthHex, dataHex,
-metadataHex)
+metadataHex, extensionsHex)
 with the reference protobuf implementation and the official Eclipse Tahu
 sparkplug_b.proto (as generated in pysparkplug):
 
@@ -71,5 +71,46 @@ def metadata():
     return p
 
 
+def with_unknown(msg, raw):
+    """Returns msg with the encoded fields raw added as unknown fields."""
+    out = type(msg)()
+    out.ParseFromString(msg.SerializeToString() + raw)
+    return out
+
+
+def extensions():
+    # Extension values and fields unknown to the schema (field 100 as a
+    # varint, field 101 as bytes) at every level that keeps them.
+    unk = bytes([0xa0, 0x06, 0x07, 0xaa, 0x06, 0x02]) + b"hi"
+    ext = pb.Payload.Metric.MetricValueExtension()
+    ext.ParseFromString(bytes([0x08, 0x2a, 0x12, 0x03]) + b"ext")
+    p = pb.Payload(timestamp=1760000003000, seq=3)
+    m = pb.Payload.Metric(name="Custom", alias=21, datatype=12)
+    m.extension_value.CopyFrom(ext)
+    m.metadata.CopyFrom(with_unknown(pb.Payload.MetaData(content_type="x/y"), unk))
+    pv = pb.Payload.PropertyValue(type=12)
+    pv.extension_value.ParseFromString(bytes([0x08, 0x01]))
+    ps = pb.Payload.PropertySet(keys=["custom", "unit"])
+    ps.values.append(pv)
+    ps.values.append(with_unknown(pb.Payload.PropertyValue(type=12, string_value="m"), unk))
+    m.properties.CopyFrom(with_unknown(ps, unk))
+    p.metrics.append(with_unknown(m, unk))
+    d = pb.Payload.Metric(name="Table", alias=22, datatype=16)
+    ds = pb.Payload.DataSet(num_of_columns=1, columns=["c"], types=[12])
+    cell = ds.rows.add().elements.add()
+    cell.extension_value.ParseFromString(bytes([0x08, 0x02]))
+    d.dataset_value.CopyFrom(with_unknown(ds, unk))
+    p.metrics.append(d)
+    t = pb.Payload.Metric(name="Motor", alias=23, datatype=19)
+    tpl = pb.Payload.Template(template_ref="MotorType")
+    par = pb.Payload.Template.Parameter(name="custom", type=12)
+    par.extension_value.ParseFromString(bytes([0x08, 0x03]))
+    tpl.parameters.append(with_unknown(par, unk))
+    t.template_value.CopyFrom(with_unknown(tpl, unk))
+    p.metrics.append(t)
+    return with_unknown(p, unk)
+
+
 print(json.dumps({"birth": birth().SerializeToString().hex(), "data": data().SerializeToString().hex(),
-                  "metadata": metadata().SerializeToString().hex()}))
+                  "metadata": metadata().SerializeToString().hex(),
+                  "extensions": extensions().SerializeToString().hex()}))

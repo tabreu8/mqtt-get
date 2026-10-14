@@ -10,7 +10,10 @@
 // This package handles only that payload. [Decode] turns the bytes of an
 // MQTT message into a [Payload]; [Encode] does the reverse. It covers every
 // message of the sparkplug_b.proto schema used by Sparkplug 3.0: metrics,
-// metric metadata, property sets, data sets and templates.
+// metric metadata, property sets, data sets and templates. Decoding is
+// lossless: extension values are kept as [KindExtension] values and fields
+// unknown to the schema in each message's Unknown field, and [Encode]
+// writes both back.
 // [Payload.Validate] checks a payload against the specification's value
 // rules, and [UnpackArray] and [PackArray] convert array values to and from
 // Go slices. The package is written by hand from the schema, has no

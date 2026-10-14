@@ -11,11 +11,14 @@ import (
 // Golden payloads encoded by the reference protobuf implementation with the
 // official sparkplug_b.proto (regenerate with testdata/gen_golden.py):
 // birthHex is an NBIRTH with one metric of every kind of value, dataHex an
-// NDATA using aliases, metadataHex a File metric with metadata.
+// NDATA using aliases, metadataHex a File metric with metadata,
+// extensionsHex extension values and fields unknown to the schema at
+// every level.
 const (
-	birthHex    = "08fb80b3c19c3312120a05626453657118fb80b3c19c3320085807121c0a144e6f646520436f6e74726f6c2f526562697274681001200b700012470a0b54656d7065726174757265100218e480b3c19c3320094a280a07656e67556e69740a07656e67486967681207080c4203c2b043120b080a310000000000c06240650000ac4112110a05436f756e741003200350fbffffff0f12110a05536d616c6c1004200150feffffff0f12140a03426967100520045880ccbbbcdeffffffff0112140a035536341006200858ffffffffffffffffff0112170a0850726573737572651007200a696666666666d66140120f0a0752756e6e696e671008200b700112170a044d6f64651009200c7a0b6175746f2022666173742212140a0753746172746564100a200d588080b3c19c3312100a04426c6f62100b20118201030001ff120f0a074e6f7468696e67100c2009380112190a04496e7473100d201882010cffffffff02000000e093040012170a06466c6f617473100e201e8201080000c03f000010c012130a05426f6f6c73100f202082010503000000a012130a054e616d6573101020218201056162006300122e0a055461626c65101120108a012008021202696412056c6162656c1803180c220d0a0608ffffffff0f0a0332017812340a054d6f746f7210122013920126120a0a0372706d200750dc0b1a0d0a066d617852706d100718b81722094d6f746f7254797065121d0a11466f6c6465722f446565702f56616c7565101320075080d0acf30e1800"
-	dataHex     = "08e887b3c19c33120e100218e887b3c19c33650000b2411208100350faffffff0f1204106350011801"
-	metadataHex = "08d08fb3c19c3312680a06436f6e6669671014201242530801120f6170706c69636174696f6e2f7a697018802020032a0a636f6e6669672e7a697032037a69703a2064343164386364393866303062323034653938303039393865636638343237654206706172742033820104504b03041802"
+	birthHex      = "08fb80b3c19c3312120a05626453657118fb80b3c19c3320085807121c0a144e6f646520436f6e74726f6c2f526562697274681001200b700012470a0b54656d7065726174757265100218e480b3c19c3320094a280a07656e67556e69740a07656e67486967681207080c4203c2b043120b080a310000000000c06240650000ac4112110a05436f756e741003200350fbffffff0f12110a05536d616c6c1004200150feffffff0f12140a03426967100520045880ccbbbcdeffffffff0112140a035536341006200858ffffffffffffffffff0112170a0850726573737572651007200a696666666666d66140120f0a0752756e6e696e671008200b700112170a044d6f64651009200c7a0b6175746f2022666173742212140a0753746172746564100a200d588080b3c19c3312100a04426c6f62100b20118201030001ff120f0a074e6f7468696e67100c2009380112190a04496e7473100d201882010cffffffff02000000e093040012170a06466c6f617473100e201e8201080000c03f000010c012130a05426f6f6c73100f202082010503000000a012130a054e616d6573101020218201056162006300122e0a055461626c65101120108a012008021202696412056c6162656c1803180c220d0a0608ffffffff0f0a0332017812340a054d6f746f7210122013920126120a0a0372706d200750dc0b1a0d0a066d617852706d100718b81722094d6f746f7254797065121d0a11466f6c6465722f446565702f56616c7565101320075080d0acf30e1800"
+	dataHex       = "08e887b3c19c33120e100218e887b3c19c33650000b2411208100350faffffff0f1204106350011801"
+	metadataHex   = "08d08fb3c19c3312680a06436f6e6669671014201242530801120f6170706c69636174696f6e2f7a697018802020032a0a636f6e6669672e7a697032037a69703a2064343164386364393866303062323034653938303039393865636638343237654206706172742033820104504b03041802"
+	extensionsHex = "08b897b3c19c33125c0a06437573746f6d1015200c420d1203782f79a00607aa060268694a2d0a06637573746f6d0a04756e69741206080c5a020801120d080c42016da00607aa06026869a00607aa060268699a0107082a1203657874a00607aa0602686912250a055461626c65101620108a01170801120163180c22060a043a020802a00607aa0602686912390a054d6f746f721017201392012b1a160a06637573746f6d100c4a020803a00607aa0602686922094d6f746f7254797065a00607aa060268691803a00607aa06026869"
 )
 
 func mustHex(t testing.TB, s string) []byte {
@@ -115,7 +118,7 @@ func TestMetadata(t *testing.T) {
 // Encoding writes fields in field-number order like the reference
 // implementation: re-encoding a decoded golden payload gives the same bytes.
 func TestEncodeMatchesReference(t *testing.T) {
-	for name, h := range map[string]string{"birth": birthHex, "data": dataHex, "metadata": metadataHex} {
+	for name, h := range map[string]string{"birth": birthHex, "data": dataHex, "metadata": metadataHex, "extensions": extensionsHex} {
 		in := mustHex(t, h)
 		p, err := Decode(in)
 		if err != nil {
@@ -178,6 +181,41 @@ func TestPackedTypesAndUnknownFields(t *testing.T) {
 	}
 }
 
+func TestExtensionsAndUnknownFields(t *testing.T) {
+	p, err := Decode(mustHex(t, extensionsHex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unk := []byte{0xa0, 0x06, 0x07, 0xaa, 0x06, 0x02, 'h', 'i'}
+	ext := func(v Value, want ...byte) bool { return v.Kind == KindExtension && bytes.Equal(v.Bytes, want) }
+	m, ds, tpl := p.Metrics[0], p.Metrics[1].Value.DataSet, p.Metrics[2].Value.Template
+	checks := map[string]bool{
+		"payload unknown":        bytes.Equal(p.Unknown, unk),
+		"metric extension":       ext(m.Value, 0x08, 0x2a, 0x12, 0x03, 'e', 'x', 't'),
+		"metric unknown":         bytes.Equal(m.Unknown, unk),
+		"metadata unknown":       m.Metadata.ContentType == "x/y" && bytes.Equal(m.Metadata.Unknown, unk),
+		"property set unknown":   bytes.Equal(m.Properties.Unknown, unk),
+		"property extension":     ext(m.Properties.Values[0].Value, 0x08, 0x01),
+		"property value unknown": m.Properties.Values[1].Value.Str == "m" && bytes.Equal(m.Properties.Values[1].Unknown, unk),
+		"data set unknown":       bytes.Equal(ds.Unknown, unk),
+		"cell extension":         ext(ds.Rows[0][0], 0x08, 0x02),
+		"template unknown":       bytes.Equal(tpl.Unknown, unk),
+		"parameter extension":    ext(tpl.Parameters[0].Value, 0x08, 0x03),
+		"parameter unknown":      bytes.Equal(tpl.Parameters[0].Unknown, unk),
+		"other metrics intact":   p.Metrics[1].Unknown == nil && tpl.TemplateRef == "MotorType",
+		"valid":                  p.Validate() == nil,
+	}
+	for name, ok := range checks {
+		if !ok {
+			t.Errorf("%s: %+v", name, p)
+		}
+	}
+	// Payloads without them carry none.
+	if p, _ := Decode(mustHex(t, birthHex)); p.Unknown != nil || p.Metrics[2].Unknown != nil || p.Metrics[2].Properties.Unknown != nil {
+		t.Error("unknown fields on a plain payload")
+	}
+}
+
 func TestDecodeRejectsMalformed(t *testing.T) {
 	for _, b := range [][]byte{
 		{0x12, 0x05, 0x01},       // metric longer than the input
@@ -233,7 +271,7 @@ func TestNames(t *testing.T) {
 // anything decoded must survive an encode/decode round trip unchanged.
 // Validate and UnpackArray must not panic on whatever decodes.
 func FuzzDecode(f *testing.F) {
-	for _, h := range []string{birthHex, dataHex, metadataHex} {
+	for _, h := range []string{birthHex, dataHex, metadataHex, extensionsHex} {
 		f.Add(mustHex(f, h))
 	}
 	f.Add([]byte{})
