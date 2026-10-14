@@ -289,6 +289,12 @@ func FuzzDecode(f *testing.F) {
 				_, _ = UnpackArray(m.Datatype, m.Value.Bytes)
 			}
 		}
+		// DecodeInto, reusing a payload that held something else, agrees.
+		reused := &Payload{Metrics: make([]Metric, 3, 8), UUID: "stale", Body: []byte{1}, Unknown: []byte{2}}
+		reused.Metrics[0].Name = "stale"
+		if err := DecodeInto(reused, b); err != nil || !bytes.Equal(Encode(reused), Encode(p)) {
+			t.Fatalf("DecodeInto disagrees with Decode: %v", err)
+		}
 		enc := Encode(p)
 		p2, err := Decode(enc)
 		if err != nil {
@@ -298,4 +304,47 @@ func FuzzDecode(f *testing.F) {
 			t.Fatal("encoding is not stable")
 		}
 	})
+}
+
+func TestDecodeInto(t *testing.T) {
+	var p Payload
+	for _, h := range []string{birthHex, extensionsHex, dataHex, metadataHex, birthHex} {
+		want, _ := Decode(mustHex(t, h))
+		if err := DecodeInto(&p, mustHex(t, h)); err != nil {
+			t.Fatal(err)
+		}
+		got := p
+		if len(got.Metrics) == 0 {
+			got.Metrics = nil
+		}
+		if len(want.Metrics) == 0 {
+			want.Metrics = nil
+		}
+		// Reused capacity aside, the result is what Decode returns.
+		got.Metrics = append([]Metric(nil), got.Metrics...)
+		want.Metrics = append([]Metric(nil), want.Metrics...)
+		if !reflect.DeepEqual(&got, want) {
+			t.Fatalf("%s:\n got  %+v\n want %+v", h[:16], got, want)
+		}
+	}
+	if err := DecodeInto(&p, []byte{0x12, 0x05, 0x01}); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("malformed: %v", err)
+	}
+	// Alias-only data allocates nothing once the metrics fit.
+	data := mustHex(t, dataHex)
+	_ = DecodeInto(&p, data)
+	if n := testing.AllocsPerRun(100, func() { _ = DecodeInto(&p, data) }); n != 0 {
+		t.Fatalf("DecodeInto allocates %v times per alias-only payload", n)
+	}
+}
+
+func BenchmarkDecodeInto(b *testing.B) {
+	data := mustHex(b, dataHex)
+	var p Payload
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := DecodeInto(&p, data); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

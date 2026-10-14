@@ -296,15 +296,33 @@ func (r *reader) expect(wt, want int) bool {
 // published on an spBv1.0 topic. Input that isn't a valid payload returns
 // ErrMalformed; Decode never panics. Fields unknown to the schema are kept
 // in the Unknown field of their message and extension values as
-// KindExtension, so that Encode reproduces them. Nesting (templates in metrics, property sets in
-// property sets) is limited to 16 levels. The returned payload doesn't
-// reference b.
+// KindExtension, so that Encode reproduces them. Nesting (templates in
+// metrics, property sets in property sets) is limited to 16 levels. The
+// returned payload doesn't reference b.
 func Decode(b []byte) (*Payload, error) {
 	p := &Payload{}
 	if n := countMetrics(b); n > 0 {
 		p.Metrics = make([]Metric, 0, n)
 	}
-	r := &reader{b: b, keep: true}
+	if err := decodePayload(p, b); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// DecodeInto is Decode into an existing payload, reusing the memory of its
+// Metrics slice: decoding a stream of messages into one Payload allocates
+// nothing for metrics with scalar values and no names (data messages that
+// use aliases). Everything p held before is replaced; on error p's
+// contents are unspecified. Like Decode, the result doesn't reference b.
+func DecodeInto(p *Payload, b []byte) error {
+	metrics := p.Metrics[:0]
+	*p = Payload{Metrics: metrics}
+	return decodePayload(p, b)
+}
+
+func decodePayload(p *Payload, b []byte) error {
+	r := reader{b: b, keep: true}
 	for {
 		f, wt, ok := r.next()
 		if !ok {
@@ -317,9 +335,14 @@ func Decode(b []byte) (*Payload, error) {
 			}
 		case 2:
 			if r.expect(wt, wireBytes) {
-				var m Metric
-				decodeMetric(r.bytes(), &m, r, 0)
-				p.Metrics = append(p.Metrics, m)
+				// Decoded in place: a Metric is large, copying it costs.
+				if len(p.Metrics) < cap(p.Metrics) {
+					p.Metrics = p.Metrics[:len(p.Metrics)+1]
+					p.Metrics[len(p.Metrics)-1] = Metric{}
+				} else {
+					p.Metrics = append(p.Metrics, Metric{})
+				}
+				decodeMetric(r.bytes(), &p.Metrics[len(p.Metrics)-1], &r, 0)
 			}
 		case 3:
 			if r.expect(wt, wireVarint) {
@@ -338,17 +361,17 @@ func Decode(b []byte) (*Payload, error) {
 		}
 	}
 	if r.err != nil {
-		return nil, r.err
+		return r.err
 	}
 	p.Unknown = r.unk
-	return p, nil
+	return nil
 }
 
 // countMetrics counts the top-level metrics fields, to allocate the
 // metrics slice once (a Metric is large). Malformed input returns what was
 // counted so far; Decode reports the error.
 func countMetrics(b []byte) int {
-	r := &reader{b: b}
+	r := reader{b: b}
 	n := 0
 	for {
 		f, wt, ok := r.next()
@@ -362,97 +385,105 @@ func countMetrics(b []byte) int {
 	}
 }
 
-// sub decodes a nested message; errors propagate to the parent reader.
-func sub(b []byte, parent *reader, depth int, fn func(r *reader, depth int)) {
+// open starts decoding the nested message b. ok is false, and the parent
+// fails, when the parent already failed or nesting is too deep. The reader
+// lives on the caller's stack; errors go back to the parent with close.
+func open(b []byte, parent *reader, depth int) (r reader, ok bool) {
 	if parent.err != nil {
-		return
+		return reader{}, false
 	}
 	if depth > maxDepth {
 		parent.fail()
-		return
+		return reader{}, false
 	}
-	r := &reader{b: b}
-	fn(r, depth+1)
+	return reader{b: b}, true
+}
+
+func (r *reader) close(parent *reader) {
 	if r.err != nil {
 		parent.fail()
 	}
 }
 
 func decodeMetric(b []byte, m *Metric, parent *reader, depth int) {
-	sub(b, parent, depth, func(r *reader, depth int) {
-		r.keep = true
-		for {
-			f, wt, ok := r.next()
-			if !ok {
-				m.Unknown = r.unk
-				return
-			}
-			switch f {
-			case 1:
-				if r.expect(wt, wireBytes) {
-					m.Name = string(r.bytes())
-				}
-			case 2:
-				if r.expect(wt, wireVarint) {
-					m.Alias, m.HasAlias = r.varint(), true
-				}
-			case 3:
-				if r.expect(wt, wireVarint) {
-					m.Timestamp, m.HasTimestamp = r.varint(), true
-				}
-			case 4:
-				if r.expect(wt, wireVarint) {
-					m.Datatype = DataType(r.varint())
-				}
-			case 5:
-				if r.expect(wt, wireVarint) {
-					m.IsHistorical = r.varint() != 0
-				}
-			case 6:
-				if r.expect(wt, wireVarint) {
-					m.IsTransient = r.varint() != 0
-				}
-			case 7:
-				if r.expect(wt, wireVarint) {
-					m.IsNull = r.varint() != 0
-				}
-			case 9:
-				if r.expect(wt, wireBytes) {
-					m.Properties = &PropertySet{}
-					decodePropertySet(r.bytes(), m.Properties, r, depth)
-				}
-			case 10, 11, 12, 13, 14, 15:
-				decodeScalar(r, f-10, wt, &m.Value)
-			case 16:
-				if r.expect(wt, wireBytes) {
-					m.Value = Value{Kind: KindBytes, Bytes: append([]byte(nil), r.bytes()...)}
-				}
-			case 17:
-				if r.expect(wt, wireBytes) {
-					ds := &DataSet{}
-					decodeDataSet(r.bytes(), ds, r, depth)
-					m.Value = Value{Kind: KindDataSet, DataSet: ds}
-				}
-			case 18:
-				if r.expect(wt, wireBytes) {
-					t := &Template{}
-					decodeTemplate(r.bytes(), t, r, depth)
-					m.Value = Value{Kind: KindTemplate, Template: t}
-				}
-			case 8:
-				if r.expect(wt, wireBytes) {
-					m.Metadata = &MetaData{}
-					decodeMetaData(r.bytes(), m.Metadata, r, depth)
-				}
-			case 19:
-				if r.expect(wt, wireBytes) {
-					m.Value = Value{Kind: KindExtension, Bytes: append([]byte{}, r.bytes()...)}
-				}
-			default:
-				r.skip(wt)
-			}
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return
+	}
+	depth++
+	r.keep = true
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
 		}
-	})
+		switch f {
+		case 1:
+			if r.expect(wt, wireBytes) {
+				m.Name = string(r.bytes())
+			}
+		case 2:
+			if r.expect(wt, wireVarint) {
+				m.Alias, m.HasAlias = r.varint(), true
+			}
+		case 3:
+			if r.expect(wt, wireVarint) {
+				m.Timestamp, m.HasTimestamp = r.varint(), true
+			}
+		case 4:
+			if r.expect(wt, wireVarint) {
+				m.Datatype = DataType(r.varint())
+			}
+		case 5:
+			if r.expect(wt, wireVarint) {
+				m.IsHistorical = r.varint() != 0
+			}
+		case 6:
+			if r.expect(wt, wireVarint) {
+				m.IsTransient = r.varint() != 0
+			}
+		case 7:
+			if r.expect(wt, wireVarint) {
+				m.IsNull = r.varint() != 0
+			}
+		case 8:
+			if r.expect(wt, wireBytes) {
+				m.Metadata = &MetaData{}
+				decodeMetaData(r.bytes(), m.Metadata, &r, depth)
+			}
+		case 9:
+			if r.expect(wt, wireBytes) {
+				m.Properties = &PropertySet{}
+				decodePropertySet(r.bytes(), m.Properties, &r, depth)
+			}
+		case 10, 11, 12, 13, 14, 15:
+			decodeScalar(&r, f-10, wt, &m.Value)
+		case 16:
+			if r.expect(wt, wireBytes) {
+				m.Value = Value{Kind: KindBytes, Bytes: append([]byte(nil), r.bytes()...)}
+			}
+		case 17:
+			if r.expect(wt, wireBytes) {
+				ds := &DataSet{}
+				decodeDataSet(r.bytes(), ds, &r, depth)
+				m.Value = Value{Kind: KindDataSet, DataSet: ds}
+			}
+		case 18:
+			if r.expect(wt, wireBytes) {
+				t := &Template{}
+				decodeTemplate(r.bytes(), t, &r, depth)
+				m.Value = Value{Kind: KindTemplate, Template: t}
+			}
+		case 19:
+			if r.expect(wt, wireBytes) {
+				m.Value = Value{Kind: KindExtension, Bytes: append([]byte{}, r.bytes()...)}
+			}
+		default:
+			r.skip(wt)
+		}
+	}
+	m.Unknown = r.unk
+	r.close(parent)
 }
 
 // decodeScalar decodes the six scalar oneof fields shared by every value
@@ -495,237 +526,284 @@ func b2u(b bool) uint64 {
 }
 
 func decodeMetaData(b []byte, md *MetaData, parent *reader, depth int) {
-	sub(b, parent, depth, func(r *reader, _ int) {
-		r.keep = true
-		for {
-			f, wt, ok := r.next()
-			if !ok {
-				md.Unknown = r.unk
-				return
-			}
-			switch {
-			case f == 1 && wt == wireVarint:
-				md.IsMultiPart = r.varint() != 0
-			case f == 2 && wt == wireBytes:
-				md.ContentType = string(r.bytes())
-			case f == 3 && wt == wireVarint:
-				md.Size = r.varint()
-			case f == 4 && wt == wireVarint:
-				md.Seq = r.varint()
-			case f == 5 && wt == wireBytes:
-				md.FileName = string(r.bytes())
-			case f == 6 && wt == wireBytes:
-				md.FileType = string(r.bytes())
-			case f == 7 && wt == wireBytes:
-				md.MD5 = string(r.bytes())
-			case f == 8 && wt == wireBytes:
-				md.Description = string(r.bytes())
-			default:
-				r.skip(wt)
-			}
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return
+	}
+	r.keep = true
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
 		}
-	})
+		switch {
+		case f == 1 && wt == wireVarint:
+			md.IsMultiPart = r.varint() != 0
+		case f == 2 && wt == wireBytes:
+			md.ContentType = string(r.bytes())
+		case f == 3 && wt == wireVarint:
+			md.Size = r.varint()
+		case f == 4 && wt == wireVarint:
+			md.Seq = r.varint()
+		case f == 5 && wt == wireBytes:
+			md.FileName = string(r.bytes())
+		case f == 6 && wt == wireBytes:
+			md.FileType = string(r.bytes())
+		case f == 7 && wt == wireBytes:
+			md.MD5 = string(r.bytes())
+		case f == 8 && wt == wireBytes:
+			md.Description = string(r.bytes())
+		default:
+			r.skip(wt)
+		}
+	}
+	md.Unknown = r.unk
+	r.close(parent)
 }
 
 func decodePropertySet(b []byte, ps *PropertySet, parent *reader, depth int) {
-	sub(b, parent, depth, func(r *reader, depth int) {
-		r.keep = true
-		for {
-			f, wt, ok := r.next()
-			if !ok {
-				ps.Unknown = r.unk
-				return
-			}
-			switch {
-			case f == 1 && wt == wireBytes:
-				ps.Keys = append(ps.Keys, string(r.bytes()))
-			case f == 2 && wt == wireBytes:
-				var pv PropertyValue
-				decodePropertyValue(r.bytes(), &pv, r, depth)
-				ps.Values = append(ps.Values, pv)
-			default:
-				r.skip(wt)
-			}
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return
+	}
+	depth++
+	r.keep = true
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
 		}
-	})
+		switch {
+		case f == 1 && wt == wireBytes:
+			ps.Keys = append(ps.Keys, string(r.bytes()))
+		case f == 2 && wt == wireBytes:
+			ps.Values = append(ps.Values, PropertyValue{})
+			decodePropertyValue(r.bytes(), &ps.Values[len(ps.Values)-1], &r, depth)
+		default:
+			r.skip(wt)
+		}
+	}
+	ps.Unknown = r.unk
+	r.close(parent)
 }
 
 func decodePropertyValue(b []byte, pv *PropertyValue, parent *reader, depth int) {
-	sub(b, parent, depth, func(r *reader, depth int) {
-		r.keep = true
-		for {
-			f, wt, ok := r.next()
-			if !ok {
-				pv.Unknown = r.unk
-				return
-			}
-			switch f {
-			case 1:
-				if r.expect(wt, wireVarint) {
-					pv.Type = DataType(r.varint())
-				}
-			case 2:
-				if r.expect(wt, wireVarint) {
-					pv.IsNull = r.varint() != 0
-				}
-			case 3, 4, 5, 6, 7, 8:
-				decodeScalar(r, f-3, wt, &pv.Value)
-			case 9:
-				if r.expect(wt, wireBytes) {
-					ps := &PropertySet{}
-					decodePropertySet(r.bytes(), ps, r, depth)
-					pv.Value = Value{Kind: KindPropertySet, Properties: ps}
-				}
-			case 10:
-				if r.expect(wt, wireBytes) {
-					var list []PropertySet
-					sub(r.bytes(), r, depth, func(lr *reader, depth int) {
-						for {
-							f, wt, ok := lr.next()
-							if !ok {
-								return
-							}
-							if f == 1 && wt == wireBytes {
-								var ps PropertySet
-								decodePropertySet(lr.bytes(), &ps, lr, depth)
-								list = append(list, ps)
-							} else {
-								lr.skip(wt)
-							}
-						}
-					})
-					pv.Value = Value{Kind: KindPropertySetList, PropertiesList: list}
-				}
-			case 11:
-				if r.expect(wt, wireBytes) {
-					pv.Value = Value{Kind: KindExtension, Bytes: append([]byte{}, r.bytes()...)}
-				}
-			default:
-				r.skip(wt)
-			}
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return
+	}
+	depth++
+	r.keep = true
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
 		}
-	})
+		switch f {
+		case 1:
+			if r.expect(wt, wireVarint) {
+				pv.Type = DataType(r.varint())
+			}
+		case 2:
+			if r.expect(wt, wireVarint) {
+				pv.IsNull = r.varint() != 0
+			}
+		case 3, 4, 5, 6, 7, 8:
+			decodeScalar(&r, f-3, wt, &pv.Value)
+		case 9:
+			if r.expect(wt, wireBytes) {
+				ps := &PropertySet{}
+				decodePropertySet(r.bytes(), ps, &r, depth)
+				pv.Value = Value{Kind: KindPropertySet, Properties: ps}
+			}
+		case 10:
+			if r.expect(wt, wireBytes) {
+				pv.Value = Value{Kind: KindPropertySetList, PropertiesList: decodePropertySetList(r.bytes(), &r, depth)}
+			}
+		case 11:
+			if r.expect(wt, wireBytes) {
+				pv.Value = Value{Kind: KindExtension, Bytes: append([]byte{}, r.bytes()...)}
+			}
+		default:
+			r.skip(wt)
+		}
+	}
+	pv.Unknown = r.unk
+	r.close(parent)
+}
+
+func decodePropertySetList(b []byte, parent *reader, depth int) []PropertySet {
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return nil
+	}
+	depth++
+	var list []PropertySet
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
+		}
+		if f == 1 && wt == wireBytes {
+			list = append(list, PropertySet{})
+			decodePropertySet(r.bytes(), &list[len(list)-1], &r, depth)
+		} else {
+			r.skip(wt)
+		}
+	}
+	r.close(parent)
+	return list
 }
 
 func decodeDataSet(b []byte, ds *DataSet, parent *reader, depth int) {
-	sub(b, parent, depth, func(r *reader, depth int) {
-		r.keep = true
-		for {
-			f, wt, ok := r.next()
-			if !ok {
-				ds.Unknown = r.unk
-				return
-			}
-			switch {
-			case f == 1 && wt == wireVarint:
-				ds.NumColumns = r.varint()
-			case f == 2 && wt == wireBytes:
-				ds.Columns = append(ds.Columns, string(r.bytes()))
-			case f == 3 && wt == wireVarint:
-				ds.Types = append(ds.Types, DataType(r.varint()))
-			case f == 3 && wt == wireBytes: // packed
-				pr := &reader{b: r.bytes()}
-				for len(pr.b) > 0 && pr.err == nil {
-					ds.Types = append(ds.Types, DataType(pr.varint()))
-				}
-				if pr.err != nil {
-					r.fail()
-				}
-			case f == 4 && wt == wireBytes:
-				var row []Value
-				sub(r.bytes(), r, depth, func(rr *reader, depth int) {
-					for {
-						f, wt, ok := rr.next()
-						if !ok {
-							return
-						}
-						if f != 1 || wt != wireBytes {
-							rr.skip(wt)
-							continue
-						}
-						var v Value
-						sub(rr.bytes(), rr, depth, func(er *reader, _ int) {
-							for {
-								f, wt, ok := er.next()
-								if !ok {
-									return
-								}
-								if f >= 1 && f <= 6 {
-									decodeScalar(er, f-1, wt, &v)
-								} else if f == 7 && er.expect(wt, wireBytes) {
-									v = Value{Kind: KindExtension, Bytes: append([]byte{}, er.bytes()...)}
-								} else if f != 7 {
-									er.skip(wt)
-								}
-							}
-						})
-						row = append(row, v)
-					}
-				})
-				ds.Rows = append(ds.Rows, row)
-			default:
-				r.skip(wt)
-			}
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return
+	}
+	depth++
+	r.keep = true
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
 		}
-	})
+		switch {
+		case f == 1 && wt == wireVarint:
+			ds.NumColumns = r.varint()
+		case f == 2 && wt == wireBytes:
+			ds.Columns = append(ds.Columns, string(r.bytes()))
+		case f == 3 && wt == wireVarint:
+			ds.Types = append(ds.Types, DataType(r.varint()))
+		case f == 3 && wt == wireBytes: // packed
+			pr := reader{b: r.bytes()}
+			for len(pr.b) > 0 && pr.err == nil {
+				ds.Types = append(ds.Types, DataType(pr.varint()))
+			}
+			if pr.err != nil {
+				r.fail()
+			}
+		case f == 4 && wt == wireBytes:
+			ds.Rows = append(ds.Rows, decodeRow(r.bytes(), &r, depth))
+		default:
+			r.skip(wt)
+		}
+	}
+	ds.Unknown = r.unk
+	r.close(parent)
+}
+
+func decodeRow(b []byte, parent *reader, depth int) []Value {
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return nil
+	}
+	depth++
+	var row []Value
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
+		}
+		if f != 1 || wt != wireBytes {
+			r.skip(wt)
+			continue
+		}
+		row = append(row, Value{})
+		decodeCell(r.bytes(), &row[len(row)-1], &r, depth)
+	}
+	r.close(parent)
+	return row
+}
+
+func decodeCell(b []byte, v *Value, parent *reader, depth int) {
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return
+	}
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
+		}
+		switch {
+		case f >= 1 && f <= 6:
+			decodeScalar(&r, f-1, wt, v)
+		case f == 7:
+			if r.expect(wt, wireBytes) {
+				*v = Value{Kind: KindExtension, Bytes: append([]byte{}, r.bytes()...)}
+			}
+		default:
+			r.skip(wt)
+		}
+	}
+	r.close(parent)
 }
 
 func decodeTemplate(b []byte, t *Template, parent *reader, depth int) {
-	sub(b, parent, depth, func(r *reader, depth int) {
-		r.keep = true
-		for {
-			f, wt, ok := r.next()
-			if !ok {
-				t.Unknown = r.unk
-				return
-			}
-			switch {
-			case f == 1 && wt == wireBytes:
-				t.Version = string(r.bytes())
-			case f == 2 && wt == wireBytes:
-				var m Metric
-				decodeMetric(r.bytes(), &m, r, depth)
-				t.Metrics = append(t.Metrics, m)
-			case f == 3 && wt == wireBytes:
-				var p Parameter
-				sub(r.bytes(), r, depth, func(pr *reader, _ int) {
-					pr.keep = true
-					for {
-						f, wt, ok := pr.next()
-						if !ok {
-							p.Unknown = pr.unk
-							return
-						}
-						switch f {
-						case 1:
-							if pr.expect(wt, wireBytes) {
-								p.Name = string(pr.bytes())
-							}
-						case 2:
-							if pr.expect(wt, wireVarint) {
-								p.Type = DataType(pr.varint())
-							}
-						case 3, 4, 5, 6, 7, 8:
-							decodeScalar(pr, f-3, wt, &p.Value)
-						case 9:
-							if pr.expect(wt, wireBytes) {
-								p.Value = Value{Kind: KindExtension, Bytes: append([]byte{}, pr.bytes()...)}
-							}
-						default:
-							pr.skip(wt)
-						}
-					}
-				})
-				t.Parameters = append(t.Parameters, p)
-			case f == 4 && wt == wireBytes:
-				t.TemplateRef = string(r.bytes())
-			case f == 5 && wt == wireVarint:
-				t.IsDefinition = r.varint() != 0
-			default:
-				r.skip(wt)
-			}
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return
+	}
+	depth++
+	r.keep = true
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
 		}
-	})
+		switch {
+		case f == 1 && wt == wireBytes:
+			t.Version = string(r.bytes())
+		case f == 2 && wt == wireBytes:
+			t.Metrics = append(t.Metrics, Metric{})
+			decodeMetric(r.bytes(), &t.Metrics[len(t.Metrics)-1], &r, depth)
+		case f == 3 && wt == wireBytes:
+			t.Parameters = append(t.Parameters, Parameter{})
+			decodeParameter(r.bytes(), &t.Parameters[len(t.Parameters)-1], &r, depth)
+		case f == 4 && wt == wireBytes:
+			t.TemplateRef = string(r.bytes())
+		case f == 5 && wt == wireVarint:
+			t.IsDefinition = r.varint() != 0
+		default:
+			r.skip(wt)
+		}
+	}
+	t.Unknown = r.unk
+	r.close(parent)
+}
+
+func decodeParameter(b []byte, p *Parameter, parent *reader, depth int) {
+	r, ok := open(b, parent, depth)
+	if !ok {
+		return
+	}
+	r.keep = true
+	for {
+		f, wt, ok := r.next()
+		if !ok {
+			break
+		}
+		switch f {
+		case 1:
+			if r.expect(wt, wireBytes) {
+				p.Name = string(r.bytes())
+			}
+		case 2:
+			if r.expect(wt, wireVarint) {
+				p.Type = DataType(r.varint())
+			}
+		case 3, 4, 5, 6, 7, 8:
+			decodeScalar(&r, f-3, wt, &p.Value)
+		case 9:
+			if r.expect(wt, wireBytes) {
+				p.Value = Value{Kind: KindExtension, Bytes: append([]byte{}, r.bytes()...)}
+			}
+		default:
+			r.skip(wt)
+		}
+	}
+	p.Unknown = r.unk
+	r.close(parent)
 }
 
 // --- wire encoding ---
