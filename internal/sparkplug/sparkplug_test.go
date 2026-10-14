@@ -876,3 +876,20 @@ func TestPersistDefinitions(t *testing.T) {
 		t.Fatalf("missing file: %d %v", n, err)
 	}
 }
+
+func TestFileMetadata(t *testing.T) {
+	tr, _, _ := newT(config.Sparkplug{})
+	out, _ := tr.Process(entry("spBv1.0/g/NBIRTH/e", birthPayload(0, 1,
+		spb.Metric{Name: "Recipe", Datatype: spb.TypeFile, Value: spb.Value{Kind: spb.KindBytes, Bytes: []byte("abc")},
+			Metadata: &spb.MetaData{FileName: "recipe \"1\".csv", ContentType: "text/csv", Size: 3, MD5: "900150983cd24fb0d6963f7d28e17f72", IsMultiPart: true}},
+		spb.Metric{Name: "Plain", Datatype: spb.TypeString, Value: spb.Value{Kind: spb.KindString, Str: "x"}, Metadata: &spb.MetaData{}})))
+	v := values(t, out)
+	md, _ := v["spb/g/e/Recipe"]["metadata"].(map[string]any)
+	want := map[string]any{"file_name": "recipe \"1\".csv", "content_type": "text/csv", "size": 3.0, "md5": "900150983cd24fb0d6963f7d28e17f72", "is_multi_part": true, "seq": 0.0}
+	if !reflect.DeepEqual(md, want) || v["spb/g/e/Recipe"]["value"] != "YWJj" {
+		t.Fatalf("file metadata: %v", v["spb/g/e/Recipe"])
+	}
+	if _, ok := v["spb/g/e/Plain"]["metadata"]; ok {
+		t.Fatal("empty metadata included")
+	}
+}

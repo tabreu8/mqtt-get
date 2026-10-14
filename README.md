@@ -244,7 +244,7 @@ curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/values/spb/plant1/pre
 | Node metric (`NBIRTH`/`NDATA` on `spBv1.0/<group>/…/<edge_node>`) | `spb/<group>/<edge_node>/<metric name>` |
 | Device metric (`DBIRTH`/`DDATA` on `…/<edge_node>/<device>`) | `spb/<group>/<edge_node>/<device>/<metric name>` |
 
-- **Values** are `{"value":…,"type":"…","timestamp":"…","online":true}`. Metric names keep their `/` folders, so `Motors/M1/Speed` becomes three topic levels. `unit` comes from the birth's `engUnit` property, and the birth's other properties are included in the birth values.
+- **Values** are `{"value":…,"type":"…","timestamp":"…","online":true}`. Metric names keep their `/` folders, so `Motors/M1/Speed` becomes three topic levels. `unit` comes from the birth's `engUnit` property, and the birth's other properties are included in the birth values. Metric metadata (for File values: `file_name`, `file_type`, `content_type`, `size`, `md5`, `description`, and `is_multi_part`/`seq` for one part of a multi-part value) is included as `"metadata":{…}`.
 - **Types**: all integer types (signed values decoded as two's complement, per Sparkplug 3.0), Float, Double, Boolean, String, Text, UUID, DateTime (as an RFC 3339 string), Bytes and File (base64), every array type, DataSets (`{"columns","types","rows"}`) and Templates (`{"template_ref","metrics","parameters"}`). 64-bit integers keep every digit.
 - **Births and aliases.** Births record each metric's name, alias and type, so data messages that carry only aliases are decoded. A new node birth invalidates its devices until they're born again.
 - **Deaths.** `NDEATH` and `DDEATH` republish the metrics with `"online":false`, keeping the last value and its age. A death left over from an older session (an older `bdSeq`, e.g. a will delivered late) is ignored. A death with a *newer* `bdSeq` is accepted, because some edge nodes send the next session's `bdSeq` when they disconnect cleanly.
@@ -279,7 +279,7 @@ mqtt-get acts as a Sparkplug 3.0 host application that **observes**: it decodes 
 - **No `STATE`.** It doesn't publish `STATE` messages, so edge nodes that wait for a primary host won't treat it as one. The Eclipse Sparkplug TCK's host application tests assume a primary host, so they don't apply as they are.
 - **Lenient `bdSeq` on death.** An NDEATH with a *newer* `bdSeq` than the birth is accepted (the specification asks for an exact match), because some edge nodes send the next session's `bdSeq` when they disconnect cleanly. Older ones (late wills) are ignored as specified.
 - **Lenient on bad payloads.** Payloads that break the value rules are translated as well as possible and reported as problems, rather than rejected.
-- **Not covered:** reassembly of multi-part File values (`MetaData.is_multi_part`), and preserving protobuf extensions (they are skipped).
+- **Not covered:** reassembly of multi-part File values. Each part is translated on its own, with its `metadata` (`is_multi_part`, `seq`), so a consumer can reassemble them.
 
 ### Settings
 

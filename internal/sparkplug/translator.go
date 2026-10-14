@@ -754,12 +754,57 @@ func (t *Translator) envelopeTail(buf []byte, m *metric, dt spb.DataType, ts uin
 	if pm != nil && pm.IsTransient {
 		buf = append(buf, `,"transient":true`...)
 	}
+	if pm != nil && pm.Metadata != nil && *pm.Metadata != (spb.MetaData{}) {
+		buf = append(buf, `,"metadata":`...)
+		buf = appendMetadata(buf, pm.Metadata)
+	}
 	if pm != nil && pm.Properties != nil && len(pm.Properties.Keys) > 0 {
 		buf = append(buf, `,"properties":`...)
 		buf = AppendProperties(buf, pm.Properties)
 	}
 	buf = append(buf, `,"online":`...)
 	buf = strconv.AppendBool(buf, online)
+	return append(buf, '}')
+}
+
+// appendMetadata writes the metadata of a value (files and multi-part
+// values) as a JSON object, leaving out empty fields.
+func appendMetadata(buf []byte, md *spb.MetaData) []byte {
+	buf = append(buf, '{')
+	start := len(buf)
+	str := func(k, v string) {
+		if v != "" {
+			if len(buf) > start {
+				buf = append(buf, ',')
+			}
+			buf = append(append(append(buf, '"'), k...), `":`...)
+			buf = store.AppendString(buf, v)
+		}
+	}
+	num := func(k string, v uint64) {
+		if len(buf) > start {
+			buf = append(buf, ',')
+		}
+		buf = append(append(append(buf, '"'), k...), `":`...)
+		buf = strconv.AppendUint(buf, v, 10)
+	}
+	str("file_name", md.FileName)
+	str("file_type", md.FileType)
+	str("content_type", md.ContentType)
+	if md.Size > 0 {
+		num("size", md.Size)
+	}
+	str("md5", md.MD5)
+	str("description", md.Description)
+	if md.IsMultiPart {
+		if len(buf) > start {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, `"is_multi_part":true`...)
+		num("seq", md.Seq)
+	} else if md.Seq > 0 {
+		num("seq", md.Seq)
+	}
 	return append(buf, '}')
 }
 
