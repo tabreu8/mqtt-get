@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/tabreu8/mqtt-get/internal/config"
@@ -124,19 +125,47 @@ func (s *Service) hostState(sp *sparkplug.Translator, e *store.Entry) {
 	}()
 }
 
-// Receive takes a message from the broker. Sparkplug messages are handed to
-// a pool of workers, one per CPU, each edge node always to the same worker:
-// translation, which costs far more than storing a plain message, runs on
-// every core while each node's messages stay in order. A full worker queue
-// blocks the caller (the connection's reader), which slows the broker down
+// NewReceiver returns a receiver for one broker connection (see
+// mqttc.Receiver). Sparkplug messages are handed to a pool of workers, one
+// per CPU, each edge node always to the same worker: translation, which
+// costs far more than storing a plain message, runs on every core while
+// each node's messages stay in order. They are handed over in batches, at
+// the end of each socket read (Flush) or every batchSize messages. A full
+// worker queue blocks the connection's reader, which slows the broker down
 // rather than dropping messages, as plain ingest does. Everything else is
 // ingested at once, as by Ingest.
-func (s *Service) Receive(e store.Entry) {
+func (s *Service) NewReceiver() mqttc.Receiver { return &receiver{s: s} }
+
+const (
+	batchSize   = 64
+	workerQueue = 256 // batches per worker
+)
+
+type receiver struct {
+	s       *Service
+	batches [][]store.Entry // per worker
+}
+
+var batchPool = sync.Pool{New: func() any { b := make([]store.Entry, 0, batchSize); return &b }}
+
+func (r *receiver) Receive(e store.Entry) {
+	s := r.s
 	if s.spb.Load() != nil {
 		if h, ok := sparkplug.Route(e.Topic); ok {
 			s.workersMu.RLock()
 			if w := s.workers; w != nil {
-				w[h%uint32(len(w))] <- e
+				if len(r.batches) != len(w) {
+					r.batches = make([][]store.Entry, len(w))
+				}
+				i := h % uint32(len(w))
+				if r.batches[i] == nil {
+					r.batches[i] = (*batchPool.Get().(*[]store.Entry))[:0]
+				}
+				r.batches[i] = append(r.batches[i], e)
+				if len(r.batches[i]) >= batchSize {
+					w[i] <- r.batches[i]
+					r.batches[i] = nil
+				}
 				s.workersMu.RUnlock()
 				return
 			}
@@ -146,8 +175,24 @@ func (s *Service) Receive(e store.Entry) {
 	s.Ingest(e)
 }
 
-// workerQueue is the length of each worker's queue.
-const workerQueue = 4096
+func (r *receiver) Flush() {
+	s := r.s
+	s.workersMu.RLock()
+	defer s.workersMu.RUnlock()
+	for i, b := range r.batches {
+		if len(b) == 0 {
+			continue
+		}
+		if s.workers != nil && len(s.workers) == len(r.batches) {
+			s.workers[i] <- b
+		} else {
+			for _, e := range b { // the workers are gone (shutting down)
+				s.Ingest(e)
+			}
+		}
+		r.batches[i] = nil
+	}
+}
 
 func (s *Service) startWorkers() {
 	n := min(max(runtime.GOMAXPROCS(0), 1), 64)
@@ -156,9 +201,9 @@ func (s *Service) startWorkers() {
 	if s.workers != nil {
 		return
 	}
-	s.workers = make([]chan store.Entry, n)
+	s.workers = make([]chan []store.Entry, n)
 	for i := range s.workers {
-		ch := make(chan store.Entry, workerQueue)
+		ch := make(chan []store.Entry, workerQueue)
 		s.workers[i] = ch
 		s.workersWG.Add(1)
 		go s.worker(ch)
@@ -167,7 +212,7 @@ func (s *Service) startWorkers() {
 
 // stopWorkers lets the workers finish what is queued and stops them.
 func (s *Service) stopWorkers() {
-	s.workersMu.Lock() // waits for senders in Receive
+	s.workersMu.Lock() // waits for senders in Receive and Flush
 	w := s.workers
 	s.workers = nil
 	s.workersMu.Unlock()
@@ -177,24 +222,29 @@ func (s *Service) stopWorkers() {
 	s.workersWG.Wait()
 }
 
-func (s *Service) worker(ch chan store.Entry) {
+func (s *Service) worker(ch chan []store.Entry) {
 	defer s.workersWG.Done()
 	var out []store.Entry // reused: ingest copies what it keeps
-	for e := range ch {
-		sp := s.spb.Load()
-		if sp == nil {
-			s.Ingest(e)
-			continue
+	for batch := range ch {
+		for _, e := range batch {
+			sp := s.spb.Load()
+			if sp == nil {
+				s.Ingest(e)
+				continue
+			}
+			var handled bool
+			out, handled = sp.ProcessAppend(e, out[:0])
+			for i := range out {
+				s.ingest(out[i])
+			}
+			clear(out) // don't keep the payloads alive until the next message
+			if !handled || sp.Config().KeepRaw {
+				s.ingest(e)
+			}
 		}
-		var handled bool
-		out, handled = sp.ProcessAppend(e, out[:0])
-		for i := range out {
-			s.ingest(out[i])
-		}
-		clear(out) // don't keep the payloads alive until the next message
-		if !handled || sp.Config().KeepRaw {
-			s.ingest(e)
-		}
+		clear(batch)
+		batch = batch[:0]
+		batchPool.Put(&batch)
 	}
 }
 

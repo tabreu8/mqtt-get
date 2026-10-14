@@ -17,13 +17,14 @@ import (
 // v3link is an MQTT 3.1 / 3.1.1 connection (eclipse/paho.mqtt.golang).
 type v3link struct {
 	m      *Manager
+	rcv    Receiver
 	client mqtt.Client
 	up     atomic.Bool
 	ctr    counters
 }
 
 func newV3(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *v3link {
-	l := &v3link{m: m}
+	l := &v3link{m: m, rcv: m.receiver()}
 	o := mqtt.NewClientOptions()
 	for _, u := range cfg.URLs {
 		o.AddBroker(u)
@@ -61,13 +62,14 @@ func newV3(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *v3link {
 		filters[s.Filter] = s.QoS
 	}
 	o.SetDefaultPublishHandler(func(_ mqtt.Client, msg mqtt.Message) {
-		m.deliver(&l.ctr, store.Entry{
+		deliver(&l.ctr, l.rcv, store.Entry{
 			Topic:    msg.Topic(),
 			Payload:  msg.Payload(),
 			QoS:      msg.Qos(),
 			Retained: msg.Retained(),
 			Time:     time.Now().UnixNano(),
 		})
+		l.rcv.Flush() // paho hands over one message at a time
 	})
 	if w := m.connectWill(cfg, idx); w != nil {
 		o.SetBinaryWill(w.Topic, []byte(w.Payload), w.QoS, w.Retain)

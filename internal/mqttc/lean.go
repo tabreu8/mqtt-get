@@ -42,6 +42,7 @@ import (
 // In-flight state is kept in memory, not on disk.
 type leanlink struct {
 	m        *Manager
+	rcv      Receiver
 	cfg      config.Broker
 	tlsCfg   *tls.Config
 	headers  http.Header
@@ -111,7 +112,7 @@ var connackErrors = map[byte]string{
 }
 
 func newLean(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *leanlink {
-	l := &leanlink{m: m, cfg: cfg, tlsCfg: tlsCfg, clientID: clientIDFor(cfg, idx), idx: idx, subs: m.subscriptionsFor(cfg, idx),
+	l := &leanlink{m: m, rcv: m.receiver(), cfg: cfg, tlsCfg: tlsCfg, clientID: clientIDFor(cfg, idx), idx: idx, subs: m.subscriptionsFor(cfg, idx),
 		quit: make(chan struct{}), done: make(chan struct{}), v5: cfg.ProtocolVersion == 5, aliasMax: defaultTopicAliasMaximum}
 	if cfg.TopicAliasMaximum != nil {
 		l.aliasMax = *cfg.TopicAliasMaximum
@@ -497,10 +498,12 @@ func (l *leanlink) keepalive(conn net.Conn, ka time.Duration, done chan struct{}
 func (l *leanlink) readLoop(r *bufio.Reader) error {
 	var scratch [64]byte
 	var now int64
+	defer l.rcv.Flush()
 	for {
 		fresh := r.Buffered() == 0
 		if fresh {
-			l.flush() // send batched acks before blocking on the socket
+			l.rcv.Flush() // hand over what was read
+			l.flush()     // send batched acks before blocking on the socket
 		}
 		h, err := r.ReadByte()
 		if err != nil {
@@ -587,7 +590,7 @@ func (l *leanlink) readLoop(r *bufio.Reader) error {
 				continue
 			}
 		}
-		l.m.deliver(&l.ctr, store.Entry{Topic: topic, Payload: buf[p:n:n], QoS: qos, Retained: h&1 == 1, Time: now, Props: props})
+		deliver(&l.ctr, l.rcv, store.Entry{Topic: topic, Payload: buf[p:n:n], QoS: qos, Retained: h&1 == 1, Time: now, Props: props})
 		switch qos {
 		case 1:
 			l.ack(pPuback<<4, id)

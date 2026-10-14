@@ -29,6 +29,20 @@ var ErrNotConnected = errors.New("not connected to MQTT broker")
 // receive goroutine and must not block.
 type Handler func(e store.Entry)
 
+// Receiver takes one connection's inbound messages, on its receive
+// goroutine: Receive for each message, and Flush once the messages read
+// from the socket so far are delivered, before the connection waits for
+// more (and when it closes). A Receiver can batch work until Flush.
+type Receiver interface {
+	Receive(e store.Entry)
+	Flush()
+}
+
+type handlerReceiver Handler
+
+func (h handlerReceiver) Receive(e store.Entry) { h(e) }
+func (handlerReceiver) Flush()                  {}
+
 // Status describes the connection state.
 type Status struct {
 	Configured       bool      `json:"configured"`
@@ -71,8 +85,9 @@ type link interface {
 
 // Manager owns the broker connections.
 type Manager struct {
-	log     *slog.Logger
-	handler Handler
+	log       *slog.Logger
+	handler   Handler
+	receivers atomic.Pointer[func() Receiver]
 
 	mu    sync.Mutex
 	cfg   config.Broker
@@ -401,10 +416,22 @@ type counters struct {
 	_     [48]byte
 }
 
-func (m *Manager) deliver(c *counters, e store.Entry) {
+func deliver(c *counters, r Receiver, e store.Entry) {
 	c.recv.Add(1)
 	c.bytes.Add(uint64(len(e.Payload)))
-	m.handler(e)
+	r.Receive(e)
+}
+
+// SetReceivers makes every connection opened from now on deliver its
+// messages to its own Receiver from f, instead of to the handler.
+func (m *Manager) SetReceivers(f func() Receiver) { m.receivers.Store(&f) }
+
+// receiver returns the Receiver of a new connection.
+func (m *Manager) receiver() Receiver {
+	if f := m.receivers.Load(); f != nil {
+		return (*f)()
+	}
+	return handlerReceiver(m.handler)
 }
 
 // Publish sends one message and waits for the result.

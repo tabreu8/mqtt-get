@@ -60,7 +60,7 @@ type Service struct {
 	hostTS     atomic.Int64
 	// workers translate Sparkplug messages in parallel (see Receive).
 	workersMu sync.RWMutex
-	workers   []chan store.Entry
+	workers   []chan []store.Entry
 	workersWG sync.WaitGroup
 	stop      chan struct{}
 	bg        sync.WaitGroup
@@ -82,7 +82,8 @@ func New(cfg config.Server, log *slog.Logger, st *state.State) *Service {
 		started: time.Now(),
 		stop:    make(chan struct{}),
 	}
-	s.mqtt = mqttc.New(log, s.Receive)
+	s.mqtt = mqttc.New(log, s.Ingest)
+	s.mqtt.SetReceivers(s.NewReceiver)
 	return s
 }
 

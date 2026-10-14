@@ -46,7 +46,15 @@ func BenchmarkIngest(b *testing.B) {
 			}
 			msgs := sparkplugStream(svc.Ingest, 500, k)
 			base := svc.Sparkplug().Stats.Messages
-			runIngest(b, msgs, k, func(e store.Entry) { svc.Receive(e) }, func() {
+			// A socket read holds about 16 KB of messages.
+			r, per, n := svc.NewReceiver(), max(1, 16<<10/len(msgs[0].Payload)), 0
+			runIngest(b, msgs, k, func(e store.Entry) {
+				r.Receive(e)
+				if n++; n%per == 0 {
+					r.Flush()
+				}
+			}, func() {
+				r.Flush()
 				for svc.Sparkplug().Stats.Messages < base+uint64(b.N) {
 					time.Sleep(50 * time.Microsecond)
 				}

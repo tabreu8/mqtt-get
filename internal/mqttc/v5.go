@@ -24,6 +24,7 @@ import (
 // the MQTT 3 client through openConn.
 type v5link struct {
 	m        *Manager
+	rcv      Receiver
 	cfg      config.Broker
 	tlsCfg   *tls.Config
 	idx      int
@@ -72,7 +73,7 @@ const defaultTopicAliasMaximum = 1024
 const receiveMaximum = 1024
 
 func newV5(m *Manager, cfg config.Broker, tlsCfg *tls.Config, idx int) *v5link {
-	return &v5link{m: m, cfg: cfg, tlsCfg: tlsCfg, idx: idx, clientID: clientIDFor(cfg, idx)}
+	return &v5link{m: m, rcv: m.receiver(), cfg: cfg, tlsCfg: tlsCfg, idx: idx, clientID: clientIDFor(cfg, idx)}
 }
 
 func (l *v5link) isUp() bool       { return l.up.Load() }
@@ -276,7 +277,7 @@ func (l *v5link) onPublish(pr paho.PublishReceived) (bool, error) {
 		l.m.setErr("received a publish with an unknown topic alias")
 		return true, nil
 	}
-	l.m.deliver(&l.ctr, store.Entry{
+	deliver(&l.ctr, l.rcv, store.Entry{
 		Topic:    topic,
 		Payload:  p.Payload,
 		QoS:      p.QoS,
@@ -284,6 +285,7 @@ func (l *v5link) onPublish(pr paho.PublishReceived) (bool, error) {
 		Time:     time.Now().UnixNano(),
 		Props:    props,
 	})
+	l.rcv.Flush() // paho hands over one message at a time
 	return true, nil
 }
 
